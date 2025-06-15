@@ -20,7 +20,7 @@ def handle_message(message):
 
     try:
         completion = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",  # Или 'gpt-4', если у вас есть доступ
+            model="o4-mini",  # Или 'gpt-4', если у вас есть доступ
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_text}
