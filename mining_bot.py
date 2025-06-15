@@ -6,8 +6,8 @@ import os
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 
-openai.api_key = OPENAI_API_KEY
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
+client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
@@ -19,8 +19,8 @@ def handle_message(message):
     )
 
     try:
-        completion = openai.ChatCompletion.create(
-            model="gpt-4o",  # Или 'gpt-4', если у вас есть доступ
+        completion = client.chat.completions.create(
+            model="gpt-4o",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_text}
@@ -28,7 +28,9 @@ def handle_message(message):
             temperature=0.4,
             max_tokens=1000
         )
+
         reply = completion.choices[0].message.content.strip()
+
     except Exception as e:
         reply = "Ошибка на стороне GPT. Попробуйте позже."
 
