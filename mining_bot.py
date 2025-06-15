@@ -1,106 +1,115 @@
 import os
-import openai
+import json
+import time
 import requests
 from flask import Flask, request
-import telebot
-
-# Загрузка переменных окружения
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CRYPTO_API_KEY = os.getenv("CRYPTO_API_KEY")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+from threading import Thread
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-# Доступ только для админов
-ADMINS = [7473992492, 5860994210]
-CHAT_ID = -1002408729915
+TELEGRAM_TOKEN = os.environ['TELEGRAM_TOKEN']
+OPENAI_API_KEY = os.environ['OPENAI_API_KEY']
+CRYPTO_API_KEY = os.environ['CRYPTO_API_KEY']
+WEBHOOK_URL = os.environ['WEBHOOK_URL']
+CHAT_ID = -1002408729915  # Mining_Sale
+ADMINS = [7473992492, 5860994210]  # @mining_sale_admin, @MoLd8
 
-# Хранилище подозрительных слов
-ban_phrases = ["casino", "казино", "easy money", "profit every hour"]
-custom_ban_list = []
-warned_users = {}
+GPT_CACHE = {}
+LAST_NEWS_TIME = 0
+NEWS_INTERVAL = 10800  # 3 часа
+CACHE_TTL = timedelta(days=3)
 
-# Хендлер входящих сообщений
-@bot.message_handler(func=lambda message: True)
-def handle_message(message):
-    text = message.text.lower()
-    user_id = message.from_user.id
+HEADERS = {
+    "Authorization": f"Bearer {OPENAI_API_KEY}"
+}
 
-    # Проверка на бан-фразы
-    if any(bad in text for bad in ban_phrases + custom_ban_list):
-        warned_users[user_id] = warned_users.get(user_id, 0) + 1
+def send_message(chat_id, text, parse_mode="Markdown"):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
+    requests.post(url, json=payload)
 
-        if warned_users[user_id] >= 3:
-            bot.ban_chat_member(CHAT_ID, user_id)
-            bot.send_message(CHAT_ID, f"Пользователь {user_id} заблокирован за спам")
-        else:
-            bot.send_message(CHAT_ID, f"Предупреждение за подозрительную активность. {3 - warned_users[user_id]} до блокировки.")
-        return
+def send_admin_error_log(error_text):
+    for admin in ADMINS:
+        send_message(admin, f"🚨 Ошибка в боте:\n\n{error_text}")
 
-    # Команда /бан (обучение фразам)
-    if text.startswith("/бан") and message.reply_to_message:
-        reply_text = message.reply_to_message.text.lower()
-        custom_ban_list.append(reply_text)
-        bot.send_message(CHAT_ID, f"Фраза добавлена в список подозрительных")
-        return
-
-    # Ответ через GPT
-    prompt = (
-        "Ты — ИИ помощник по майнингу. Отвечай строго, профессионально и кратко."
-        "Разбираешься в Antminer, Whatsminer, доставке, ROI, ремонте, поставках."
-    )
-
-    try:
-        completion = openai.ChatCompletion.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": message.text},
-            ],
-            temperature=0.4,
-            max_tokens=1000,
-        )
-        reply = completion.choices[0].message.content.strip()
-        bot.send_message(message.chat.id, reply)
-    except Exception as e:
-        bot.send_message(message.chat.id, "⚠️ GPT временно недоступен. Попробуйте позже.")
-
-# Ендпоинт от Telegram
-@app.route('/webhook', methods=['POST'])
+@app.route("/", methods=["POST"])
 def webhook():
-    json_str = request.get_data().decode('UTF-8')
-    update = telebot.types.Update.de_json(json_str)
-    bot.process_new_updates([update])
-    return 'ok'
+    data = request.get_json()
+    if not data or "message" not in data:
+        return "ok"
+    msg = data["message"]
+    chat_id = msg["chat"]["id"]
+    user_id = msg["from"]["id"]
+    text = msg.get("text", "")
 
-# Ручная установка Webhook (вызывается один раз)
-@app.route('/set_webhook', methods=['GET'])
-def set_webhook():
-    s = bot.set_webhook(url=WEBHOOK_URL)
-    return f'Webhook установлен: {s}'
+    if "/stats" in text and user_id in ADMINS:
+        stats = f"🔢 Сообщений в кеше: {len(GPT_CACHE)}"
+        send_message(chat_id, stats)
+        return "ok"
 
-# Автопостинг новостей каждые 3 часа
-@app.route('/post_news', methods=['GET'])
-def post_news():
-    url = "https://cryptopanic.com/api/v1/posts/?auth_token=" + CRYPTO_API_KEY + "&kind=news"
+    if "казино" in text.lower():
+        send_message(chat_id, "🚫 Реклама казино запрещена.")
+        return "ok"
+
+    response_text = handle_gpt_response(text)
+    if response_text:
+        send_message(chat_id, response_text)
+
+    return "ok"
+
+def handle_gpt_response(text):
+    now = datetime.utcnow()
+    if text in GPT_CACHE:
+        cached, timestamp = GPT_CACHE[text]
+        if now - timestamp < CACHE_TTL:
+            return cached
+
+    prompt = f"Ты помощник в Telegram-чате по майнингу. Пользователь спросил: {text}. Ответь строго по теме, кратко и понятно."
+
     try:
-        response = requests.get(url)
-        news = response.json().get("results", [])[:3]
-
-        if news:
-            msg = "📰 Актуальные новости по майнингу:\n\n"
-            for item in news:
-                msg += f"{item['title']}\n{item['url']}\n\n"
-            msg += "\n🤝 Продвижение оплачено. Проверяйте продавцов лично.\n🔗 https://app.leadteh.ru/w/dTeKr"
-            bot.send_message(CHAT_ID, msg)
-            return 'Опубликовано'
-        else:
-            return 'Нет новостей'
-
+        res = requests.post("https://api.openai.com/v1/chat/completions", headers=HEADERS, json={
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.5,
+        })
+        if res.status_code != 200:
+            send_admin_error_log(f"OpenAI ошибка {res.status_code}:\n{res.text}")
+            return "⚠️ Временная ошибка. Попробуйте позже."
+        output = res.json()["choices"][0]["message"]["content"]
+        GPT_CACHE[text] = (output, now)
+        return output
     except Exception as e:
-        return f'Ошибка при получении новостей: {str(e)}'
+        send_admin_error_log(str(e))
+        return "⚠️ GPT недоступен. Обратитесь позже."
+
+def post_news():
+    global LAST_NEWS_TIME
+    while True:
+        now = time.time()
+        if now - LAST_NEWS_TIME >= NEWS_INTERVAL:
+            try:
+                news = fetch_crypto_news()
+                ad = "📣 Надёжный поставщик ASIC-оборудования (реклама): https://app.leadteh.ru/w/dTeKr"
+                send_message(CHAT_ID, news + "\n\n" + ad)
+                LAST_NEWS_TIME = now
+            except Exception as e:
+                send_admin_error_log(str(e))
+        time.sleep(60)
+
+def fetch_crypto_news():
+    res = requests.get(f"https://cryptopanic.com/api/v1/posts/?auth_token={CRYPTO_API_KEY}&public=true")
+    if res.status_code != 200:
+        raise Exception(f"CryptoPanic ошибка {res.status_code}:\n{res.text}")
+    articles = res.json().get("results", [])[:3]
+    return "\n\n".join([f"📰 [{a['title']}]({a['url']})" for a in articles])
+
+def set_webhook():
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={WEBHOOK_URL}"
+    res = requests.get(url)
+    print(res.text)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    Thread(target=post_news).start()
+    set_webhook()
+    app.run(host="0.0.0.0", port=10000)
