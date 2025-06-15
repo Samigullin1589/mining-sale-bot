@@ -1,72 +1,69 @@
+import os
+import time
 import openai
 import telebot
-import os
+import requests
 import threading
-import time
+from datetime import datetime
 
-# Получение ключей из переменных окружения
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+# === НАСТРОЙКИ ===
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+CRYPTO_NEWS_URL = "https://cryptopanic.com/api/v1/posts/?auth_token=demo&public=true&currencies=BTC"
+LEAD_LINK = "https://app.leadteh.ru/w/dTeKr"
+POST_INTERVAL = 10800  # 3 часа в секундах
 
-openai.api_key = OPENAI_API_KEY
+# === ИНИЦИАЛИЗАЦИЯ ===
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
+openai.api_key = OPENAI_API_KEY
 
-# Системный промпт для ИИ
-system_prompt = (
-    "Ты — эксперт по майнингу. Отвечай строго, профессионально, кратко."
-    " Разбираешься в Antminer, Whatsminer, доставке, ROI, техобслуживании."
-)
+# === СПИСОК КЛЮЧЕВЫХ СЛОВ ===
+KEYWORDS = ["где купить", "сколько стоит", "доставка", "гарантия", "цены"]
 
-# Обработка входящих сообщений
-def handle_message(message):
-    user_text = message.text
+# === ФУНКЦИЯ: ЗАПРОС К OPENAI ===
+def ask_gpt(prompt):
     try:
-        completion = openai.ChatCompletion.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_text},
-            ],
-            temperature=0.4,
-            max_tokens=1000
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7
         )
-        reply = completion.choices[0].message.content.strip()
-    except Exception:
-        reply = "Извините, произошла ошибка на стороне GPT. Попробуйте позже."
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return "Извините, произошла ошибка при получении ответа."
 
-    bot.reply_to(message, reply)
+# === ФУНКЦИЯ: ПОЛУЧИТЬ НОВОСТИ С CRYPTOPANIC ===
+def fetch_news():
+    try:
+        response = requests.get(CRYPTO_NEWS_URL)
+        data = response.json()
+        headlines = [post['title'] for post in data.get('results', [])[:5]]
+        return "\n".join(f"• {h}" for h in headlines)
+    except:
+        return "Не удалось получить новости."
 
-@bot.message_handler(func=lambda message: True)
-def message_router(message):
-    handle_message(message)
-
-# Автопостинг раз в 3 часа
-def auto_posting():
+# === ФУНКЦИЯ: ПУБЛИКАЦИЯ НОВОСТЕЙ ===
+def post_news():
     while True:
+        news = fetch_news()
+        now = datetime.now().strftime("%H:%M")
+        message = f"📰 *Актуальные новости по майнингу* ({now}):\n\n{news}\n\n🔗 [Узнать больше]({LEAD_LINK})"
         try:
-            completion = openai.ChatCompletion.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": (
-                        "Ты — Telegram-бот по майнингу. Пиши каждые 3 часа короткий, актуальный, полезный пост."
-                        " Пиши как живой человек, кратко, строго по теме. В конце добавь нативную рекламу и закреп контактов."
-                    )},
-                    {"role": "user", "content": (
-                        "Напиши пост для Telegram-чата по теме майнинга."
-                        " Упомяни одну новость, совет по охлаждению или питанию, и в конце — краткая нативная реклама, например:"
-                        " 'по всем вопросам — @контакт'. Без эмодзи, без воды."
-                    )}
-                ],
-                temperature=0.5,
-                max_tokens=800
-            )
-            post_text = completion.choices[0].message.content.strip()
-            bot.send_message(chat_id="@Mining_Sale", text=post_text)
-        except Exception:
-            pass
-        time.sleep(60 * 60 * 3)  # 3 часа
+            bot.send_message(chat_id="@ВАШ_ЧАТ", text=message, parse_mode="Markdown")
+        except Exception as e:
+            print("Ошибка отправки новости:", e)
+        time.sleep(POST_INTERVAL)
 
-threading.Thread(target=auto_posting, daemon=True).start()
+# === ФУНКЦИЯ: ОБРАБОТКА СООБЩЕНИЙ ===
+@bot.message_handler(func=lambda message: True)
+def handle_message(message):
+    text = message.text.lower()
+    if any(keyword in text for keyword in KEYWORDS):
+        bot.reply_to(message, f"🛠 По вопросам покупки и доставки — наш партнёр: [Связаться]({LEAD_LINK})", parse_mode="Markdown")
+    else:
+        reply = ask_gpt(message.text)
+        bot.reply_to(message, reply)
 
-# Запуск бота
-bot.polling()
+# === ЗАПУСК ===
+threading.Thread(target=post_news).start()
+bot.infinity_polling()
