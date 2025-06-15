@@ -1,69 +1,142 @@
 import os
-import time
 import openai
 import telebot
 import requests
-import threading
+import json
+import time
 from datetime import datetime
+from threading import Thread
 
-# === НАСТРОЙКИ ===
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+# API tokens (должны быть заданы в Render в Environment Variables)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-CRYPTO_NEWS_URL = "https://cryptopanic.com/api/v1/posts/?auth_token=demo&public=true&currencies=BTC"
-LEAD_LINK = "https://app.leadteh.ru/w/dTeKr"
-POST_INTERVAL = 10800  # 3 часа в секундах
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CRYPTOPANIC_API_KEY = os.getenv("CRYPTOPANIC_API_KEY")
 
-# === ИНИЦИАЛИЗАЦИЯ ===
+# Telegram чат и админы
+TARGET_CHAT_ID = -1002408729915
+ADMINS = [7473992492, 5860994210]
+
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 openai.api_key = OPENAI_API_KEY
 
-# === СПИСОК КЛЮЧЕВЫХ СЛОВ ===
-KEYWORDS = ["где купить", "сколько стоит", "доставка", "гарантия", "цены"]
+BANNED_KEYWORDS = ["казино", "ставки", "1win", "pin-up", "играй и выигрывай"]
+SUSPICIOUS_PHRASES = set()
+USER_WARNINGS = {}
 
-# === ФУНКЦИЯ: ЗАПРОС К OPENAI ===
-def ask_gpt(prompt):
-    try:
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        return "Извините, произошла ошибка при получении ответа."
+# Постоянный текст с нативной ссылкой
+AD_LINK = "\n\n💬 Надёжный продавец оборудования: https://app.leadteh.ru/w/dTeKr"
 
-# === ФУНКЦИЯ: ПОЛУЧИТЬ НОВОСТИ С CRYPTOPANIC ===
-def fetch_news():
-    try:
-        response = requests.get(CRYPTO_NEWS_URL)
-        data = response.json()
-        headlines = [post['title'] for post in data.get('results', [])[:5]]
-        return "\n".join(f"• {h}" for h in headlines)
-    except:
-        return "Не удалось получить новости."
+# Системный промпт для GPT
+system_prompt = (
+    "Ты — эксперт по майнингу. Отвечай строго, профессионально и кратко. "
+    "Разбираешься в Antminer, Whatsminer, ROI, доставке и сервисе."
+)
 
-# === ФУНКЦИЯ: ПУБЛИКАЦИЯ НОВОСТЕЙ ===
-def post_news():
-    while True:
-        news = fetch_news()
-        now = datetime.now().strftime("%H:%M")
-        message = f"📰 *Актуальные новости по майнингу* ({now}):\n\n{news}\n\n🔗 [Узнать больше]({LEAD_LINK})"
-        try:
-            bot.send_message(chat_id="@ВАШ_ЧАТ", text=message, parse_mode="Markdown")
-        except Exception as e:
-            print("Ошибка отправки новости:", e)
-        time.sleep(POST_INTERVAL)
-
-# === ФУНКЦИЯ: ОБРАБОТКА СООБЩЕНИЙ ===
-@bot.message_handler(func=lambda message: True)
-def handle_message(message):
+# === GPT-ОТВЕТ ===
+@bot.message_handler(func=lambda m: True)
+def handle_all_messages(message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
     text = message.text.lower()
-    if any(keyword in text for keyword in KEYWORDS):
-        bot.reply_to(message, f"🛠 По вопросам покупки и доставки — наш партнёр: [Связаться]({LEAD_LINK})", parse_mode="Markdown")
-    else:
-        reply = ask_gpt(message.text)
+
+    # --- 1. Команда: помощь ---
+    if text.startswith("/помощь"):
+        bot.reply_to(message, (
+            "\u2705 Этот бот умеет:\n"
+            "1. Отвечать на вопросы по теме майнинга\n"
+            "2. Автоматически постить свежие новости каждые 3 часа\n"
+            "3. Защищать чат от спама и казино\n"
+            "4. Обучается: напишите 'ban' в ответ на сообщение — и он это запомнит\n"
+            "5. Команда /стата — только для админов, показывает статистику чата"
+        ))
+        return
+
+    # --- 2. Команда: стата ---
+    if text.startswith("/стата") and user_id in ADMINS:
+        stats = get_chat_statistics()
+        bot.reply_to(message, stats)
+        return
+
+    # --- 3. Команда: ban (обучение) ---
+    if text.startswith("ban") and message.reply_to_message:
+        SUSPICIOUS_PHRASES.add(message.reply_to_message.text.lower())
+        bot.reply_to(message, "Фраза добавлена в список подозрительных.")
+        return
+
+    # --- 4. Модерация: казино/спам ---
+    if any(kw in text for kw in BANNED_KEYWORDS + list(SUSPICIOUS_PHRASES)):
+        warnings = USER_WARNINGS.get(user_id, 0) + 1
+        USER_WARNINGS[user_id] = warnings
+
+        if warnings >= 3:
+            try:
+                bot.ban_chat_member(chat_id, user_id)
+                bot.reply_to(message, "\u26d4 Пользователь забанен за спам.")
+            except:
+                pass
+        else:
+            bot.reply_to(message, f"\u26a0 Предупреждение {warnings}/3. Продолжите — получите бан.")
+        return
+
+    # --- 5. GPT ответ ---
+    try:
+        completion = openai.ChatCompletion.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": message.text}
+            ],
+            temperature=0.4,
+            max_tokens=1000
+        )
+        reply = completion.choices[0].message.content.strip()
         bot.reply_to(message, reply)
+    except Exception as e:
+        bot.reply_to(message, "\u274c Ошибка на стороне GPT. Попробуйте позже.")
+
+# === КАЖДЫЕ 3 ЧАСА: НОВОСТИ ===
+def fetch_crypto_news():
+    url = f"https://cryptopanic.com/api/v1/posts/?auth_token={CRYPTOPANIC_API_KEY}&currencies=BTC,ETH&public=true"
+    try:
+        response = requests.get(url)
+        if response.status_code == 200:
+            data = response.json()
+            posts = data.get("results", [])[:3]
+            if not posts:
+                return
+
+            text = "\ud83d\udcc8 Новости по майнингу:\n"
+            for post in posts:
+                headline = post.get("title", "")
+                link = post.get("url", "")
+                text += f"\n\u2022 <a href='{link}'>{headline}</a>"
+
+            text += AD_LINK
+            bot.send_message(TARGET_CHAT_ID, text, parse_mode="HTML")
+    except Exception as e:
+        print("[!] Ошибка при получении новостей:", e)
+
+# === ПЕРИОДИЧЕСКИЙ ЦИКЛ ===
+def run_scheduled_news():
+    while True:
+        fetch_crypto_news()
+        time.sleep(3 * 60 * 60)  # каждые 3 часа
+
+# === СТАТИСТИКА ===
+def get_chat_statistics():
+    try:
+        members = bot.get_chat_members_count(TARGET_CHAT_ID)
+        admins = bot.get_chat_administrators(TARGET_CHAT_ID)
+        return (
+            f"\ud83d\udcca Статистика чата:\n"
+            f"\u2022 Участников: {members}\n"
+            f"\u2022 Админов: {len(admins)}\n"
+            f"\u2022 Подозрительных фраз: {len(SUSPICIOUS_PHRASES)}"
+        )
+    except:
+        return "\u274c Не удалось получить статистику."
 
 # === ЗАПУСК ===
-threading.Thread(target=post_news).start()
-bot.infinity_polling()
+if __name__ == "__main__":
+    Thread(target=run_scheduled_news).start()
+    bot.polling(none_stop=True)
