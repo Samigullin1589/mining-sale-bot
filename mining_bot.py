@@ -1,142 +1,106 @@
 import os
 import openai
-import telebot
 import requests
-import json
-import time
-from datetime import datetime
-from threading import Thread
+from flask import Flask, request
+import telebot
 
-# API tokens (должны быть заданы в Render в Environment Variables)
+# Загрузка переменных окружения
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CRYPTOPANIC_API_KEY = os.getenv("CRYPTOPANIC_API_KEY")
+CRYPTO_API_KEY = os.getenv("CRYPTO_API_KEY")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
-# Telegram чат и админы
-TARGET_CHAT_ID = -1002408729915
-ADMINS = [7473992492, 5860994210]
-
+app = Flask(__name__)
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
-openai.api_key = OPENAI_API_KEY
 
-BANNED_KEYWORDS = ["казино", "ставки", "1win", "pin-up", "играй и выигрывай"]
-SUSPICIOUS_PHRASES = set()
-USER_WARNINGS = {}
+# Доступ только для админов
+ADMINS = [7473992492, 5860994210]
+CHAT_ID = -1002408729915
 
-# Постоянный текст с нативной ссылкой
-AD_LINK = "\n\n💬 Надёжный продавец оборудования: https://app.leadteh.ru/w/dTeKr"
+# Хранилище подозрительных слов
+ban_phrases = ["casino", "казино", "easy money", "profit every hour"]
+custom_ban_list = []
+warned_users = {}
 
-# Системный промпт для GPT
-system_prompt = (
-    "Ты — эксперт по майнингу. Отвечай строго, профессионально и кратко. "
-    "Разбираешься в Antminer, Whatsminer, ROI, доставке и сервисе."
-)
-
-# === GPT-ОТВЕТ ===
-@bot.message_handler(func=lambda m: True)
-def handle_all_messages(message):
-    user_id = message.from_user.id
-    chat_id = message.chat.id
+# Хендлер входящих сообщений
+@bot.message_handler(func=lambda message: True)
+def handle_message(message):
     text = message.text.lower()
+    user_id = message.from_user.id
 
-    # --- 1. Команда: помощь ---
-    if text.startswith("/помощь"):
-        bot.reply_to(message, (
-            "\u2705 Этот бот умеет:\n"
-            "1. Отвечать на вопросы по теме майнинга\n"
-            "2. Автоматически постить свежие новости каждые 3 часа\n"
-            "3. Защищать чат от спама и казино\n"
-            "4. Обучается: напишите 'ban' в ответ на сообщение — и он это запомнит\n"
-            "5. Команда /стата — только для админов, показывает статистику чата"
-        ))
-        return
+    # Проверка на бан-фразы
+    if any(bad in text for bad in ban_phrases + custom_ban_list):
+        warned_users[user_id] = warned_users.get(user_id, 0) + 1
 
-    # --- 2. Команда: стата ---
-    if text.startswith("/стата") and user_id in ADMINS:
-        stats = get_chat_statistics()
-        bot.reply_to(message, stats)
-        return
-
-    # --- 3. Команда: ban (обучение) ---
-    if text.startswith("ban") and message.reply_to_message:
-        SUSPICIOUS_PHRASES.add(message.reply_to_message.text.lower())
-        bot.reply_to(message, "Фраза добавлена в список подозрительных.")
-        return
-
-    # --- 4. Модерация: казино/спам ---
-    if any(kw in text for kw in BANNED_KEYWORDS + list(SUSPICIOUS_PHRASES)):
-        warnings = USER_WARNINGS.get(user_id, 0) + 1
-        USER_WARNINGS[user_id] = warnings
-
-        if warnings >= 3:
-            try:
-                bot.ban_chat_member(chat_id, user_id)
-                bot.reply_to(message, "\u26d4 Пользователь забанен за спам.")
-            except:
-                pass
+        if warned_users[user_id] >= 3:
+            bot.ban_chat_member(CHAT_ID, user_id)
+            bot.send_message(CHAT_ID, f"Пользователь {user_id} заблокирован за спам")
         else:
-            bot.reply_to(message, f"\u26a0 Предупреждение {warnings}/3. Продолжите — получите бан.")
+            bot.send_message(CHAT_ID, f"Предупреждение за подозрительную активность. {3 - warned_users[user_id]} до блокировки.")
         return
 
-    # --- 5. GPT ответ ---
+    # Команда /бан (обучение фразам)
+    if text.startswith("/бан") and message.reply_to_message:
+        reply_text = message.reply_to_message.text.lower()
+        custom_ban_list.append(reply_text)
+        bot.send_message(CHAT_ID, f"Фраза добавлена в список подозрительных")
+        return
+
+    # Ответ через GPT
+    prompt = (
+        "Ты — ИИ помощник по майнингу. Отвечай строго, профессионально и кратко."
+        "Разбираешься в Antminer, Whatsminer, доставке, ROI, ремонте, поставках."
+    )
+
     try:
         completion = openai.ChatCompletion.create(
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": message.text}
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": message.text},
             ],
             temperature=0.4,
-            max_tokens=1000
+            max_tokens=1000,
         )
         reply = completion.choices[0].message.content.strip()
-        bot.reply_to(message, reply)
+        bot.send_message(message.chat.id, reply)
     except Exception as e:
-        bot.reply_to(message, "\u274c Ошибка на стороне GPT. Попробуйте позже.")
+        bot.send_message(message.chat.id, "⚠️ GPT временно недоступен. Попробуйте позже.")
 
-# === КАЖДЫЕ 3 ЧАСА: НОВОСТИ ===
-def fetch_crypto_news():
-    url = f"https://cryptopanic.com/api/v1/posts/?auth_token={CRYPTOPANIC_API_KEY}&currencies=BTC,ETH&public=true"
+# Ендпоинт от Telegram
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    json_str = request.get_data().decode('UTF-8')
+    update = telebot.types.Update.de_json(json_str)
+    bot.process_new_updates([update])
+    return 'ok'
+
+# Ручная установка Webhook (вызывается один раз)
+@app.route('/set_webhook', methods=['GET'])
+def set_webhook():
+    s = bot.set_webhook(url=WEBHOOK_URL)
+    return f'Webhook установлен: {s}'
+
+# Автопостинг новостей каждые 3 часа
+@app.route('/post_news', methods=['GET'])
+def post_news():
+    url = "https://cryptopanic.com/api/v1/posts/?auth_token=" + CRYPTO_API_KEY + "&kind=news"
     try:
         response = requests.get(url)
-        if response.status_code == 200:
-            data = response.json()
-            posts = data.get("results", [])[:3]
-            if not posts:
-                return
+        news = response.json().get("results", [])[:3]
 
-            text = "\ud83d\udcc8 Новости по майнингу:\n"
-            for post in posts:
-                headline = post.get("title", "")
-                link = post.get("url", "")
-                text += f"\n\u2022 <a href='{link}'>{headline}</a>"
+        if news:
+            msg = "📰 Актуальные новости по майнингу:\n\n"
+            for item in news:
+                msg += f"{item['title']}\n{item['url']}\n\n"
+            msg += "\n🤝 Продвижение оплачено. Проверяйте продавцов лично.\n🔗 https://app.leadteh.ru/w/dTeKr"
+            bot.send_message(CHAT_ID, msg)
+            return 'Опубликовано'
+        else:
+            return 'Нет новостей'
 
-            text += AD_LINK
-            bot.send_message(TARGET_CHAT_ID, text, parse_mode="HTML")
     except Exception as e:
-        print("[!] Ошибка при получении новостей:", e)
+        return f'Ошибка при получении новостей: {str(e)}'
 
-# === ПЕРИОДИЧЕСКИЙ ЦИКЛ ===
-def run_scheduled_news():
-    while True:
-        fetch_crypto_news()
-        time.sleep(3 * 60 * 60)  # каждые 3 часа
-
-# === СТАТИСТИКА ===
-def get_chat_statistics():
-    try:
-        members = bot.get_chat_members_count(TARGET_CHAT_ID)
-        admins = bot.get_chat_administrators(TARGET_CHAT_ID)
-        return (
-            f"\ud83d\udcca Статистика чата:\n"
-            f"\u2022 Участников: {members}\n"
-            f"\u2022 Админов: {len(admins)}\n"
-            f"\u2022 Подозрительных фраз: {len(SUSPICIOUS_PHRASES)}"
-        )
-    except:
-        return "\u274c Не удалось получить статистику."
-
-# === ЗАПУСК ===
-if __name__ == "__main__":
-    Thread(target=run_scheduled_news).start()
-    bot.polling(none_stop=True)
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=10000)
