@@ -12,7 +12,6 @@ from openai import OpenAI
 from datetime import datetime
 from bs4 import BeautifulSoup
 
-# --- Настройки ---
 BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY")
@@ -27,8 +26,6 @@ ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 app = Flask(__name__)
 client = OpenAI(api_key=OPENAI_API_KEY)
-
-# --- Глобальное хранилище запросов погоды ---
 pending_weather_requests = {}
 
 @app.route('/webhook', methods=['POST'])
@@ -48,11 +45,8 @@ def set_webhook():
     time.sleep(1)
     bot.set_webhook(url=WEBHOOK_URL.rstrip("/") + "/webhook")
 
-# --- Google Sheets ---
 def get_gsheet():
-    creds = Credentials.from_service_account_file(GOOGLE_JSON, scopes=[
-        'https://www.googleapis.com/auth/spreadsheets']
-    )
+    creds = Credentials.from_service_account_file(GOOGLE_JSON, scopes=['https://www.googleapis.com/auth/spreadsheets'])
     gc = gspread.authorize(creds)
     return gc.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
 
@@ -63,7 +57,6 @@ def log_error_to_sheet(error_msg):
     except:
         pass
 
-# --- Актуальные ASIC модели ---
 TOP_ASICS = []
 
 def update_top_asics():
@@ -87,7 +80,6 @@ def schedule_asic_updates():
     schedule.every().day.at("03:00").do(update_top_asics)
     update_top_asics()
 
-# --- GPT ---
 def ask_gpt(prompt):
     try:
         res = client.chat.completions.create(
@@ -96,9 +88,8 @@ def ask_gpt(prompt):
         )
         return res.choices[0].message.content.strip()
     except Exception as e:
-        return f"[Ошибка GPT: {e}]"
+        return f"[GPT ошибка: {e}]"
 
-# --- Погода (через wttr.in) ---
 def get_weather(city):
     try:
         url = f"https://wttr.in/{city}?format=j1"
@@ -118,7 +109,6 @@ def get_weather(city):
     except Exception as e:
         return f"[Ошибка погоды: {e}]"
 
-# --- Курсы валют ---
 def get_currency_rate(from_symbol, to_symbol):
     try:
         url = f"https://api.exchangerate.host/latest?base={from_symbol.upper()}&symbols={to_symbol.upper()}"
@@ -128,7 +118,6 @@ def get_currency_rate(from_symbol, to_symbol):
     except Exception as e:
         return f"[Ошибка курса: {e}]"
 
-# --- Получение курса BTC ---
 def get_coin_price(coin_id='bitcoin'):
     try:
         data = requests.get(f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd").json()
@@ -136,7 +125,31 @@ def get_coin_price(coin_id='bitcoin'):
     except:
         return None
 
-# --- Обработка всех сообщений ---
+def get_crypto_news():
+    try:
+        r = requests.get(f"https://cryptopanic.com/api/v1/posts/?auth_token={CRYPTO_API_KEY}&currencies=BTC,ETH&public=true").json()
+        filtered = r.get("results", [])[:3]
+        items = []
+        for item in filtered:
+            title = item.get("title", "Без заголовка")
+            url = item.get("url", "")
+            translated = ask_gpt(f"Переведи и кратко поясни:\n{title}")
+            items.append(f"🔹 {translated}\n{url}")
+        return "\n\n".join(items) if items else "[Нет свежих новостей]"
+    except Exception as e:
+        return f"[Ошибка CryptoPanic: {e}]"
+
+def is_mining_price_message(text):
+    return any(x in text.lower() for x in ["th", "asics", "в наличии", "продам", "бу", "новые", "usd", "$"])
+
+def analyze_mining_prices(text):
+    prompt = (
+        "Это сообщение из Telegram-чата с прайсами на майнинг-оборудование."
+        " Проанализируй как трейдер: есть ли выгодные предложения, актуальные цены, есть ли подозрительно дешевые."
+        " Ответь кратко, на русском, без формальностей.\n\nТекст:\n" + text
+    )
+    return ask_gpt(prompt)
+
 @bot.message_handler(func=lambda msg: True)
 def handle_all_messages(msg):
     user_id = msg.from_user.id
@@ -155,24 +168,28 @@ def handle_all_messages(msg):
 
     if "курс btc" in text:
         price = get_coin_price("bitcoin")
-        if price:
-            bot.send_message(msg.chat.id, f"💰 Курс BTC: ${price}")
-        else:
-            bot.send_message(msg.chat.id, "Не удалось получить курс BTC")
+        bot.send_message(msg.chat.id, f"💰 Курс BTC: ${price}" if price else "Не удалось получить курс BTC")
         return
 
     if "доллар к евро" in text:
         bot.send_message(msg.chat.id, get_currency_rate("usd", "eur"))
         return
 
+    if "tiktok.com" in text:
+        bot.send_message(msg.chat.id, "⚠️ Бот не может просматривать TikTok. Опишите суть — помогу!")
+        return
+
+    if is_mining_price_message(text):
+        feedback = analyze_mining_prices(msg.text)
+        bot.send_message(msg.chat.id, feedback)
+        return
+
     if any(k in text for k in ["asic", "модель", "розетка", "квт", "выгодно", "доходность"]):
         models = "\n".join(TOP_ASICS)
         prompt = (
-            "Ниже представлен актуальный список ASIC SHA‑256 моделей, полученный с сайта asicminervalue.com, "
-            "обновлённый сегодня. Используй исключительно эти данные. Не ссылайся на своё обучение в 2023 году. "
-            "Отвечай как консультант, у которого свежая информация.\n\n"
-            f"{models}\n\n"
-            f"Теперь ответь на вопрос пользователя:\n{msg.text}"
+            "Ниже представлен актуальный список ASIC SHA‑256 моделей, полученный с сайта asicminervalue.com,"
+            " обновлённый сегодня. Используй исключительно эти данные.\n\n"
+            f"{models}\n\nТеперь ответь на вопрос пользователя:\n{msg.text}"
         )
     else:
         prompt = msg.text
@@ -185,10 +202,9 @@ def handle_all_messages(msg):
     except Exception as e:
         bot.send_message(msg.chat.id, f"[GPT ошибка: {e}]")
 
-# --- Автообновление ---
 def auto_send_news():
     try:
-        news = "Новостной блок пока не реализован здесь."
+        news = get_crypto_news()
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("💬 Получить прайс от партнёра", url="https://app.leadteh.ru/w/dTeKr"))
         bot.send_message(NEWS_CHAT_ID, news, reply_markup=markup)
@@ -216,7 +232,6 @@ def run_scheduler():
         schedule.run_pending()
         time.sleep(1)
 
-# --- Запуск ---
 if __name__ == '__main__':
     set_webhook()
     threading.Thread(target=run_scheduler).start()
