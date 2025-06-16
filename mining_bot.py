@@ -65,10 +65,11 @@ def log_price_to_sheet(user, text):
         sheet.append_row([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), user.username or user.first_name, text])
     except: pass
 
-def get_coingecko_price(symbol="bitcoin"):
+def get_binance_price(symbol="BTCUSDT"):
     try:
-        res = requests.get(f"https://api.coingecko.com/api/v3/simple/price?ids={symbol}&vs_currencies=usd")
-        return round(res.json()[symbol]['usd'], 2)
+        res = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol.upper()}").json()
+        price = float(res['price'])
+        return price
     except Exception as e:
         return None
 
@@ -204,9 +205,9 @@ def handle_start(msg):
 
 @bot.message_handler(commands=['cmc'])
 def handle_cmc(msg):
-    price = get_coingecko_price("bitcoin")
+    price = get_binance_price("BTCUSDT")
     if price:
-        bot.send_message(msg.chat.id, f"💹 Курс BTC по CoinGecko: ${price}")
+        bot.send_message(msg.chat.id, f"💹 Курс BTC по Binance: ${price}")
     else:
         bot.send_message(msg.chat.id, "[Ошибка получения курса BTC]")
 
@@ -231,7 +232,7 @@ def handle_all_messages(msg):
         return
 
     if any(k in text for k in ["курс btc", "btc курс", "курс биткоина", "btc price", "btc now", "биткоин курс"]):
-        price = get_coingecko_price("bitcoin")
+        price = get_binance_price("BTCUSDT")
         if price:
             comment = ask_gpt(f"Курс BTC ${price}. Кратко прокомментируй текущую ситуацию в 1 предложении.")
             bot.send_message(msg.chat.id, f"💰 Курс BTC: ${price}\n{comment}")
