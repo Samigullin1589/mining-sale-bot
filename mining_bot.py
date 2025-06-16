@@ -28,7 +28,6 @@ bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 app = Flask(__name__)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# --- Webhook ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
     if request.headers.get('content-type') == 'application/json':
@@ -58,7 +57,8 @@ def log_error_to_sheet(error_msg):
     try:
         sh = get_gsheet()
         sh.append_row([time.strftime("%Y-%m-%d %H:%M:%S"), "error", error_msg])
-    except: pass
+    except:
+        pass
 
 # --- Актуальные ASIC модели ---
 TOP_ASICS = []
@@ -100,20 +100,26 @@ def get_coin_price(coin_id='bitcoin'):
     try:
         data = requests.get(f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd").json()
         return float(data[coin_id]['usd'])
-    except: return None
+    except:
+        return None
 
 def get_crypto_news():
     news = []
+
+    # NewsAPI
     try:
-        r = requests.get(f"https://newsapi.org/v2/top-headlines?q=crypto&language=en&sortBy=publishedAt&pageSize=3&apiKey={NEWSAPI_KEY}").json()
+        r = requests.get(
+            f"https://newsapi.org/v2/top-headlines?q=crypto&language=en&sortBy=publishedAt&pageSize=3&apiKey={NEWSAPI_KEY}"
+        ).json()
         for item in r.get("articles", [])[:3]:
-    title = item.get("title", "Без заголовка")
-    url = item.get("url", "")
-    translated = ask_gpt(f'Переведи на русский и кратко перескажи:\n"{title}"')
-    news.append(f"📰 {translated}\n{url}")
+            title = item.get("title", "Без заголовка")
+            url = item.get("url", "")
+            translated = ask_gpt(f'Переведи на русский и кратко перескажи:\n"{title}"')
+            news.append(f"📰 {translated}\n{url}")
     except Exception as e:
         news.append(f"[Ошибка NewsAPI: {e}]")
 
+    # CryptoPanic
     try:
         if CRYPTO_API_KEY:
             r = requests.get(
@@ -137,6 +143,7 @@ def get_crypto_news():
             news.append("[CRYPTO_API_KEY не задан]")
     except Exception as e:
         news.append(f"[Ошибка CryptoPanic: {e}]")
+
     return "\n\n".join(news)
 
 # --- Калькулятор ---
@@ -243,7 +250,7 @@ def run_scheduler():
         schedule.run_pending()
         time.sleep(1)
 
-# --- Старт ---
+# --- Запуск ---
 if __name__ == '__main__':
     set_webhook()
     threading.Thread(target=run_scheduler).start()
