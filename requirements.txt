@@ -7,3 +7,4 @@ google-auth
 fpdf
 pytz
 feedparser
+oauth2client
