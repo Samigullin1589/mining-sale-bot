@@ -10,7 +10,7 @@ import pytz
 
 # --- Настройки (токены, вебхуки, ключи) ---
 BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or "ТВОЙ_ТОКЕН_ТУТ"
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL") or "https://ТВОЙ-ДОМЕН.onrender.com/"  # без /webhook, будет ниже
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL") or "https://ТВОЙ-ДОМЕН.onrender.com/"  # без /webhook
 NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY") or "ТВОЙ_NEWSAPI_KEY"
 GOOGLE_JSON = os.environ.get("GOOGLE_JSON", "sage-instrument-338811-a8c8cc7f2500.json")
 SHEET_ID = os.environ.get("SHEET_ID") or "ID_ТВОЕЙ_ТАБЛИЦЫ"
@@ -65,7 +65,6 @@ def get_news():
             news.append(item["title"] + "\n" + item["url"])
     except Exception as e:
         news.append(f"[Ошибка NewsAPI: {e}]")
-    # CryptoPanic RSS
     try:
         d = feedparser.parse("https://cryptopanic.com/news/rss")
         if d.entries:
@@ -106,6 +105,11 @@ def cmd_stat(msg):
         bot.send_message(msg.chat.id, f"Всего записей: {len(rows)}")
     except Exception as e:
         bot.send_message(msg.chat.id, "Ошибка: " + str(e))
+
+# ✅ Обработчик всех сообщений (для теста)
+@bot.message_handler(func=lambda message: True)
+def echo_all(message):
+    bot.send_message(message.chat.id, f"Вы написали: {message.text}")
 
 # --- Основной запуск Flask + webhook ---
 if __name__ == '__main__':
