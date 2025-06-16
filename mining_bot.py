@@ -124,7 +124,7 @@ def schedule_asic_updates():
     schedule.every().day.at("03:00").do(update_top_asics)
     update_top_asics()
 
-def auto_send_news():
+def get_crypto_news():
     try:
         r = requests.get(f"https://cryptopanic.com/api/v1/posts/?auth_token={CRYPTO_API_KEY}&currencies=BTC,ETH&public=true").json()
         posts = r.get("results", [])[:3]
@@ -132,7 +132,13 @@ def auto_send_news():
         for post in posts:
             translated = ask_gpt(f"Переведи и объясни новость:\n{post['title']}")
             items.append(f"🔹 {translated}\n{post['url']}")
-        news = "\n\n".join(items) if items else "[Нет новостей]"
+        return "\n\n".join(items) if items else "[Нет новостей]"
+    except Exception as e:
+        return f"[Ошибка новостей: {e}]"
+
+def auto_send_news():
+    try:
+        news = get_crypto_news()
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("💬 Получить прайс от партнёра", url="https://app.leadteh.ru/w/dTeKr"))
         bot.send_message(NEWS_CHAT_ID, news, reply_markup=markup)
@@ -190,6 +196,10 @@ def handle_all_messages(msg):
 
     if "доллар к евро" in text:
         bot.send_message(msg.chat.id, get_currency_rate("usd", "eur"))
+        return
+
+    if "новости" in text:
+        bot.send_message(msg.chat.id, get_crypto_news())
         return
 
     if any(x in text for x in ["продам", "asic", "в наличии", "бу", "$", "usd"]):
