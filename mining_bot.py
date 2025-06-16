@@ -131,7 +131,11 @@ def get_crypto_news():
         items = []
         for post in posts:
             translated = ask_gpt(f"Переведи и объясни новость:\n{post['title']}")
-            items.append(f"🔹 {translated}\n{post['url']}")
+            url = post.get('url') or post.get('source', {}).get('url', '')
+            if url:
+                items.append(f"🔹 {translated}\n{url}")
+            else:
+                items.append(f"🔹 {translated}")
         return "\n\n".join(items) if items else "[Нет новостей]"
     except Exception as e:
         return f"[Ошибка новостей: {e}]"
