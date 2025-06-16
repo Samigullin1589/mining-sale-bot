@@ -140,6 +140,36 @@ def get_crypto_news():
     except Exception as e:
         return f"[Ошибка новостей: {e}]"
 
+def send_profit_chart(chat_id):
+    try:
+        sheet = get_gsheet()
+        records = sheet.get_all_values()[1:]  # пропускаем заголовки
+        dates = [r[0] for r in records]
+        messages = [r[2] for r in records]
+        profits = []
+        for text in messages:
+            if "$" in text:
+                try:
+                    dollar = float(text.split("$")[1].split()[0])
+                    profits.append(dollar)
+                except:
+                    profits.append(0)
+            else:
+                profits.append(0)
+        plt.figure(figsize=(10,4))
+        plt.plot(dates, profits, marker='o')
+        plt.title('Доходность по дням')
+        plt.xlabel('Дата')
+        plt.ylabel('USD')
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png')
+        buf.seek(0)
+        bot.send_photo(chat_id, buf)
+    except Exception as e:
+        bot.send_message(chat_id, f"[Ошибка графика: {e}]")
+
 def auto_send_news():
     try:
         news = get_crypto_news()
@@ -176,6 +206,10 @@ def handle_start(msg):
 def handle_cmc(msg):
     price = get_coingecko_price("bitcoin")
     bot.send_message(msg.chat.id, f"💹 Курс BTC по CoinGecko: ${price}")
+
+@bot.message_handler(commands=['chart'])
+def handle_chart(msg):
+    send_profit_chart(msg.chat.id)
 
 @bot.message_handler(func=lambda msg: True)
 def handle_all_messages(msg):
@@ -217,7 +251,7 @@ def handle_all_messages(msg):
             "Ниже представлен актуальный список ASIC SHA‑256 моделей, полученный с сайта asicminervalue.com, "
             "обновлённый сегодня. Используй исключительно эти данные. Не ссылайся на своё обучение в 2023 году. "
             "Отвечай как консультант, у которого свежая информация.\n\n"
-            f"{models}\n\nТеперь ответь на вопрос пользователя:\n{msg.text}"
+            f"{models}\n\nТеперь ответь на вопрос пользователя:\n{text}"
         )
     else:
         prompt = msg.text
