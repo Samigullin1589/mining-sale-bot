@@ -105,10 +105,12 @@ def get_coin_price(coin_id='bitcoin'):
 def get_crypto_news():
     news = []
     try:
-        r = requests.get(f"https://newsapi.org/v2/everything?q=cryptocurrency&apiKey={NEWSAPI_KEY}&pageSize=1").json()
-        for item in r.get("articles", []):
-            translated = ask_gpt("Переведи на русский и кратко перескажи:\n" + item["title"])
-            news.append(f"{translated}\n{item['url']}")
+        r = requests.get(f"https://newsapi.org/v2/top-headlines?q=crypto&language=en&sortBy=publishedAt&pageSize=3&apiKey={NEWSAPI_KEY}").json()
+        for item in r.get("articles", [])[:3]:
+    title = item.get("title", "Без заголовка")
+    url = item.get("url", "")
+    translated = ask_gpt(f'Переведи на русский и кратко перескажи:\n"{title}"')
+    news.append(f"📰 {translated}\n{url}")
     except Exception as e:
         news.append(f"[Ошибка NewsAPI: {e}]")
 
