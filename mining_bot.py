@@ -13,13 +13,15 @@ from telebot import types
 import openai
 
 # --- Настройки ---
-BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
-NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY")
+BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or "⚠️ TG_BOT_TOKEN is missing"
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL") or "⚠️ WEBHOOK_URL is missing"
+NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY") or "⚠️ NEWSAPI_KEY is missing"
 GOOGLE_JSON = os.environ.get("GOOGLE_JSON", "sage-instrument-338811-a8c8cc7f2500.json")
-SHEET_ID = os.environ.get("SHEET_ID")
+SHEET_ID = os.environ.get("SHEET_ID") or "⚠️ SHEET_ID is missing"
 SHEET_NAME = os.environ.get("SHEET_NAME", "Лист1")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or "⚠️ OPENAI_API_KEY is missing"
+NEWS_CHAT_ID = os.environ.get("NEWS_CHAT_ID") or "-1002408729915"
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID") or "7473992492"
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
@@ -47,8 +49,8 @@ def set_webhook():
 # --- Подключение к Google Sheets ---
 def get_gsheet():
     creds = Credentials.from_service_account_file(GOOGLE_JSON, scopes=[
-        'https://www.googleapis.com/auth/spreadsheets'
-    ])
+        'https://www.googleapis.com/auth/spreadsheets']
+    )
     gc = gspread.authorize(creds)
     return gc.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
 
@@ -133,11 +135,35 @@ def auto_send_news():
         text = get_news()
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("🔥 Интересует оборудование? Спецусловия тут:", url="https://app.leadteh.ru/w/dTeKr"))
-        bot.send_message(os.environ.get("NEWS_CHAT_ID"), text, reply_markup=markup)
+        bot.send_message(NEWS_CHAT_ID, text, reply_markup=markup)
     except Exception as e:
         print(f"Ошибка авторассылки новостей: {e}")
 
+# --- Автоотчёт по проверке переменных и функций ---
+def auto_check_status():
+    errors = []
+    if "⚠️" in BOT_TOKEN: errors.append("BOT_TOKEN")
+    if "⚠️" in WEBHOOK_URL: errors.append("WEBHOOK_URL")
+    if "⚠️" in NEWSAPI_KEY: errors.append("NEWSAPI_KEY")
+    if "⚠️" in SHEET_ID: errors.append("SHEET_ID")
+    if "⚠️" in OPENAI_API_KEY: errors.append("OPENAI_API_KEY")
+    try:
+        get_news()
+    except Exception as e:
+        errors.append(f"News function: {e}")
+    try:
+        ask_gpt("Проверка GPT")
+    except Exception as e:
+        errors.append(f"GPT: {e}")
+    try:
+        get_gsheet()
+    except Exception as e:
+        errors.append(f"Google Sheets: {e}")
+    msg = "✅ Все функции работают корректно." if not errors else "⚠️ Обнаружены проблемы:\n" + "\n".join(errors)
+    bot.send_message(ADMIN_CHAT_ID, msg)
+
 schedule.every(3).hours.do(auto_send_news)
+schedule.every(3).hours.do(auto_check_status)
 
 def run_scheduler():
     while True:
