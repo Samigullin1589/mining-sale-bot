@@ -11,3 +11,4 @@ feedparser
 oauth2client
 schedule
 beautifulsoup4
+matplotlib
