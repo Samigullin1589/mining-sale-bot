@@ -70,7 +70,7 @@ def get_coingecko_price(symbol="bitcoin"):
         res = requests.get(f"https://api.coingecko.com/api/v3/simple/price?ids={symbol}&vs_currencies=usd")
         return round(res.json()[symbol]['usd'], 2)
     except Exception as e:
-        return f"[Ошибка CoinGecko: {e}]"
+        return None
 
 def get_weather(city):
     try:
@@ -205,7 +205,10 @@ def handle_start(msg):
 @bot.message_handler(commands=['cmc'])
 def handle_cmc(msg):
     price = get_coingecko_price("bitcoin")
-    bot.send_message(msg.chat.id, f"💹 Курс BTC по CoinGecko: ${price}")
+    if price:
+        bot.send_message(msg.chat.id, f"💹 Курс BTC по CoinGecko: ${price}")
+    else:
+        bot.send_message(msg.chat.id, "[Ошибка получения курса BTC]")
 
 @bot.message_handler(commands=['chart'])
 def handle_chart(msg):
@@ -229,7 +232,10 @@ def handle_all_messages(msg):
 
     if any(k in text for k in ["курс btc", "btc курс", "курс биткоина", "btc price", "btc now", "биткоин курс"]):
         price = get_coingecko_price("bitcoin")
-        bot.send_message(msg.chat.id, f"💰 Курс BTC: ${price}")
+        if price:
+            bot.send_message(msg.chat.id, f"💰 Курс BTC: ${price}")
+        else:
+            bot.send_message(msg.chat.id, "[Ошибка получения курса BTC]")
         return
 
     if "доллар к евро" in text:
