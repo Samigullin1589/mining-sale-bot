@@ -28,6 +28,9 @@ bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 app = Flask(__name__)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+# --- Глобальное хранилище запросов погоды ---
+pending_weather_requests = {}
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
     if request.headers.get('content-type') == 'application/json':
@@ -95,7 +98,37 @@ def ask_gpt(prompt):
     except Exception as e:
         return f"[Ошибка GPT: {e}]"
 
-# --- Новости ---
+# --- Погода (через wttr.in) ---
+def get_weather(city):
+    try:
+        url = f"https://wttr.in/{city}?format=j1"
+        r = requests.get(url).json()
+        current = r["current_condition"][0]
+        temp = current["temp_C"]
+        desc = current["weatherDesc"][0]["value"]
+        humidity = current["humidity"]
+        wind = current["windspeedKmph"]
+        return (
+            f"🌍 Город: {city.title()}\n"
+            f"🌡 Температура: {temp}°C\n"
+            f"☁️ Погода: {desc}\n"
+            f"💧 Влажность: {humidity}%\n"
+            f"💨 Ветер: {wind} км/ч"
+        )
+    except Exception as e:
+        return f"[Ошибка погоды: {e}]"
+
+# --- Курсы валют ---
+def get_currency_rate(from_symbol, to_symbol):
+    try:
+        url = f"https://api.exchangerate.host/latest?base={from_symbol.upper()}&symbols={to_symbol.upper()}"
+        data = requests.get(url).json()
+        rate = data['rates'][to_symbol.upper()]
+        return f"💱 {from_symbol.upper()} → {to_symbol.upper()} = {rate:.2f}"
+    except Exception as e:
+        return f"[Ошибка курса: {e}]"
+
+# --- Получение курса BTC ---
 def get_coin_price(coin_id='bitcoin'):
     try:
         data = requests.get(f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd").json()
@@ -103,91 +136,35 @@ def get_coin_price(coin_id='bitcoin'):
     except:
         return None
 
-def get_crypto_news():
-    news = []
-
-    try:
-        r = requests.get(
-            f"https://newsapi.org/v2/top-headlines?q=crypto&language=en&sortBy=publishedAt&pageSize=3&apiKey={NEWSAPI_KEY}"
-        ).json()
-        for item in r.get("articles", []):
-            title = item.get("title", "Без заголовка")
-            url = item.get("url", "")
-            translated = ask_gpt(f'Переведи на русский и кратко перескажи:\n"{title}"')
-            news.append(f"📰 {translated}\n{url}")
-    except Exception as e:
-        news.append(f"[Ошибка NewsAPI: {e}]")
-
-    try:
-        if CRYPTO_API_KEY:
-            r = requests.get(
-                f"https://cryptopanic.com/api/v1/posts/?auth_token={CRYPTO_API_KEY}&currencies=BTC,ETH&public=true"
-            ).json()
-            filtered = [
-                p for p in r.get("results", [])
-                if "tags" in p and any(tag.get("label", "").lower() in ["bullish", "news", "signal"] for tag in p["tags"])
-            ]
-
-            if not filtered:
-                filtered = r.get("results", [])[:3]
-
-            for item in filtered[:3]:
-                title = item.get("title", "Без заголовка")
-                url = item.get("url", "")
-                time_raw = item.get("published_at", "")
-                time_str = datetime.fromisoformat(time_raw.replace("Z", "+00:00")).strftime("%H:%M %d.%m")
-                translated = ask_gpt("Переведи на русский и кратко перескажи:\n" + title)
-                news.append(f"🕒 {time_str}\n🔹 {translated}\n{url}")
-        else:
-            news.append("[CRYPTO_API_KEY не задан]")
-    except Exception as e:
-        news.append(f"[Ошибка CryptoPanic: {e}]")
-
-    return "\n\n".join(news)
-
-# --- Калькулятор ---
-def calculate_profit(ths, watt, kwh_cost, coin_price, coin_per_th_day):
-    coin_day = ths * coin_per_th_day
-    income = coin_day * coin_price
-    cost = (watt * 24 / 1000) * kwh_cost
-    profit = income - cost
-    return round(profit, 2), round(income, 2), round(cost, 2)
-
-@bot.message_handler(commands=['calc'])
-def handle_calc(msg):
-    try:
-        parts = msg.text.split()
-        ths, watt, kwh = float(parts[1]), float(parts[2]), float(parts[3])
-        btc = get_coin_price("bitcoin")
-        if not btc: raise Exception("нет цены BTC")
-        p, i, c = calculate_profit(ths, watt, kwh, btc, 0.000027)
-        bot.send_message(msg.chat.id, f"📟 Доходность:\n💰 Доход: ${i}\n🔌 Расход: ${c}\n📈 Профит: ${p}\n(курс BTC: ${btc})")
-    except:
-        bot.send_message(msg.chat.id, "❗ Формат: /calc 120 3300 0.07")
-
-# --- Команды ---
-@bot.message_handler(func=lambda msg: msg.text.lower() in ['start', 'старт'])
-def handle_start(msg):
-    bot.send_message(msg.chat.id, "Привет! Бот работает.")
-
-@bot.message_handler(func=lambda msg: msg.text.lower() in ['news', 'новости'])
-def handle_news(msg):
-    text = get_crypto_news()
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("💬 Получить прайс от партнёра", url="https://app.leadteh.ru/w/dTeKr"))
-    bot.send_message(msg.chat.id, text, reply_markup=markup)
-
-@bot.message_handler(func=lambda msg: msg.text.lower() in ['stat', 'стат'])
-def handle_stat(msg):
-    try:
-        rows = get_gsheet().get_all_values()
-        bot.send_message(msg.chat.id, f"Всего записей: {len(rows)}")
-    except Exception as e:
-        bot.send_message(msg.chat.id, "Ошибка: " + str(e))
-
+# --- Обработка всех сообщений ---
 @bot.message_handler(func=lambda msg: True)
-def handle_gpt(msg):
+def handle_all_messages(msg):
+    user_id = msg.from_user.id
     text = msg.text.lower()
+
+    if user_id in pending_weather_requests:
+        response = get_weather(msg.text)
+        del pending_weather_requests[user_id]
+        bot.send_message(msg.chat.id, response)
+        return
+
+    if "погода" in text:
+        pending_weather_requests[user_id] = True
+        bot.send_message(msg.chat.id, "🌦 В каком городе вас интересует погода?")
+        return
+
+    if "курс btc" in text:
+        price = get_coin_price("bitcoin")
+        if price:
+            bot.send_message(msg.chat.id, f"💰 Курс BTC: ${price}")
+        else:
+            bot.send_message(msg.chat.id, "Не удалось получить курс BTC")
+        return
+
+    if "доллар к евро" in text:
+        bot.send_message(msg.chat.id, get_currency_rate("usd", "eur"))
+        return
+
     if any(k in text for k in ["asic", "модель", "розетка", "квт", "выгодно", "доходность"]):
         models = "\n".join(TOP_ASICS)
         prompt = (
@@ -199,6 +176,7 @@ def handle_gpt(msg):
         )
     else:
         prompt = msg.text
+
     try:
         answer = ask_gpt(prompt)
         markup = types.InlineKeyboardMarkup()
@@ -207,18 +185,10 @@ def handle_gpt(msg):
     except Exception as e:
         bot.send_message(msg.chat.id, f"[GPT ошибка: {e}]")
 
-# --- Спам-фильтр ---
-SPAM_PHRASES = ["заработок без вложений", "казино", "ставки", "раздача"]
-@bot.message_handler(func=lambda m: any(x in m.text.lower() for x in SPAM_PHRASES))
-def spam_filter(msg):
-    bot.delete_message(msg.chat.id, msg.message_id)
-    bot.send_message(msg.chat.id, "Сообщение удалено как спам.")
-    log_error_to_sheet(f"SPAM: {msg.text}")
-
 # --- Автообновление ---
 def auto_send_news():
     try:
-        news = get_crypto_news()
+        news = "Новостной блок пока не реализован здесь."
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("💬 Получить прайс от партнёра", url="https://app.leadteh.ru/w/dTeKr"))
         bot.send_message(NEWS_CHAT_ID, news, reply_markup=markup)
@@ -230,8 +200,6 @@ def auto_check_status():
     for key, name in [(BOT_TOKEN, "BOT_TOKEN"), (WEBHOOK_URL, "WEBHOOK_URL"),
                       (NEWSAPI_KEY, "NEWSAPI_KEY"), (SHEET_ID, "SHEET_ID"), (OPENAI_API_KEY, "OPENAI_API_KEY")]:
         if not key or "⚠️" in str(key): errors.append(name)
-    try: get_crypto_news()
-    except Exception as e: errors.append(f"News: {e}")
     try: ask_gpt("Проверка GPT")
     except Exception as e: errors.append(f"GPT: {e}")
     try: get_gsheet()
