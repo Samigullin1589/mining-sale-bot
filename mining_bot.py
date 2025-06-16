@@ -23,7 +23,7 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or "⚠️ OPENAI_API_KEY is m
 NEWS_CHAT_ID = os.environ.get("NEWS_CHAT_ID") or "-1002408729915"
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID") or "7473992492"
 
-bot = telebot.TeleBot(BOT_TOKEN)
+bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 app = Flask(__name__)
 
 # --- Webhook ---
