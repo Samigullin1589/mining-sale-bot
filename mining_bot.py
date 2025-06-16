@@ -106,7 +106,6 @@ def get_coin_price(coin_id='bitcoin'):
 def get_crypto_news():
     news = []
 
-    # NewsAPI (до 3 штук)
     try:
         r = requests.get(
             f"https://newsapi.org/v2/top-headlines?q=crypto&language=en&sortBy=publishedAt&pageSize=3&apiKey={NEWSAPI_KEY}"
@@ -119,7 +118,6 @@ def get_crypto_news():
     except Exception as e:
         news.append(f"[Ошибка NewsAPI: {e}]")
 
-    # CryptoPanic (фильтрация по меткам)
     try:
         if CRYPTO_API_KEY:
             r = requests.get(
@@ -128,17 +126,18 @@ def get_crypto_news():
             filtered = [
                 p for p in r.get("results", [])
                 if "tags" in p and any(tag.get("label", "").lower() in ["bullish", "news", "signal"] for tag in p["tags"])
-            ][:3]
-            if filtered:
-                for item in filtered:
-                    title = item.get("title", "Без заголовка")
-                    url = item.get("url", "")
-                    time_raw = item.get("published_at", "")
-                    time_str = datetime.fromisoformat(time_raw.replace("Z", "+00:00")).strftime("%H:%M %d.%m")
-                    translated = ask_gpt("Переведи на русский и кратко перескажи:\n" + title)
-                    news.append(f"🕒 {time_str}\n🔹 {translated}\n{url}")
-            else:
-                news.append("[Нет подходящих новостей в CryptoPanic]")
+            ]
+
+            if not filtered:
+                filtered = r.get("results", [])[:3]
+
+            for item in filtered[:3]:
+                title = item.get("title", "Без заголовка")
+                url = item.get("url", "")
+                time_raw = item.get("published_at", "")
+                time_str = datetime.fromisoformat(time_raw.replace("Z", "+00:00")).strftime("%H:%M %d.%m")
+                translated = ask_gpt("Переведи на русский и кратко перескажи:\n" + title)
+                news.append(f"🕒 {time_str}\n🔹 {translated}\n{url}")
         else:
             news.append("[CRYPTO_API_KEY не задан]")
     except Exception as e:
