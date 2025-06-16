@@ -1,181 +1,242 @@
 import os
 import json
-import logging
 import time
-import random
+import pytz
+import logging
 import requests
+import feedparser
+from datetime import datetime
+import telebot
+from telebot import types
 import openai
 import gspread
-import pytz
-from datetime import datetime, timedelta
+from google.oauth2.service_account import Credentials
 from fpdf import FPDF
-from feedparser import parse as feedparse
-from oauth2client.service_account import ServiceAccountCredentials
-from pyTelegramBotAPI import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# --- Константы ---
-TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "ВАШ_ТГ_ТОКЕН")
-OPENAI_KEY = os.getenv("OPENAI_API_KEY", "ВАШ_OPENAI_API_KEY")
-NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "ВАШ_NEWSAPI_KEY")
-ADMIN_IDS = [7473992492, 5860994210]   # Ваши id админов
-GROUP_ID = -1002408729915              # id группы
-GOOGLE_CREDS_PATH = '/etc/secrets/sage-instrument-338811-a8c8cc7f2500.json'
-SHEET_ID = '1WqzsXwqw-aDH_lNWSpX5bjHFqT5BHmXYFSgHupAlWQg'
-SHEET_TAB = 'Лист1'
-REKLAMA_LINK = "https://app.leadteh.ru/w/dTeKr"
-BUTTON_CTA = [
+# --- Переменные окружения ---
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY")
+CRYPTO_PANIC_KEY = os.environ.get("CRYPTO_PANIC_KEY")
+GOOGLE_SHEET = os.environ.get("GOOGLE_SHEET") # ID таблицы
+ADMIN_IDS = [7473992492, 5860994210]  # Админы группы
+GROUP_ID = -1002408729915
+
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "sage-instrument-338811-a8c8cc7f2500.json"
+
+# --- Бот ---
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
+
+# --- Google Sheets ---
+def get_sheet():
+    creds = Credentials.from_service_account_file(
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"],
+        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    gc = gspread.authorize(creds)
+    sheet = gc.open_by_key(GOOGLE_SHEET).worksheet("Стата с барахолки майнинг")
+    return sheet
+
+# --- Кнопки для URL ---
+BUTTON_TEXTS = [
     "💰 Посмотреть актуальный прайс и приобрести",
-    "🔥 Получить спецусловия прямо сейчас!",
-    "🤑 Запросить оптовый прайс и консультацию",
-    "📦 Выбрать оборудование для майнинга с гарантией"
+    "🔥 Интересуют спецусловия на оборудование?",
+    "⚡️ Получить свежий прайс прямо сейчас",
+    "🎯 Перейти к выгодным предложениям",
+    "🚀 Узнать цены и купить оборудование",
 ]
-TIMEZONE = pytz.timezone('Europe/Moscow')
+def get_rotated_button():
+    return BUTTON_TEXTS[int(time.time()) % len(BUTTON_TEXTS)]
 
-# --- Логирование в Google Sheets ---
-def log_event(event_type, user_id, msg, extra=None):
+# --- Локализация ---
+def tr(text, lang="ru"):
+    translations = {
+        "ru": {
+            "news": "Новости",
+            "reward": "Вы получили награду!",
+            "stats": "Статистика за сутки",
+        },
+        "en": {
+            "news": "News",
+            "reward": "You received a reward!",
+            "stats": "Stats for the day",
+        }
+    }
+    return translations.get(lang, {}).get(text, text)
+
+# --- Логирование ошибок в Google Sheets ---
+def log_error(exc_text, comment=""):
     try:
-        creds_dict = json.load(open(GOOGLE_CREDS_PATH, "r"))
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(
-            creds_dict, [
-                'https://spreadsheets.google.com/feeds',
-                'https://www.googleapis.com/auth/drive'
-            ])
-        gc = gspread.authorize(creds)
-        ws = gc.open_by_key(SHEET_ID).worksheet(SHEET_TAB)
-        now = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
-        ws.append_row([now, event_type, str(user_id), str(msg), json.dumps(extra or {})])
+        sheet = get_sheet()
+        now = datetime.now(pytz.timezone("Europe/Moscow")).strftime("%Y-%m-%d %H:%M:%S")
+        sheet.append_row([now, "ERROR", exc_text, comment])
     except Exception as e:
-        print(f"[LOG ERR]: {e}")
+        print("Failed to log error:", e)
 
-# --- Инициализация бота и OpenAI ---
-bot = telebot.TeleBot(TG_TOKEN)
-openai.api_key = OPENAI_KEY
+# --- Авто-спам фильтр (self-learning, простая реализация) ---
+SPAM_PATTERNS_FILE = "spam_patterns.txt"
+def load_spam_patterns():
+    if not os.path.exists(SPAM_PATTERNS_FILE):
+        with open(SPAM_PATTERNS_FILE, "w", encoding="utf-8") as f:
+            f.write("казино\nfast payout\nfree money\n")
+    with open(SPAM_PATTERNS_FILE, encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
 
-# --- Перевод и сжатие текста через GPT ---
-def gpt_translate_summary(text, lang="ru"):
-    prompt = (
-        f"Кратко перескажи главное (3-5 предложений) и переведи на {lang}:\n\n"
-        f"Текст: \"{text}\""
+def save_spam_pattern(pattern):
+    with open(SPAM_PATTERNS_FILE, "a", encoding="utf-8") as f:
+        f.write(f"{pattern}\n")
+
+def is_spam(msg):
+    text = msg.text.lower()
+    for pat in load_spam_patterns():
+        if pat in text:
+            return True
+    return False
+
+# --- Рейтинг пользователей ---
+USER_STATS_FILE = "user_stats.json"
+def update_user_stat(uid):
+    if not os.path.exists(USER_STATS_FILE):
+        stats = {}
+    else:
+        with open(USER_STATS_FILE, encoding="utf-8") as f:
+            stats = json.load(f)
+    stats[str(uid)] = stats.get(str(uid), 0) + 1
+    with open(USER_STATS_FILE, "w", encoding="utf-8") as f:
+        json.dump(stats, f)
+
+def get_top_users(n=3):
+    if not os.path.exists(USER_STATS_FILE):
+        return []
+    with open(USER_STATS_FILE, encoding="utf-8") as f:
+        stats = json.load(f)
+    sorted_stats = sorted(stats.items(), key=lambda x: x[1], reverse=True)
+    return sorted_stats[:n]
+
+def reward_top_users():
+    top = get_top_users(3)
+    rewards = ["🥇", "🥈", "🥉"]
+    for i, (uid, count) in enumerate(top):
+        try:
+            bot.send_message(int(uid), f"{rewards[i]} {tr('reward')}")
+        except Exception as e:
+            log_error(str(e), f"Reward to {uid}")
+
+# --- Авто-сжатие и перевод новостей ---
+def summarize_translate(news, lang="ru"):
+    openai.api_key = OPENAI_API_KEY
+    prompt = f"Сделай краткое резюме и переведи на {lang.upper()}: {news}"
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo", messages=[{"role": "user", "content": prompt}]
     )
-    resp = openai.ChatCompletion.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=400, temperature=0.6
-    )
-    return resp.choices[0].message.content.strip()
-
-# --- КНОПКА CTA (ротация текста) ---
-def cta_keyboard():
-    btn_text = random.choice(BUTTON_CTA)
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton(btn_text, url=REKLAMA_LINK))
-    return kb
+    return response.choices[0].message.content.strip()
 
 # --- Получение новостей ---
-def fetch_cryptopanic():
-    url = f"https://cryptopanic.com/api/v1/posts/?auth_token=ВАШ_CRYPTOPANIC_TOKEN&public=true"
-    resp = requests.get(url, timeout=10).json()
-    news = []
-    for post in resp.get("results", [])[:3]:
-        news.append(post["title"] + "\n" + post["url"])
-    return news
+def get_news_cryptopanic():
+    url = f"https://cryptopanic.com/api/v1/posts/?auth_token={CRYPTO_PANIC_KEY}&currencies=BTC,ETH"
+    data = requests.get(url).json()
+    items = data["results"]
+    return [item["title"] for item in items[:3]]
 
-def fetch_newsapi():
-    url = f"https://newsapi.org/v2/top-headlines?category=business&q=crypto&language=en&apiKey={NEWSAPI_KEY}"
-    resp = requests.get(url, timeout=10).json()
-    return [a["title"] for a in resp.get("articles", [])[:3]]
+def get_news_newsapi():
+    url = f"https://newsapi.org/v2/top-headlines?category=business&q=crypto&apiKey={NEWSAPI_KEY}&language=en"
+    data = requests.get(url).json()
+    if data["status"] != "ok":
+        return []
+    return [art["title"] for art in data["articles"][:3]]
 
-def fetch_rss(source="https://cointelegraph.com/rss"):
-    d = feedparse(source)
-    return [entry.title for entry in d.entries[:3]]
+def get_news_coindesk():
+    feed = feedparser.parse("https://www.coindesk.com/arc/outboundfeeds/rss/")
+    return [entry["title"] for entry in feed.entries[:3]]
 
-# --- Основная рассылка новостей ---
-def send_news(chat_id, lang="ru"):
-    try:
-        all_news = []
-        for get_news in [fetch_cryptopanic, fetch_newsapi, lambda: fetch_rss("https://www.coindesk.com/arc/outboundfeeds/rss/")]:
-
-            for n in get_news():
-                translated = gpt_translate_summary(n, lang)
-                bot.send_message(chat_id, translated, reply_markup=cta_keyboard())
-                all_news.append(translated)
-        log_event("news_sent", chat_id, "ok", {"count": len(all_news)})
-    except Exception as e:
-        bot.send_message(chat_id, f"❗️ Ошибка отправки новостей: {e}")
-        log_event("news_error", chat_id, str(e))
+# --- Генерация PDF статистики (по команде) ---
+def export_stats_pdf():
+    sheet = get_sheet()
+    data = sheet.get_all_values()
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", size=12)
+    for row in data[-50:]:
+        pdf.cell(200, 10, txt=" | ".join(row), ln=1)
+    pdf.output("stats.pdf")
+    return "stats.pdf"
 
 # --- Команды Telegram ---
-@bot.message_handler(commands=['news', 'новости'])
-def cmd_news(msg):
-    send_news(msg.chat.id)
-    log_event("cmd_news", msg.from_user.id, msg.text)
+@bot.message_handler(commands=["start"])
+def cmd_start(m):
+    bot.send_message(m.chat.id, "Привет! Я бот Mining Sale, использую /news, /стата, /top, /addspam, /stats_pdf.")
 
-@bot.message_handler(commands=['pdf'])
-def cmd_pdf(msg):
+@bot.message_handler(commands=["news", "новости"])
+def cmd_news(m):
     try:
-        # Формируем PDF по последним 10 строкам статистики
-        creds_dict = json.load(open(GOOGLE_CREDS_PATH, "r"))
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(
-            creds_dict, [
-                'https://spreadsheets.google.com/feeds',
-                'https://www.googleapis.com/auth/drive'
-            ])
-        gc = gspread.authorize(creds)
-        ws = gc.open_by_key(SHEET_ID).worksheet(SHEET_TAB)
-        data = ws.get_all_values()[-10:]
-        pdf = FPDF()
-        pdf.add_page()
-        pdf.set_font("Arial", size=12)
-        for row in data:
-            pdf.cell(200, 10, txt=" | ".join(row), ln=True)
-        fname = "stats.pdf"
-        pdf.output(fname)
-        with open(fname, "rb") as f:
-            bot.send_document(msg.chat.id, f)
-        log_event("pdf_sent", msg.from_user.id, "ok")
+        news = get_news_cryptopanic() + get_news_newsapi() + get_news_coindesk()
+        txt = ""
+        for n in news:
+            txt += f"📰 {summarize_translate(n, 'ru')}\n"
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton(get_rotated_button(), url="https://app.leadteh.ru/w/dTeKr"))
+        bot.send_message(m.chat.id, txt, reply_markup=markup)
+        update_user_stat(m.from_user.id)
     except Exception as e:
-        bot.send_message(msg.chat.id, f"Ошибка PDF: {e}")
-        log_event("pdf_err", msg.from_user.id, str(e))
+        log_error(str(e), "news cmd")
+        bot.send_message(m.chat.id, "Ошибка получения новостей!")
 
-# --- Фильтр спама (простая версия, можно расширять) ---
-SPAM_PATTERNS = ["scam", "casino", "казино", "даром", "free money"]
+@bot.message_handler(commands=["top"])
+def cmd_top(m):
+    top = get_top_users(5)
+    msg = "🏆 Топ-5 активных участников:\n"
+    for i, (uid, count) in enumerate(top):
+        msg += f"{i+1}) {uid}: {count} сообщений\n"
+    bot.send_message(m.chat.id, msg)
 
-@bot.message_handler(func=lambda m: any(x in m.text.lower() for x in SPAM_PATTERNS))
-def filter_spam(msg):
-    bot.delete_message(msg.chat.id, msg.message_id)
-    log_event("spam_blocked", msg.from_user.id, msg.text)
-
-# --- Рейтинг активности (очень базово, можно доработать под ваши нужды) ---
-@bot.message_handler(commands=['top'])
-def cmd_top(msg):
+@bot.message_handler(commands=["стата"])
+def cmd_stata(m):
     try:
-        creds_dict = json.load(open(GOOGLE_CREDS_PATH, "r"))
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(
-            creds_dict, [
-                'https://spreadsheets.google.com/feeds',
-                'https://www.googleapis.com/auth/drive'
-            ])
-        gc = gspread.authorize(creds)
-        ws = gc.open_by_key(SHEET_ID).worksheet(SHEET_TAB)
-        data = ws.get_all_values()
-        user_stats = {}
-        for row in data:
-            uid = row[2]
-            user_stats[uid] = user_stats.get(uid, 0) + 1
-        top = sorted(user_stats.items(), key=lambda x: -x[1])[:3]
-        res = "\n".join([f"{i+1}. {uid} — {cnt} сообщений" for i, (uid, cnt) in enumerate(top)])
-        bot.send_message(msg.chat.id, f"🏆 Топ-3 самых активных:\n{res}")
-        log_event("cmd_top", msg.from_user.id, "ok", {"result": res})
+        sheet = get_sheet()
+        data = sheet.get_all_values()[-10:]
+        msg = "\n".join(" | ".join(r) for r in data)
+        bot.send_message(m.chat.id, f"Последние записи:\n{msg}")
     except Exception as e:
-        bot.send_message(msg.chat.id, f"Ошибка рейтинга: {e}")
-        log_event("top_err", msg.from_user.id, str(e))
+        log_error(str(e), "стата cmd")
+        bot.send_message(m.chat.id, "Ошибка выгрузки статы.")
 
-# --- Базовая обработка всех остальных сообщений для лога ---
-@bot.message_handler(func=lambda m: True)
-def all_handler(msg):
-    log_event("msg", msg.from_user.id, msg.text)
+@bot.message_handler(commands=["stats_pdf"])
+def cmd_stats_pdf(m):
+    try:
+        f = export_stats_pdf()
+        with open(f, "rb") as doc:
+            bot.send_document(m.chat.id, doc)
+    except Exception as e:
+        log_error(str(e), "stats_pdf cmd")
+        bot.send_message(m.chat.id, "Ошибка при формировании PDF.")
 
-# --- Запуск бота ---
+@bot.message_handler(commands=["addspam"])
+def cmd_addspam(m):
+    # usage: /addspam слово/фраза
+    pat = m.text.split(maxsplit=1)[-1]
+    save_spam_pattern(pat)
+    bot.send_message(m.chat.id, f"Паттерн '{pat}' добавлен в фильтр!")
+
+# --- Фильтр спама, обработка сообщений ---
+@bot.message_handler(func=lambda m: True, content_types=["text"])
+def all_msgs(m):
+    if is_spam(m):
+        bot.delete_message(m.chat.id, m.message_id)
+        bot.send_message(m.from_user.id, "Ваше сообщение было определено как спам и удалено.")
+        log_error("Spam deleted", m.text)
+        return
+    update_user_stat(m.from_user.id)
+
+# --- Автонаграждение (раз в сутки) ---
+def daily_tasks():
+    while True:
+        now = datetime.now(pytz.timezone("Europe/Moscow"))
+        if now.hour == 23:
+            reward_top_users()
+        time.sleep(3600)
+
+import threading
+threading.Thread(target=daily_tasks, daemon=True).start()
+
 if __name__ == "__main__":
-    bot.polling(none_stop=True)
+    bot.infinity_polling(skip_pending=True)
