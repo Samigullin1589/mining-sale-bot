@@ -9,3 +9,4 @@ fpdf
 pytz
 feedparser
 oauth2client
+schedule
