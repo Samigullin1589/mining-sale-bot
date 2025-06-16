@@ -106,12 +106,12 @@ def get_coin_price(coin_id='bitcoin'):
 def get_crypto_news():
     news = []
 
-    # NewsAPI
+    # NewsAPI (до 3 штук)
     try:
         r = requests.get(
             f"https://newsapi.org/v2/top-headlines?q=crypto&language=en&sortBy=publishedAt&pageSize=3&apiKey={NEWSAPI_KEY}"
         ).json()
-        for item in r.get("articles", [])[:3]:
+        for item in r.get("articles", []):
             title = item.get("title", "Без заголовка")
             url = item.get("url", "")
             translated = ask_gpt(f'Переведи на русский и кратко перескажи:\n"{title}"')
@@ -119,7 +119,7 @@ def get_crypto_news():
     except Exception as e:
         news.append(f"[Ошибка NewsAPI: {e}]")
 
-    # CryptoPanic
+    # CryptoPanic (фильтрация по меткам)
     try:
         if CRYPTO_API_KEY:
             r = requests.get(
@@ -127,7 +127,7 @@ def get_crypto_news():
             ).json()
             filtered = [
                 p for p in r.get("results", [])
-                if any(tag["label"].lower() in ["bullish", "news", "signal"] for tag in p.get("tags", []))
+                if "tags" in p and any(tag.get("label", "").lower() in ["bullish", "news", "signal"] for tag in p["tags"])
             ][:3]
             if filtered:
                 for item in filtered:
@@ -186,7 +186,6 @@ def handle_stat(msg):
     except Exception as e:
         bot.send_message(msg.chat.id, "Ошибка: " + str(e))
 
-# --- GPT + ASIC анализ ---
 @bot.message_handler(func=lambda msg: True)
 def handle_gpt(msg):
     text = msg.text.lower()
