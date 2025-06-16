@@ -10,6 +10,7 @@ from google.oauth2.service_account import Credentials
 from telebot import types
 from openai import OpenAI
 from datetime import datetime
+from bs4 import BeautifulSoup
 
 # --- Настройки ---
 BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
@@ -45,18 +46,7 @@ def set_webhook():
     time.sleep(1)
     bot.set_webhook(url=WEBHOOK_URL.rstrip("/") + "/webhook")
 
-# --- GPT ---
-def ask_gpt(prompt):
-    try:
-        res = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}]
-        )
-        return res.choices[0].message.content.strip()
-    except Exception as e:
-        return f"[Ошибка GPT: {e}]"
-
-# --- Sheets ---
+# --- Google Sheets ---
 def get_gsheet():
     creds = Credentials.from_service_account_file(GOOGLE_JSON, scopes=[
         'https://www.googleapis.com/auth/spreadsheets']
@@ -68,21 +58,52 @@ def log_error_to_sheet(error_msg):
     try:
         sh = get_gsheet()
         sh.append_row([time.strftime("%Y-%m-%d %H:%M:%S"), "error", error_msg])
-    except Exception:
-        pass
+    except: pass
+
+# --- Актуальные ASIC модели ---
+TOP_ASICS = []
+
+def update_top_asics():
+    try:
+        url = "https://www.asicminervalue.com/miners/sha-256"
+        r = requests.get(url, timeout=10)
+        soup = BeautifulSoup(r.text, "html.parser")
+        TOP_ASICS.clear()
+        for row in soup.select("table tbody tr")[:5]:
+            tds = row.find_all("td")
+            model = tds[0].get_text(strip=True)
+            hr = tds[1].get_text(strip=True)
+            watt = tds[2].get_text(strip=True)
+            profit = tds[3].get_text(strip=True)
+            TOP_ASICS.append(f"{model} — {hr}, {watt}, доход: {profit}/день")
+    except Exception as e:
+        TOP_ASICS.clear()
+        TOP_ASICS.append(f"[Ошибка обновления ASIC: {e}]")
+
+def schedule_asic_updates():
+    schedule.every().day.at("03:00").do(update_top_asics)
+    update_top_asics()
+
+# --- GPT ---
+def ask_gpt(prompt):
+    try:
+        res = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return res.choices[0].message.content.strip()
+    except Exception as e:
+        return f"[Ошибка GPT: {e}]"
 
 # --- Новости ---
 def get_coin_price(coin_id='bitcoin'):
     try:
-        url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
-        data = requests.get(url, timeout=5).json()
+        data = requests.get(f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd").json()
         return float(data[coin_id]['usd'])
-    except:
-        return None
+    except: return None
 
 def get_crypto_news():
     news = []
-    # NewsAPI
     try:
         r = requests.get(f"https://newsapi.org/v2/everything?q=cryptocurrency&apiKey={NEWSAPI_KEY}&pageSize=1").json()
         for item in r.get("articles", []):
@@ -91,7 +112,6 @@ def get_crypto_news():
     except Exception as e:
         news.append(f"[Ошибка NewsAPI: {e}]")
 
-    # CryptoPanic
     try:
         if CRYPTO_API_KEY:
             r = requests.get(
@@ -115,7 +135,6 @@ def get_crypto_news():
             news.append("[CRYPTO_API_KEY не задан]")
     except Exception as e:
         news.append(f"[Ошибка CryptoPanic: {e}]")
-
     return "\n\n".join(news)
 
 # --- Калькулятор ---
@@ -130,30 +149,24 @@ def calculate_profit(ths, watt, kwh_cost, coin_price, coin_per_th_day):
 def handle_calc(msg):
     try:
         parts = msg.text.split()
-        if len(parts) != 4:
-            raise ValueError
-        ths = float(parts[1])
-        watt = float(parts[2])
-        kwh = float(parts[3])
+        ths, watt, kwh = float(parts[1]), float(parts[2]), float(parts[3])
         btc = get_coin_price("bitcoin")
-        if not btc:
-            raise Exception("Не удалось получить цену BTC")
-        profit, income, cost = calculate_profit(ths, watt, kwh, btc, 0.000027)
-        bot.send_message(msg.chat.id,
-            f"📟 Доходность (BTC):\n💰 Доход: ${income}\n🔌 Расход: ${cost}\n📈 Профит: ${profit}\n(по курсу ${btc})")
+        if not btc: raise Exception("нет цены BTC")
+        p, i, c = calculate_profit(ths, watt, kwh, btc, 0.000027)
+        bot.send_message(msg.chat.id, f"📟 Доходность:\n💰 Доход: ${i}\n🔌 Расход: ${c}\n📈 Профит: ${p}\n(курс BTC: ${btc})")
     except:
-        bot.send_message(msg.chat.id, "❗ Используйте формат: /calc 120 3300 0.07")
+        bot.send_message(msg.chat.id, "❗ Формат: /calc 120 3300 0.07")
 
 # --- Команды ---
 @bot.message_handler(func=lambda msg: msg.text.lower() in ['start', 'старт'])
 def handle_start(msg):
-    bot.send_message(msg.chat.id, "Привет! Бот запущен и готов к работе.")
+    bot.send_message(msg.chat.id, "Привет! Бот работает.")
 
 @bot.message_handler(func=lambda msg: msg.text.lower() in ['news', 'новости'])
 def handle_news(msg):
     text = get_crypto_news()
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("💬 Получить прайс от нашего партнёра", url="https://app.leadteh.ru/w/dTeKr"))
+    markup.add(types.InlineKeyboardButton("💬 Получить прайс от партнёра", url="https://app.leadteh.ru/w/dTeKr"))
     bot.send_message(msg.chat.id, text, reply_markup=markup)
 
 @bot.message_handler(func=lambda msg: msg.text.lower() in ['stat', 'стат'])
@@ -164,13 +177,23 @@ def handle_stat(msg):
     except Exception as e:
         bot.send_message(msg.chat.id, "Ошибка: " + str(e))
 
-# --- Обработка текста через GPT ---
+# --- GPT + ASIC анализ ---
 @bot.message_handler(func=lambda msg: True)
 def handle_gpt(msg):
+    text = msg.text.lower()
+    if any(k in text for k in ["asic", "модель", "розетка", "квт", "выгодно", "доходность"]):
+        models = "\n".join(TOP_ASICS)
+        prompt = (
+            f"Вот актуальные модели SHA-256 ASIC (из интернета на сегодня):\n{models}\n\n"
+            f"{msg.text}\n"
+            f"Проанализируй, опираясь только на эти данные."
+        )
+    else:
+        prompt = msg.text
     try:
-        answer = ask_gpt(msg.text)
+        answer = ask_gpt(prompt)
         markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("💬 Прайс на оборудование от партнёра", url="https://app.leadteh.ru/w/dTeKr"))
+        markup.add(types.InlineKeyboardButton("💬 Прайс от партнёра", url="https://app.leadteh.ru/w/dTeKr"))
         bot.send_message(msg.chat.id, answer, reply_markup=markup)
     except Exception as e:
         bot.send_message(msg.chat.id, f"[GPT ошибка: {e}]")
@@ -183,7 +206,7 @@ def spam_filter(msg):
     bot.send_message(msg.chat.id, "Сообщение удалено как спам.")
     log_error_to_sheet(f"SPAM: {msg.text}")
 
-# --- Автофункции ---
+# --- Автообновление ---
 def auto_send_news():
     try:
         news = get_crypto_news()
@@ -191,7 +214,7 @@ def auto_send_news():
         markup.add(types.InlineKeyboardButton("💬 Получить прайс от партнёра", url="https://app.leadteh.ru/w/dTeKr"))
         bot.send_message(NEWS_CHAT_ID, news, reply_markup=markup)
     except Exception as e:
-        print(f"Ошибка автоотправки: {e}")
+        print(f"[Авторассылка]: {e}")
 
 def auto_check_status():
     errors = []
@@ -200,7 +223,7 @@ def auto_check_status():
         if not key or "⚠️" in str(key): errors.append(name)
     try: get_crypto_news()
     except Exception as e: errors.append(f"News: {e}")
-    try: ask_gpt("Проверка")
+    try: ask_gpt("Проверка GPT")
     except Exception as e: errors.append(f"GPT: {e}")
     try: get_gsheet()
     except Exception as e: errors.append(f"Sheets: {e}")
@@ -209,13 +232,14 @@ def auto_check_status():
 
 schedule.every(3).hours.do(auto_send_news)
 schedule.every(3).hours.do(auto_check_status)
+schedule_asic_updates()
 
 def run_scheduler():
     while True:
         schedule.run_pending()
         time.sleep(1)
 
-# --- Запуск ---
+# --- Старт ---
 if __name__ == '__main__':
     set_webhook()
     threading.Thread(target=run_scheduler).start()
