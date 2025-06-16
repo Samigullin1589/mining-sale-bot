@@ -233,7 +233,8 @@ def handle_all_messages(msg):
     if any(k in text for k in ["курс btc", "btc курс", "курс биткоина", "btc price", "btc now", "биткоин курс"]):
         price = get_coingecko_price("bitcoin")
         if price:
-            bot.send_message(msg.chat.id, f"💰 Курс BTC: ${price}")
+            comment = ask_gpt(f"Курс BTC ${price}. Кратко прокомментируй текущую ситуацию в 1 предложении.")
+            bot.send_message(msg.chat.id, f"💰 Курс BTC: ${price}\n{comment}")
         else:
             bot.send_message(msg.chat.id, "[Ошибка получения курса BTC]")
         return
