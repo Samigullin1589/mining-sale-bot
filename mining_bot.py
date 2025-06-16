@@ -57,6 +57,13 @@ def log_error_to_sheet(error_msg):
     except:
         pass
 
+def log_price_to_sheet(user, text):
+    try:
+        sh = get_gsheet()
+        sh.append_row([time.strftime("%Y-%m-%d %H:%M:%S"), user.username or user.first_name, text])
+    except:
+        pass
+
 TOP_ASICS = []
 
 def update_top_asics():
@@ -181,6 +188,7 @@ def handle_all_messages(msg):
 
     if is_mining_price_message(text):
         feedback = analyze_mining_prices(msg.text)
+        log_price_to_sheet(msg.from_user, msg.text)
         bot.send_message(msg.chat.id, feedback)
         return
 
