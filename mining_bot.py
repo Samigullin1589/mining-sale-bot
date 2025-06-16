@@ -143,7 +143,7 @@ def get_crypto_news():
 def send_profit_chart(chat_id):
     try:
         sheet = get_gsheet()
-        records = sheet.get_all_values()[1:]  # пропускаем заголовки
+        records = sheet.get_all_values()[1:]
         dates = [r[0] for r in records]
         messages = [r[2] for r in records]
         profits = []
@@ -227,7 +227,7 @@ def handle_all_messages(msg):
         bot.send_message(msg.chat.id, "🌦 В каком городе вас интересует погода?")
         return
 
-    if "курс btc" in text:
+    if any(k in text for k in ["курс btc", "btc курс", "курс биткоина", "btc price", "btc now", "биткоин курс"]):
         price = get_coingecko_price("bitcoin")
         bot.send_message(msg.chat.id, f"💰 Курс BTC: ${price}")
         return
