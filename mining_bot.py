@@ -61,14 +61,23 @@ def get_news():
         url = f"https://newsapi.org/v2/everything?q=cryptocurrency&apiKey={NEWSAPI_KEY}&pageSize=1"
         resp = requests.get(url).json()
         for item in resp.get("articles", []):
-            news.append(item["title"] + "\n" + item["url"])
+            eng_text = item["title"] + "\n" + item["url"]
+            try:
+                translated = ask_gpt("Переведи на русский и кратко перескажи:\n" + item["title"])
+            except:
+                translated = "[Перевод недоступен]"
+            news.append(f"{translated}\n{item['url']}")
     except Exception as e:
         news.append(f"[Ошибка NewsAPI: {e}]")
     try:
         d = feedparser.parse("https://cryptopanic.com/news/rss")
         if d.entries:
             entry = d.entries[0]
-            news.append(entry.title + "\n" + entry.link)
+            try:
+                translated = ask_gpt("Переведи на русский и кратко перескажи:\n" + entry.title)
+            except:
+                translated = "[Перевод недоступен]"
+            news.append(f"{translated}\n{entry.link}")
     except Exception as e:
         news.append(f"[Ошибка CryptoPanic: {e}]")
     return "\n\n".join(news)
