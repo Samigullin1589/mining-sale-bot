@@ -11,6 +11,7 @@ import threading
 import schedule
 import json
 import atexit
+import httpx # ИМПОРТИРОВАНО для решения проблемы с прокси
 from flask import Flask, request
 import gspread
 from google.oauth2.service_account import Credentials
@@ -39,7 +40,6 @@ BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 NEWSAPI_KEY = os.getenv("CRYPTO_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-# ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "YourApiKeyToken") # УДАЛЕНО: Больше не используется
 NEWS_CHAT_ID = os.getenv("NEWS_CHAT_ID")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
 GOOGLE_JSON_STR = os.getenv("GOOGLE_JSON")
@@ -85,12 +85,16 @@ class ExceptionHandler(telebot.ExceptionHandler):
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False, parse_mode='HTML', exception_handler=ExceptionHandler())
 app = Flask(__name__)
 try:
-    openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-    if not openai_client:
+    # ИЗМЕНЕНО: Явная инициализация http_client для обхода проблем с прокси на хостинге
+    if OPENAI_API_KEY:
+        http_client = httpx.Client()
+        openai_client = OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
+    else:
+        openai_client = None
         logger.warning("OPENAI_API_KEY не найден. Функциональность GPT будет отключена.")
 except Exception as e:
     openai_client = None
-    logger.error(f"Не удалось инициализировать клиент OpenAI: {e}", exc_info=True)
+    logger.critical(f"Не удалось инициализировать клиент OpenAI: {e}", exc_info=True)
 
 # --- Глобальные переменные и кэш ---
 asic_cache = {"data": [], "timestamp": None}
@@ -359,7 +363,6 @@ def get_crypto_news():
         items = []
         for p in posts:
             title = p['title']
-            # Исправлено: Убрана вложенная f-строка
             prompt = f"Сделай краткое саммари (1 предложение): '{title}'"
             summary = ask_gpt(prompt, "gpt-4o-mini")
             
@@ -372,12 +375,10 @@ def get_crypto_news():
         return "📰 <b>Последние крипто-новости:</b>\n\n" + "\n\n".join(items)
     except requests.RequestException as e: logger.error(f"Ошибка API новостей: {e}"); return "[❌ Ошибка API новостей]"
 
-# ИЗМЕНЕНО: Функция для получения цены на газ без API ключа
 def get_eth_gas_price():
     """Получает цену на газ из открытого источника ethgas.watch."""
     try:
         res = requests.get("https://ethgas.watch/api/gas", timeout=5).json()
-        # Новая структура ответа: {"slow": {"gwei": ...}, "normal": ..., "fast": ...}
         slow_price = res.get('slow', {}).get('gwei', 'N/A')
         normal_price = res.get('normal', {}).get('gwei', 'N/A')
         fast_price = res.get('fast', {}).get('gwei', 'N/A')
