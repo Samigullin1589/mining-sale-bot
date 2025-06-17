@@ -165,16 +165,28 @@ def get_weather(city: str):
         return f"[❌ Не удалось найти город '{city}' или произошла ошибка.]"
 
 def get_currency_rate(base="USD", to="RUB"):
-    """Получает курс валют с exchangerate.host."""
+    """Получает курс валют с exchangerate.host с резервированием."""
+    # 1. Попытка с ExchangeRate.host
     try:
         res = requests.get(f"https://api.exchangerate.host/latest?base={base.upper()}&symbols={to.upper()}", timeout=5).json()
         if res.get('rates') and res['rates'].get(to.upper()):
             rate = res['rates'][to.upper()]
             return f"💹 {base.upper()} → {to.upper()} = **{rate:.2f}**"
-        return f"[❌ Не удалось получить курс для {base.upper()} к {to.upper()}]"
     except Exception as e:
-        logging.error(f"Ошибка получения курса валют: {e}")
-        return f"[❌ Ошибка API курсов валют]"
+        logging.warning(f"Ошибка API ExchangeRate.host: {e}. Пробую резервный API.")
+
+    # 2. Резервная попытка с Exchangeratesapi.io
+    try:
+        # У этого API другой формат ответа
+        res = requests.get(f"https://api.exchangerate-api.com/v4/latest/{base.upper()}", timeout=5).json()
+        if res.get('rates') and res['rates'].get(to.upper()):
+            rate = res['rates'][to.upper()]
+            return f"💹 {base.upper()} → {to.upper()} = **{rate:.2f}** (резервный API)"
+    except Exception as e:
+        logging.error(f"Ошибка резервного API курсов валют: {e}")
+
+    return f"[❌ Не удалось получить курс для {base.upper()} к {to.upper()} ни с одного источника]"
+
 
 def ask_gpt(prompt: str, model: str = "gpt-4o"):
     """Отправляет запрос к OpenAI GPT."""
@@ -288,14 +300,31 @@ def send_message_with_partner_button(chat_id, text, **kwargs):
     except Exception as e:
         logging.error(f"Не удалось отправить сообщение в чат {chat_id}: {e}")
 
+def get_usd_to_rub_rate():
+    """Получает курс USD к RUB с двух источников для надежности."""
+    # 1. ExchangeRate.host
+    try:
+        res = requests.get("https://api.exchangerate.host/latest?base=USD&symbols=RUB", timeout=5).json()
+        if res.get('rates') and 'RUB' in res['rates']:
+            return res['rates']['RUB']
+    except Exception as e:
+        logging.warning(f"API ExchangeRate.host для калькулятора не ответил: {e}. Пробую резервный.")
+
+    # 2. Exchangerate-api.com
+    try:
+        res = requests.get("https://api.exchangerate-api.com/v4/latest/USD", timeout=5).json()
+        if res.get('rates') and 'RUB' in res['rates']:
+            return res['rates']['RUB']
+    except Exception as e:
+        logging.error(f"Резервный API курсов для калькулятора тоже не ответил: {e}")
+
+    return None # Возвращаем None, если оба API не сработали
+
 def calculate_and_format_profit(electricity_cost_rub: float):
     """Расчет и форматирование доходности ASIC с конвертацией из рублей."""
-    try:
-        rate_info = requests.get(f"https://api.exchangerate.host/latest?base=USD&symbols=RUB", timeout=5).json()
-        usd_to_rub_rate = rate_info['rates']['RUB']
-    except Exception as e:
-        logging.error(f"Ошибка получения курса USD/RUB для калькулятора: {e}")
-        return "Не удалось получить курс доллара для расчета. Попробуйте позже."
+    usd_to_rub_rate = get_usd_to_rub_rate()
+    if usd_to_rub_rate is None:
+        return "Не удалось получить курс доллара для расчета ни с одного из источников. Попробуйте позже."
 
     electricity_cost_usd = electricity_cost_rub / usd_to_rub_rate
     asics_data = get_top_asics()
@@ -552,7 +581,6 @@ def handle_all_text_messages(msg):
 # 6. ЗАПУСК БОТА, ВЕБХУКА И ПЛАНИРОВЩИКА
 # ========================================================================================
 
-# ИЗМЕНЕНО: Возвращаем статический URL для вебхука для большей надежности
 @app.route('/webhook', methods=['POST'])
 def webhook():
     """Обработчик вебхука от Telegram."""
@@ -562,7 +590,6 @@ def webhook():
         bot.process_new_updates([update])
         return '', 200
     else:
-        # УЛУЧШЕНО: Возвращаем 403 Forbidden, если тип контента неверный
         return 'Forbidden', 403
 
 @app.route("/")
@@ -592,7 +619,6 @@ if __name__ == '__main__':
         logging.info("Режим вебхука. Установка...")
         bot.remove_webhook()
         time.sleep(0.5)
-        # ИЗМЕНЕНО: Устанавливаем вебхук на статический адрес /webhook
         full_webhook_url = WEBHOOK_URL.rstrip("/") + "/webhook"
         bot.set_webhook(url=full_webhook_url)
         logging.info(f"Вебхук установлен на: {full_webhook_url}")
@@ -609,4 +635,3 @@ if __name__ == '__main__':
         scheduler_thread.start()
         bot.remove_webhook()
         bot.polling(none_stop=True)
-
