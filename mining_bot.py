@@ -26,6 +26,9 @@ BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 NEWSAPI_KEY = os.environ.get("CRYPTO_API_KEY") # CryptoPanic API Key
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+# Публичный ключ для Etherscan (обычно не требуется для этого запроса, но лучше иметь)
+ETHERSCAN_API_KEY = os.environ.get("ETHERSCAN_API_KEY", "YourApiKeyToken")
+
 
 NEWS_CHAT_ID = os.environ.get("NEWS_CHAT_ID") # Канал для новостей
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID") # ID админа для отчетов
@@ -58,7 +61,7 @@ CURRENCY_MAP = {
     'евро': 'EUR', 'eur': 'EUR', '€': 'EUR',
     'рубль': 'RUB', 'rub': 'RUB', '₽': 'RUB',
     'юань': 'CNY', 'cny': 'CNY',
-    'биткоин': 'BTC', 'btc': 'BTC',
+    'биткоин': 'BTC', 'btc': 'BTC', 'бтс': 'BTC', 'втс': 'BTC',
     'эфир': 'ETH', 'eth': 'ETH',
 }
 
@@ -91,7 +94,7 @@ def get_crypto_price(coin_id="bitcoin", vs_currency="usd"):
     """
     # Попытка 1: Binance (публичный API)
     try:
-        symbol = "BTCUSDT" # Binance использует такой формат для BTC
+        symbol = "BTCUSDT"
         res = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}", timeout=5).json()
         if 'price' in res:
             return (float(res['price']), "Binance")
@@ -100,7 +103,7 @@ def get_crypto_price(coin_id="bitcoin", vs_currency="usd"):
 
     # Попытка 2: KuCoin (публичный API)
     try:
-        symbol = "BTC-USDT" # KuCoin использует такой формат
+        symbol = "BTC-USDT"
         res = requests.get(f"https://api.kucoin.com/api/v1/market/orderbook/level1?symbol={symbol}", timeout=5).json()
         if res.get('data') and res['data'].get('price'):
             return (float(res['data']['price']), "KuCoin")
@@ -116,6 +119,29 @@ def get_crypto_price(coin_id="bitcoin", vs_currency="usd"):
         print(f"Ошибка API CoinGecko: {e}.")
     
     return (None, None)
+
+def get_eth_gas_price():
+    """НОВАЯ ФУНКЦИЯ: Получает актуальную цену газа в сети Ethereum."""
+    try:
+        url = f"https://api.etherscan.io/api?module=gastracker&action=gasoracle&apikey={ETHERSCAN_API_KEY}"
+        res = requests.get(url, timeout=5).json()
+        if res.get("status") == "1" and res.get("result"):
+            gas_info = res["result"]
+            safe_gas = gas_info["SafeGasPrice"]
+            propose_gas = gas_info["ProposeGasPrice"]
+            fast_gas = gas_info["FastGasPrice"]
+            
+            return (
+                f"⛽️ **Актуальная цена газа в Ethereum (Gwei):**\n\n"
+                f"🐢 **Медленно:** `{safe_gas}` Gwei\n"
+                f"🚶‍♂️ **Средне:** `{propose_gas}` Gwei\n"
+                f"🚀 **Быстро:** `{fast_gas}` Gwei"
+            )
+        else:
+            return "[❌ Не удалось получить данные о газе с Etherscan]"
+    except Exception as e:
+        print(f"Ошибка API Etherscan: {e}")
+        return "[❌ Ошибка при запросе цены на газ]"
 
 def get_weather(city: str):
     """Получает погоду с wttr.in."""
@@ -179,13 +205,14 @@ def get_crypto_news(keywords: list = None):
 # ========================================================================================
 
 def get_main_keyboard():
-    """Создает основную клавиатуру с кнопками."""
+    """ДОБАВЛЕНО: Создает основную клавиатуру с кнопками, включая цену газа."""
     markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     btn1 = types.KeyboardButton("💹 Курс BTC")
-    btn2 = types.KeyboardButton("⚙️ Топ-5 ASIC")
-    btn3 = types.KeyboardButton("📰 Новости")
-    btn4 = types.KeyboardButton("🌦️ Погода")
-    markup.add(btn1, btn2, btn3, btn4)
+    btn2 = types.KeyboardButton("⛽️ Газ ETH")
+    btn3 = types.KeyboardButton("⚙️ Топ-5 ASIC")
+    btn4 = types.KeyboardButton("📰 Новости")
+    btn5 = types.KeyboardButton("🌦️ Погода")
+    markup.add(btn1, btn2, btn3, btn4, btn5)
     return markup
 
 def parse_currency_pair(text: str):
@@ -208,10 +235,9 @@ def get_random_partner_button():
 # ========================================================================================
 
 def keep_alive():
-    """НОВАЯ ФУНКЦИЯ: Отправляет запрос самому себе, чтобы приложение не "засыпало" на хостинге."""
+    """Отправляет запрос самому себе, чтобы приложение не "засыпало" на хостинге."""
     if WEBHOOK_URL:
         try:
-            # Получаем базовый URL (без /webhook)
             base_url = WEBHOOK_URL.rsplit('/', 1)[0]
             requests.get(base_url)
             print(f"[{datetime.now()}] Keep-alive пинг отправлен на {base_url}")
@@ -317,13 +343,19 @@ def handle_all_text_messages(msg):
 
     # --- Обработка кнопок клавиатуры и текстовых команд ---
     
-    if 'курс btc' in text_lower or 'курс' in text_lower and ('биткоин' in text_lower or 'втс' in text_lower):
+    # ИСПРАВЛЕНО: Добавлена проверка на "бтс"
+    if 'курс btc' in text_lower or 'курс' in text_lower and ('биткоин' in text_lower or 'бтс' in text_lower or 'втс' in text_lower):
         price, source = get_crypto_price("bitcoin", "usd")
         if price:
             comment = ask_gpt(f"Курс BTC ${price:,.2f}. Дай краткий, дерзкий комментарий (1 предложение) о рынке.", "gpt-3.5-turbo")
             bot.send_message(msg.chat.id, f"💰 **Курс BTC: ${price:,.2f}** (данные от {source})\n\n*{comment}*", parse_mode="Markdown")
         else:
             bot.send_message(msg.chat.id, "❌ Не удалось получить курс BTC ни с одного источника.")
+        return
+        
+    if 'газ eth' in text_lower:
+        gas_report = get_eth_gas_price()
+        bot.send_message(msg.chat.id, gas_report, parse_mode="Markdown")
         return
 
     if 'топ-5 asic' in text_lower:
@@ -347,7 +379,10 @@ def handle_all_text_messages(msg):
         bot.send_message(msg.chat.id, get_currency_rate(*currency_pair))
         return
 
-    if any(x in text_lower for x in ["продам", "в наличии", "предзаказ", "$"]):
+    # УЛУЧШЕНА ЛОГИКА: Триггер для анализа прайсов стал точнее
+    sale_words = ["продам", "продать", "куплю", "купить", "в наличии", "предзаказ"]
+    item_words = ["asic", "асик", "$", "whatsminer", "antminer"]
+    if any(word in text_lower for word in sale_words) and any(word in text_lower for word in item_words):
         log_to_sheet([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg.from_user.username or msg.from_user.first_name, msg.text])
         analysis = ask_gpt(f"Это прайс на майнинг-оборудование. Проанализируй как трейдер: выгодные предложения, актуальность цен, подозрительно дешевые позиции. Ответь кратко, без формальностей.\n\nТекст:\n{msg.text}")
         bot.send_message(msg.chat.id, analysis)
@@ -377,9 +412,7 @@ def index():
 
 def run_scheduler():
     """Бесконечный цикл для выполнения задач по расписанию."""
-    # ДОБАВЛЕНА задача для "прогрева"
     schedule.every(25).minutes.do(keep_alive)
-    
     schedule.every(3).hours.do(auto_send_news)
     schedule.every(3).hours.do(auto_check_status)
     schedule.every(1).hours.do(get_top_asics)
