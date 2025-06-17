@@ -355,7 +355,7 @@ def get_crypto_news():
         params = {"auth_token": NEWSAPI_KEY, "public": "true", "currencies": "BTC,ETH"}
         posts = requests.get("https://cryptopanic.com/api/v1/posts/", params=params, timeout=10).json().get("results", [])[:3]
         if not posts: return "[🧐 Новостей по вашему запросу не найдено]"
-        items = [f'🔹 <a href="{p.get("url", "")}">{ask_gpt(f"Сделай краткое саммари (1 предложение): \'{p[\'title\']}\'", "gpt-3.5-turbo")}</a>' for p in posts]
+        items = [f'🔹 <a href="{p.get("url", "")}">{ask_gpt(f"Сделай краткое саммари (1 предложение): \'{p[\'title\']}\'", "gpt-4o-mini")}</a>' for p in posts]
         return "📰 <b>Последние крипто-новости:</b>\n\n" + "\n\n".join(items)
     except requests.RequestException as e: logger.error(f"Ошибка API новостей: {e}"); return "[❌ Ошибка API новостей]"
 
@@ -521,7 +521,7 @@ def handle_buy_boost(msg): send_message_with_partner_button(msg.chat.id, game.bu
 @bot.message_handler(func=lambda message: message.text.lower() == '🎓 слово дня')
 def handle_word_of_the_day(msg):
     term = random.choice(CRYPTO_TERMS)
-    explanation = ask_gpt(f"Объясни термин '{term}' простыми словами для новичка в криптовалютах (2-3 предложения).", "gpt-3.5-turbo")
+    explanation = ask_gpt(f"Объясни термин '{term}' простыми словами для новичка в криптовалютах (2-3 предложения).", "gpt-4o-mini")
     send_message_with_partner_button(msg.chat.id, f"🎓 <b>Слово дня: {term}</b>\n\n{explanation}")
 
 @bot.message_handler(commands=['quiz'])
@@ -651,4 +651,4 @@ if __name__ == '__main__':
     else:
         logger.info("Режим: long-polling.")
         bot.remove_webhook()
-        bot.polling(none_stop=True)
+        bot.polling(none_stop=Tr
