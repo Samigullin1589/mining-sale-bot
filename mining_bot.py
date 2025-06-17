@@ -107,7 +107,6 @@ user_rigs = {}
 # ========================================================================================
 # 2. РАБОТА С ВНЕШНИМИ СЕРВИСАМИ (API)
 # ========================================================================================
-# ... (Этот раздел без изменений, он уже стабилен)
 def get_gsheet():
     """Подключается к Google Sheets."""
     try:
@@ -132,7 +131,9 @@ def get_crypto_price(coin_id="bitcoin", vs_currency="usd"):
         {"name": "CoinGecko", "url": f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies={vs_currency}"},
         {"name": "Binance", "url": f"https://api.binance.com/api/v3/ticker/price?symbol={coin_id.upper()}USDT"}
     ]
-    if "USDT" not in coin_id.upper(): # Binance работает с парами USDT
+    
+    # Binance поддерживает только определенные тикеры, так что проверяем
+    if coin_id.upper() != "BTC":
         sources.pop(1)
     
     for source in sources:
@@ -147,7 +148,6 @@ def get_crypto_price(coin_id="bitcoin", vs_currency="usd"):
             continue
     return (None, None)
 
-# ... (остальные функции API без изменений)
 def get_eth_gas_price():
     """Получает цену на газ в сети Ethereum."""
     try:
@@ -330,17 +330,16 @@ def send_message_with_partner_button(chat_id, text, **kwargs):
     except Exception as e:
         logger.error(f"Не удалось отправить сообщение в чат {chat_id}: {e}")
 
-# 📌 ИСПРАВЛЕНО: Создана "обертка" для отправки фото с кнопкой
 def send_photo_with_partner_button(chat_id, photo, caption, **kwargs):
     """Отправляет фото с партнерской кнопкой и подсказкой."""
     try:
+        if not photo: raise ValueError("Объект фото пустой")
         full_caption = f"{caption}\n\n---\n<i>{random.choice(BOT_HINTS)}</i>"
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton(random.choice(PARTNER_BUTTON_TEXT_OPTIONS), url=PARTNER_URL))
         bot.send_photo(chat_id, photo, caption=full_caption, reply_markup=markup, **kwargs)
     except Exception as e:
         logger.error(f"Не удалось отправить фото в чат {chat_id}: {e}")
-        # Если отправка фото не удалась, пробуем отправить текст
         send_message_with_partner_button(chat_id, caption, **kwargs)
 
 def calculate_and_format_profit(electricity_cost_rub: float):
@@ -398,7 +397,6 @@ def handle_price(msg):
     coin_symbol = msg.text.split()[1].upper() if len(msg.text.split()) > 1 else "BTC"
     get_price_and_send(msg.chat.id, coin_symbol)
 
-# 📌 ИСПРАВЛЕНО: Используется новая функция-обертка для отправки фото
 @bot.message_handler(commands=['fear', 'fng'])
 def handle_fear_and_greed(msg):
     bot.send_message(msg.chat.id, "⏳ Генерирую актуальный Индекс страха...")
@@ -411,16 +409,13 @@ def handle_my_rig(msg):
     """Показывает информацию о ферме пользователя."""
     user_id = msg.from_user.id
     if user_id not in user_rigs:
-        # Автоматически создаем ферму при первом обращении
         user_rigs[user_id] = {'last_collected': None, 'balance': 0.0, 'level': 1, 'streak': 0, 'name': msg.from_user.first_name}
         response = "🎉 Поздравляю! Вы запустили свою первую виртуальную ферму!\n\n"
     else:
         response = ""
-    
     rig = user_rigs[user_id]
     next_level = rig['level'] + 1
     upgrade_cost_text = f"Стоимость улучшения до {next_level} уровня: <code>{UPGRADE_COSTS.get(next_level, 'N/A')}</code> BTC." if next_level in UPGRADE_COSTS else "Вы достигли максимального уровня!"
-    
     response += (f"🖥️ <b>Ферма {telebot.util.escape(rig['name'])}</b>\n\n"
                  f"<b>Уровень:</b> {rig['level']}\n"
                  f"<b>Баланс:</b> <code>{rig['balance']:.6f}</code> BTC\n"
@@ -435,27 +430,21 @@ def handle_collect(msg):
     user_id = msg.from_user.id
     if user_id not in user_rigs:
         return send_message_with_partner_button(msg.chat.id, "🤔 У вас нет фермы. Начните с команды <code>/my_rig</code>.")
-
     rig = user_rigs[user_id]
     now = datetime.now()
-    
     if rig['last_collected'] and (now - rig['last_collected']) < timedelta(hours=24):
         time_left = timedelta(hours=24) - (now - rig['last_collected'])
         h, m = divmod(time_left.seconds, 3600)[0], divmod(time_left.seconds % 3600, 60)[0]
         return send_message_with_partner_button(msg.chat.id, f"Вы уже собирали награду. Попробуйте снова через <b>{h}ч {m}м</b>.")
-
-    # Обновление серии
     if rig['last_collected'] and (now - rig['last_collected']) < timedelta(hours=48):
         rig['streak'] += 1
     else:
-        rig['streak'] = 1 # Сброс, если прошло >48 часов или это первый сбор
-
+        rig['streak'] = 1
     base_mined = MINING_RATES.get(rig['level'], 0.0001)
     streak_bonus = base_mined * rig['streak'] * STREAK_BONUS_MULTIPLIER
     total_mined = base_mined + streak_bonus
     rig['balance'] += total_mined
     rig['last_collected'] = now
-    
     response = (f"✅ Собрано <b>{total_mined:.6f}</b> BTC!\n"
                 f"  (Базовая добыча: {base_mined:.6f} + Бонус за серию: {streak_bonus:.6f})\n"
                 f"🔥 Ваша серия: <b>{rig['streak']} дней!</b>\n"
@@ -468,14 +457,11 @@ def handle_upgrade_rig(msg):
     user_id = msg.from_user.id
     if user_id not in user_rigs:
         return send_message_with_partner_button(msg.chat.id, "🤔 У вас нет фермы. Начните с команды <code>/my_rig</code>.")
-
     rig = user_rigs[user_id]
     next_level = rig['level'] + 1
     cost = UPGRADE_COSTS.get(next_level)
-
     if not cost:
         return send_message_with_partner_button(msg.chat.id, "🎉 Поздравляем, у вас уже максимальный уровень фермы!")
-    
     if rig['balance'] >= cost:
         rig['balance'] -= cost
         rig['level'] = next_level
@@ -487,7 +473,6 @@ def handle_upgrade_rig(msg):
         response = f"❌ <b>Недостаточно средств.</b>\n\n" \
                    f"Для улучшения до {next_level} уровня требуется <code>{cost}</code> BTC.\n" \
                    f"Вам не хватает <code>{needed:.6f}</code> BTC. Копите дальше!"
-    
     send_message_with_partner_button(msg.chat.id, response)
 
 @bot.message_handler(commands=['top_miners'])
@@ -495,14 +480,10 @@ def handle_top_miners(msg):
     """Показывает таблицу лидеров."""
     if not user_rigs:
         return send_message_with_partner_button(msg.chat.id, "Пока нет ни одного майнера для составления топа.")
-        
-    # Сортируем пользователей по балансу
     sorted_rigs = sorted(user_rigs.values(), key=lambda r: r['balance'], reverse=True)
-    
     response = ["🏆 <b>Топ-5 Виртуальных Майнеров:</b>\n"]
     for i, rig in enumerate(sorted_rigs[:5]):
         response.append(f"<b>{i+1}.</b> {telebot.util.escape(rig['name'])} - <code>{rig['balance']:.6f}</code> BTC (Ур. {rig['level']})")
-    
     send_message_with_partner_button(msg.chat.id, "\n".join(response))
 
 # --- Обработчики викторины и слова дня ---
@@ -698,4 +679,4 @@ if __name__ == '__main__':
     else:
         logger.info("Запуск в режиме long-polling...")
         bot.remove_webhook()
-        bot.polling(none_stop=True)
+        bot.polling(none_stop=Tr
