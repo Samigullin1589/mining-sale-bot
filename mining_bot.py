@@ -9,6 +9,7 @@ import requests
 import time
 import threading
 import schedule
+import json # ИСПРАВЛЕНО: Добавлен импорт json
 from flask import Flask, request
 import gspread
 from google.oauth2.service_account import Credentials
@@ -28,11 +29,11 @@ NEWSAPI_KEY = os.environ.get("CRYPTO_API_KEY") # CryptoPanic API Key
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 ETHERSCAN_API_KEY = os.environ.get("ETHERSCAN_API_KEY", "YourApiKeyToken")
 
-
 NEWS_CHAT_ID = os.environ.get("NEWS_CHAT_ID") # Канал для новостей
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID") # ID админа для отчетов
 
-GOOGLE_JSON_PATH = os.environ.get("GOOGLE_JSON", "sage-instrument.json")
+# ИСПРАВЛЕНО: Теперь ключ читается как текстовая переменная, а не как путь к файлу
+GOOGLE_JSON_STR = os.environ.get("GOOGLE_JSON")
 SHEET_ID = os.environ.get("SHEET_ID")
 SHEET_NAME = os.environ.get("SHEET_NAME", "Лист1")
 
@@ -52,7 +53,7 @@ app = Flask(__name__)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 pending_weather_requests = {}
-pending_calculator_requests = {} # Для нового калькулятора
+pending_calculator_requests = {} 
 asic_cache = {"data": [], "timestamp": None}
 
 # Словарь для универсального парсера валют
@@ -70,11 +71,18 @@ CURRENCY_MAP = {
 # ========================================================================================
 
 def get_gsheet():
-    """Подключается к Google Sheets и возвращает объект листа."""
+    """ИСПРАВЛЕНО: Подключается к Google Sheets используя ключи из переменной окружения."""
+    if not GOOGLE_JSON_STR:
+        print("Ошибка: переменная окружения GOOGLE_JSON не установлена.")
+        raise ValueError("Ключи Google Sheets не найдены.")
     try:
-        creds = Credentials.from_service_account_file(GOOGLE_JSON_PATH, scopes=['https://www.googleapis.com/auth/spreadsheets'])
+        creds_dict = json.loads(GOOGLE_JSON_STR)
+        creds = Credentials.from_service_account_info(creds_dict, scopes=['https://www.googleapis.com/auth/spreadsheets'])
         gc = gspread.authorize(creds)
         return gc.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
+    except json.JSONDecodeError:
+        print("Ошибка: неверный формат JSON в переменной GOOGLE_JSON.")
+        raise
     except Exception as e:
         print(f"Ошибка подключения к Google Sheets: {e}")
         raise
@@ -129,7 +137,9 @@ def get_weather(city: str):
 def get_currency_rate(base="USD", to="EUR"):
     try:
         res = requests.get(f"https://api.exchangerate.host/latest?base={base.upper()}&symbols={to.upper()}").json()
-        return f"💱 {base.upper()} → {to.upper()} = {res['rates'][to.upper()]:.2f}"
+        if res.get('rates') and res['rates'].get(to.upper()):
+            return f"� {base.upper()} → {to.upper()} = {res['rates'][to.upper()]:.2f}"
+        return f"[❌ Не удалось получить курс для {base.upper()} к {to.upper()}]"
     except Exception as e: return f"[❌ Ошибка получения курса: {e}]"
 
 def ask_gpt(prompt: str, model: str = "gpt-4o"):
@@ -185,16 +195,25 @@ def send_message_with_partner_button(chat_id, text, **kwargs):
     kwargs.setdefault('reply_markup', get_random_partner_button())
     bot.send_message(chat_id, text, **kwargs)
 
-def calculate_and_format_profit(electricity_cost: float):
-    """НОВАЯ ФУНКЦИЯ: Расчет и форматирование доходности ASIC."""
+def calculate_and_format_profit(electricity_cost_rub: float):
+    """ИСПРАВЛЕНО: Расчет и форматирование доходности ASIC с конвертацией из рублей."""
+    # Получаем курс USD к RUB
+    try:
+        rate_info = requests.get(f"https://api.exchangerate.host/latest?base=USD&symbols=RUB").json()
+        usd_to_rub_rate = rate_info['rates']['RUB']
+    except Exception as e:
+        print(f"Ошибка получения курса USD/RUB для калькулятора: {e}")
+        return "Не удалось получить курс доллара для расчета. Попробуйте позже."
+
+    electricity_cost_usd = electricity_cost_rub / usd_to_rub_rate
+    
     asics_data = get_top_asics()
     if not asics_data or "Ошибка" in asics_data[0]:
         return "Не удалось получить данные по ASIC для расчета. Попробуйте позже."
 
-    result = [f"💰 **Расчет чистой прибыли при цене розетки ${electricity_cost:.3f}/кВтч**\n"]
+    result = [f"💰 **Расчет чистой прибыли при цене розетки {electricity_cost_rub:.2f} ₽/кВтч (~${electricity_cost_usd:.3f}/кВтч)**\n"]
     for asic_string in asics_data:
         try:
-            # Парсим данные из строки, например: "• Bitmain Antminer S19 Pro: 110Th/s, 3250W, доход ~$5.50/день"
             name_match = re.search(r"•\s(.*?):", asic_string)
             power_match = re.search(r"(\d+W)", asic_string)
             revenue_match = re.search(r"\$([\d\.]+)", asic_string)
@@ -206,13 +225,13 @@ def calculate_and_format_profit(electricity_cost: float):
             daily_revenue = float(revenue_match.group(1))
 
             daily_power_kwh = (power_watts / 1000) * 24
-            daily_electricity_cost = daily_power_kwh * electricity_cost
+            daily_electricity_cost = daily_power_kwh * electricity_cost_usd
             net_profit = daily_revenue - daily_electricity_cost
 
             result.append(
                 f"**{name}**\n"
-                f"  - Доход: `${daily_revenue:.2f}`/день\n"
-                f"  - Расход: `${daily_electricity_cost:.2f}`/день\n"
+                f"  - Доход: `${daily_revenue:.2f}`\n"
+                f"  - Расход: `${daily_electricity_cost:.2f}`\n"
                 f"  - **Чистая прибыль: `${net_profit:.2f}`/день**"
             )
         except Exception as e:
@@ -316,6 +335,7 @@ def handle_all_text_messages(msg):
     user_id = msg.from_user.id
     text_lower = msg.text.lower()
 
+    # --- Обработка состояний (ожидание ввода) ---
     if pending_weather_requests.get(user_id):
         del pending_weather_requests[user_id]
         send_message_with_partner_button(msg.chat.id, get_weather(msg.text), reply_markup=get_main_keyboard())
@@ -328,9 +348,10 @@ def handle_all_text_messages(msg):
             calculation_result = calculate_and_format_profit(electricity_cost)
             send_message_with_partner_button(msg.chat.id, calculation_result, reply_markup=get_main_keyboard())
         except ValueError:
-            bot.send_message(msg.chat.id, "❌ Неверный формат. Пожалуйста, введите число, например: `0.05`")
+            bot.send_message(msg.chat.id, "❌ Неверный формат. Пожалуйста, введите число, например: `7.5`")
         return
 
+    # --- Обработка кнопок и ключевых фраз ---
     if 'курс btc' in text_lower or 'курс' in text_lower and ('биткоин' in text_lower or 'бтс' in text_lower or 'втс' in text_lower):
         price, source = get_crypto_price("bitcoin", "usd")
         if price:
@@ -345,7 +366,7 @@ def handle_all_text_messages(msg):
         
     if 'калькулятор' in text_lower:
         pending_calculator_requests[user_id] = True
-        bot.send_message(msg.chat.id, "💡 Введите стоимость вашей электроэнергии в USD за кВт/ч (например: `0.05`)", reply_markup=types.ReplyKeyboardRemove())
+        bot.send_message(msg.chat.id, "💡 Введите стоимость вашей электроэнергии в **рублях** за кВт/ч (например: `7.5`)", reply_markup=types.ReplyKeyboardRemove())
         return
 
     if 'топ-5 asic' in text_lower:
@@ -362,12 +383,16 @@ def handle_all_text_messages(msg):
         bot.send_message(msg.chat.id, "🌦 В каком городе показать погоду?", reply_markup=types.ReplyKeyboardRemove())
         return
 
-    words = text_lower.replace('=', ' ').split()
-    currency_words = [word for word in words if CURRENCY_MAP.get(word)]
-    if 'к' in words and len(currency_words) >= 2:
-        base, quote = CURRENCY_MAP[currency_words[0]], CURRENCY_MAP[currency_words[1]]
-        send_message_with_partner_button(msg.chat.id, get_currency_rate(base, quote))
-        return
+    # ИСПРАВЛЕНО: Более надежный триггер для конвертера валют
+    match = re.search(r'(\w+)\s+к\s+(\w+)', text_lower)
+    if match and ('курс' in text_lower or len(match.groups())==2):
+        base_word = match.group(1)
+        quote_word = match.group(2)
+        base_currency = CURRENCY_MAP.get(base_word)
+        quote_currency = CURRENCY_MAP.get(quote_word)
+        if base_currency and quote_currency:
+            send_message_with_partner_button(msg.chat.id, get_currency_rate(base_currency, quote_currency))
+            return
 
     sale_words = ["продам", "продать", "куплю", "купить", "в наличии", "предзаказ"]
     item_words = ["asic", "асик", "$", "whatsminer", "antminer"]
@@ -377,6 +402,7 @@ def handle_all_text_messages(msg):
         send_message_with_partner_button(msg.chat.id, analysis)
         return
     
+    # --- Если ничего не подошло, отправляем в GPT ---
     send_message_with_partner_button(msg.chat.id, ask_gpt(msg.text))
 
 # ========================================================================================
@@ -399,7 +425,7 @@ def run_scheduler():
     schedule.every(3).hours.do(auto_send_news)
     schedule.every(3).hours.do(auto_check_status)
     schedule.every(1).hours.do(get_top_asics)
-    get_top_asics(); auto_check_status(); keep_alive() # Первоначальный запуск
+    get_top_asics(); auto_check_status(); keep_alive()
     while True:
         schedule.run_pending()
         time.sleep(1)
