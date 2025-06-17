@@ -83,7 +83,8 @@ def get_binance_price(symbol="BTCUSDT"):
     try:
         res = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol.upper()}").json()
         return float(res['price']) if 'price' in res else None
-    except Exception:
+    except Exception as e:
+        print(f"Ошибка API Binance: {e}")
         return None
 
 def get_weather(city: str):
@@ -114,9 +115,11 @@ def get_currency_rate(base="USD", to="EUR"):
 def ask_gpt(prompt: str, model: str = "gpt-4o"):
     """Отправляет запрос к OpenAI GPT."""
     try:
+        # Добавляем инструкцию отвечать на русском в начало промпта
+        full_prompt = f"Отвечай всегда на русском языке. {prompt}"
         res = openai_client.chat.completions.create(
             model=model,
-            messages=[{"role": "user", "content": prompt}]
+            messages=[{"role": "user", "content": full_prompt}]
         )
         return res.choices[0].message.content.strip()
     except Exception as e:
@@ -314,13 +317,15 @@ def handle_all_messages(msg):
         bot.send_message(msg.chat.id, "🌦 В каком городе показать погоду?")
         return
 
-    if any(k in text_lower for k in ["курс btc", "курс биткоина"]):
+    # Улучшенная проверка на запрос курса BTC
+    if 'курс' in text_lower and ('btc' in text_lower or 'биткоин' in text_lower or 'втс' in text_lower):
         price = get_binance_price("BTCUSDT")
         if price:
-            comment = ask_gpt(f"Курс BTC ${price:,.2f}. Дай краткий, дерзкий комментарий (1 предложение) о рынке.", "gpt-3.5-turbo")
-            bot.send_message(msg.chat.id, f"💰 **Курс BTC: ${price:,.2f}**\n\n*{comment}*")
+            comment_prompt = f"Курс BTC ${price:,.2f}. Дай краткий, дерзкий комментарий (1 предложение) о рынке."
+            comment = ask_gpt(comment_prompt, "gpt-3.5-turbo")
+            bot.send_message(msg.chat.id, f"💰 **Курс BTC: ${price:,.2f}**\n\n*{comment}*", parse_mode="Markdown")
         else:
-            bot.send_message(msg.chat.id, "❌ Не удалось получить курс BTC.")
+            bot.send_message(msg.chat.id, "❌ Не удалось получить курс BTC с Binance.")
         return
 
     currency_pair = parse_currency_pair(text_lower)
