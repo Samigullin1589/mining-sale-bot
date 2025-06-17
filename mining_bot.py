@@ -27,8 +27,6 @@ import logging
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
 
 # --- Ключи и Настройки (Загрузка из переменных окружения) ---
-# РЕКОМЕНДАЦИЯ: Используйте os.getenv() вместо os.environ.get() для лучшей практики.
-# getenv не вызовет ошибку, если переменная не найдена, а вернет None.
 BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 NEWSAPI_KEY = os.getenv("CRYPTO_API_KEY") # CryptoPanic API Key
@@ -54,7 +52,6 @@ PARTNER_BUTTON_TEXT_OPTIONS = [
 if not BOT_TOKEN:
     raise ValueError("Критическая ошибка: не найдена переменная окружения TG_BOT_TOKEN")
 
-# УЛУЧШЕНО: Добавлена обработка ошибок при инициализации API
 try:
     bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
     app = Flask(__name__)
@@ -155,7 +152,6 @@ def get_eth_gas_price():
 def get_weather(city: str):
     """Получает погоду с сервиса wttr.in."""
     try:
-        # УЛУЧШЕНО: Добавлены заголовки для имитации запроса от браузера
         headers = {'User-Agent': 'Mozilla/5.0'}
         r = requests.get(f"https://wttr.in/{city}?format=j1", headers=headers, timeout=7).json()
         current = r["current_condition"][0]
@@ -183,14 +179,13 @@ def get_currency_rate(base="USD", to="RUB"):
 def ask_gpt(prompt: str, model: str = "gpt-4o"):
     """Отправляет запрос к OpenAI GPT."""
     try:
-        # УЛУЧШЕНО: Использование системного сообщения для более точного указания роли
         res = openai_client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": "Ты — полезный ассистент, который всегда отвечает на русском языке."},
                 {"role": "user", "content": prompt}
             ],
-            timeout=20.0 # Установлен таймаут для долгих запросов
+            timeout=20.0
         )
         return res.choices[0].message.content.strip()
     except Exception as e:
@@ -207,7 +202,7 @@ def get_top_asics(force_update: bool = False):
     try:
         logging.info("Обновление данных по ASIC с сайта...")
         r = requests.get("https://www.asicminervalue.com/miners/sha-256", timeout=15)
-        r.raise_for_status() # Проверка на HTTP ошибки
+        r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
         table_rows = soup.select("table tbody tr")
         if not table_rows:
@@ -217,7 +212,6 @@ def get_top_asics(force_update: bool = False):
         for row in table_rows[:5]:
             cols = row.find_all("td")
             if len(cols) > 3:
-                 # УЛУЧШЕНО: Более надежный парсинг с проверками
                 name = cols[0].get_text(strip=True)
                 th = cols[1].get_text(strip=True)
                 power = cols[2].get_text(strip=True)
@@ -241,7 +235,7 @@ def get_crypto_news(keywords: list = None):
         if keywords:
             params["currencies"] = ",".join(keywords).upper()
         else:
-             params["currencies"] = "BTC,ETH" # Новости по умолчанию
+             params["currencies"] = "BTC,ETH"
 
         r = requests.get("https://cryptopanic.com/api/v1/posts/", params=params, timeout=10).json()
         posts = r.get("results", [])[:3]
@@ -249,7 +243,6 @@ def get_crypto_news(keywords: list = None):
         if not posts:
             return "[🧐 Новостей по вашему запросу не найдено]"
 
-        # УЛУЧШЕНО: Использование GPT для саммаризации
         prompt_for_gpt = (
             "Ниже приведены заголовки новостей. Для каждого заголовка сделай краткое саммари на русском (1 предложение). "
             "Отформатируй ответ так: 'САММАРИ 1\nСАММАРИ 2\nСАММАРИ 3'.\n\n" +
@@ -312,7 +305,6 @@ def calculate_and_format_profit(electricity_cost_rub: float):
     result = [f"💰 **Расчет чистой прибыли при цене розетки {electricity_cost_rub:.2f} ₽/кВтч (~${electricity_cost_usd:.3f}/кВтч)**\n"]
     for asic_string in asics_data:
         try:
-            # УЛУЧШЕНО: Более устойчивый к ошибкам парсинг с помощью regex
             match = re.search(r"•\s*(.*?):\s*.*?(\d+W).*?\$([\d\.]+)", asic_string)
             if not match:
                 continue
@@ -345,7 +337,6 @@ def keep_alive():
     """Отправляет запрос самому себе, чтобы приложение не 'засыпало' на хостинге."""
     if WEBHOOK_URL:
         try:
-            # УЛУЧШЕНО: Пингуется базовый URL, а не эндпоинт вебхука
             base_url = WEBHOOK_URL.rsplit('/', 1)[0]
             requests.get(base_url, timeout=10)
             logging.info(f"Keep-alive пинг на {base_url} отправлен.")
@@ -370,15 +361,12 @@ def auto_check_status():
     if not ADMIN_CHAT_ID: return
     logging.info("Запуск плановой проверки систем...")
     errors = []
-    # 1. Проверка OpenAI
     if "ошибка" in ask_gpt("Тест", "gpt-3.5-turbo").lower():
         errors.append("API OpenAI (GPT) вернул ошибку.")
-    # 2. Проверка Google Sheets
     try:
         get_gsheet()
     except Exception:
         errors.append("Не удалось подключиться к Google Sheets.")
-    # 3. Проверка новостного API
     if "ошибка" in get_crypto_news().lower():
         errors.append("API новостей (CryptoPanic) вернул ошибку.")
 
@@ -386,7 +374,7 @@ def auto_check_status():
     if not errors:
         status_msg = f"✅ **Плановая проверка ({ts})**\n\nВсе системы работают."
     else:
-        error_list = "\n".join([f"� {e}" for e in errors])
+        error_list = "\n".join([f"🚨 {e}" for e in errors])
         status_msg = f"⚠️ **Проблемы в работе бота ({ts}):**\n{error_list}"
     try:
         bot.send_message(ADMIN_CHAT_ID, status_msg, parse_mode="Markdown")
@@ -417,11 +405,9 @@ def handle_start_help(msg):
 def handle_price(msg):
     """Обработчик команды /price."""
     try:
-        # УЛУЧШЕНО: Более гибкий парсинг пары
         parts = msg.text.split()
         pair_text = parts[1].upper() if len(parts) > 1 else "BTC-USDT"
         coin, currency = (pair_text.split('-') + ['USD'])[:2]
-        # Для CoinGecko нужен ID, а не тикер
         coin_id_map = {'BTC': 'bitcoin', 'ETH': 'ethereum'}
         coin_id = coin_id_map.get(coin, coin.lower())
     except IndexError:
@@ -440,8 +426,7 @@ def handle_chart(msg):
     bot.send_message(msg.chat.id, "⏳ Строю график, это может занять немного времени...")
     try:
         sheet = get_gsheet()
-        # УЛУЧШЕНО: Получаем только нужные столбцы
-        records = sheet.get_all_values()[1:] # Пропускаем заголовок
+        records = sheet.get_all_values()[1:]
         dates, profits = [], []
         error_lines = []
 
@@ -449,13 +434,12 @@ def handle_chart(msg):
             try:
                 if not row or len(row) < 3 or not row[0] or not row[2]: continue
                 date_obj = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
-                # УЛУЧШЕНО: Более надежный поиск цены
                 profit_match = re.search(r'\$([\d\.]+)', row[2])
                 if profit_match:
                     profits.append(float(profit_match.group(1)))
                     dates.append(date_obj)
             except (ValueError, IndexError):
-                error_lines.append(str(i + 2)) # +2 т.к. начинаем с 1 и есть заголовок
+                error_lines.append(str(i + 2))
                 continue
 
         if len(dates) < 2:
@@ -465,7 +449,6 @@ def handle_chart(msg):
         if error_lines:
             bot.send_message(msg.chat.id, f"⚠️ **Предупреждение:** Не удалось обработать строки: {', '.join(error_lines)}. Убедитесь, что дата в формате `ГГГГ-ММ-ДД ЧЧ:ММ:СС` и в тексте есть цена в `$`. График построен по остальным данным.")
 
-        # Построение графика
         plt.style.use('dark_background')
         fig, ax = plt.subplots(figsize=(12, 6))
         ax.plot(dates, profits, marker='o', linestyle='-', color='#00aaff', label='Чистая прибыль ($)')
@@ -493,7 +476,6 @@ def handle_all_text_messages(msg):
     user_id = msg.from_user.id
     text_lower = msg.text.lower().strip()
 
-    # --- 1. Обработка состояний (ожидание ввода от пользователя) ---
     if pending_weather_requests.get(user_id):
         del pending_weather_requests[user_id]
         bot.send_message(msg.chat.id, "⏳ Ищу погоду...", reply_markup=get_main_keyboard())
@@ -511,7 +493,6 @@ def handle_all_text_messages(msg):
             bot.send_message(msg.chat.id, "❌ Неверный формат. Пожалуйста, введите число, например: `7.5` или `3`")
         return
 
-    # --- 2. Обработка кнопок и ключевых фраз ---
     if text_lower in ["💹 курс btc", "/btc"]:
         price, source = get_crypto_price("bitcoin", "usd")
         if price:
@@ -527,7 +508,6 @@ def handle_all_text_messages(msg):
 
     if text_lower in ["⛏️ калькулятор", "/calc"]:
         pending_calculator_requests[user_id] = True
-        # УЛУЧШЕНО: Убираем клавиатуру только на время ввода
         bot.send_message(msg.chat.id, "💡 Введите стоимость вашей электроэнергии в **рублях** за кВт/ч (например: `7.5`)", reply_markup=types.ReplyKeyboardRemove())
         return
 
@@ -547,7 +527,6 @@ def handle_all_text_messages(msg):
         bot.send_message(msg.chat.id, "🌦 В каком городе показать погоду?", reply_markup=types.ReplyKeyboardRemove())
         return
 
-    # --- 3. Универсальный конвертер валют ---
     match = re.search(r'(\S+)\s+(?:в|to|к)\s+(\S+)', text_lower)
     if match and ('курс' in text_lower or 'конверт' in text_lower):
         base_word, quote_word = match.groups()
@@ -557,7 +536,6 @@ def handle_all_text_messages(msg):
             send_message_with_partner_button(msg.chat.id, get_currency_rate(base_currency, quote_currency))
             return
 
-    # --- 4. Анализ объявлений ---
     sale_words = ["продам", "продать", "куплю", "купить", "в наличии", "предзаказ"]
     item_words = ["asic", "асик", "whatsminer", "antminer", "карта", "ферма"]
     if any(word in text_lower for word in sale_words) and any(word in text_lower for word in item_words):
@@ -566,7 +544,6 @@ def handle_all_text_messages(msg):
         send_message_with_partner_button(msg.chat.id, analysis)
         return
 
-    # --- 5. Если ничего не подошло, отправляем в GPT как общий вопрос ---
     bot.send_chat_action(msg.chat.id, 'typing')
     send_message_with_partner_button(msg.chat.id, ask_gpt(msg.text))
 
@@ -575,7 +552,8 @@ def handle_all_text_messages(msg):
 # 6. ЗАПУСК БОТА, ВЕБХУКА И ПЛАНИРОВЩИКА
 # ========================================================================================
 
-@app.route('/' + BOT_TOKEN, methods=['POST'])
+# ИЗМЕНЕНО: Возвращаем статический URL для вебхука для большей надежности
+@app.route('/webhook', methods=['POST'])
 def webhook():
     """Обработчик вебхука от Telegram."""
     if request.headers.get('content-type') == 'application/json':
@@ -584,6 +562,7 @@ def webhook():
         bot.process_new_updates([update])
         return '', 200
     else:
+        # УЛУЧШЕНО: Возвращаем 403 Forbidden, если тип контента неверный
         return 'Forbidden', 403
 
 @app.route("/")
@@ -593,13 +572,11 @@ def index():
 
 def run_scheduler():
     """Запускает фоновые задачи по расписанию."""
-    # Задачи
     schedule.every(25).minutes.do(keep_alive)
     schedule.every(4).hours.do(auto_send_news)
     schedule.every(6).hours.do(auto_check_status)
     schedule.every(1).hours.do(get_top_asics)
 
-    # Первый запуск сразу после старта
     logging.info("Первоначальный запуск фоновых задач...")
     get_top_asics(force_update=True)
     auto_check_status()
@@ -612,23 +589,21 @@ def run_scheduler():
 if __name__ == '__main__':
     logging.info("Запуск бота...")
     if WEBHOOK_URL:
-        # Установка вебхука
         logging.info("Режим вебхука. Установка...")
         bot.remove_webhook()
         time.sleep(0.5)
-        bot.set_webhook(url=WEBHOOK_URL.rstrip("/") + "/" + BOT_TOKEN)
-        logging.info(f"Вебхук установлен на: {WEBHOOK_URL}")
+        # ИЗМЕНЕНО: Устанавливаем вебхук на статический адрес /webhook
+        full_webhook_url = WEBHOOK_URL.rstrip("/") + "/webhook"
+        bot.set_webhook(url=full_webhook_url)
+        logging.info(f"Вебхук установлен на: {full_webhook_url}")
 
-        # Запуск планировщика в отдельном потоке
         scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
         scheduler_thread.start()
         logging.info("Планировщик запущен.")
 
-        # Запуск Flask-приложения
         port = int(os.environ.get('PORT', 10000))
         app.run(host="0.0.0.0", port=port)
     else:
-        # Режим long-polling для локального тестирования
         logging.info("Вебхук не найден. Запуск в режиме long-polling для отладки...")
         scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
         scheduler_thread.start()
