@@ -214,7 +214,7 @@ def ask_gpt(prompt: str, model: str = "gpt-4o"):
         return f"[❌ Ошибка GPT: Не удалось получить ответ. Попробуйте позже.]"
 
 def _parse_asicminervalue():
-    """Парсер для asicminervalue.com."""
+    """ИСПРАВЛЕНО: Более надежный парсер для asicminervalue.com."""
     logging.info("Попытка парсинга asicminervalue.com")
     r = requests.get("https://www.asicminervalue.com/miners/sha-256", timeout=15)
     r.raise_for_status()
@@ -226,30 +226,26 @@ def _parse_asicminervalue():
     parsed_asics = []
     for row in table_rows[:5]:
         cols = row.find_all("td")
-        if not cols: continue
+        if len(cols) < 4: continue
 
-        asic_data = {}
-        asic_data['name'] = cols[0].get_text(strip=True)
+        asic_data = {
+            'name': cols[0].get_text(strip=True),
+            'hashrate': cols[1].get_text(strip=True),
+            'power_str': cols[2].get_text(strip=True),
+            'revenue_str': cols[3].get_text(strip=True),
+        }
 
-        for col in cols:
-            text = col.get_text(strip=True)
-            if 'h/s' in text.lower() and 'hashrate' not in asic_data:
-                asic_data['hashrate'] = text
-            elif 'W' in text and 'Wh' not in text and 'power_str' not in asic_data:
-                power_match = re.search(r'(\d+)', text)
-                if power_match:
-                    asic_data['power_watts'] = float(power_match.group(1))
-                    asic_data['power_str'] = text
-            elif '$' in text and 'revenue_str' not in asic_data:
-                revenue_match = re.search(r'([\d\.]+)', text)
-                if revenue_match:
-                    asic_data['daily_revenue'] = float(revenue_match.group(1))
-                    asic_data['revenue_str'] = text
-        
-        if all(k in asic_data for k in ['name', 'hashrate', 'power_watts', 'daily_revenue', 'power_str', 'revenue_str']):
-            parsed_asics.append(asic_data)
-        else:
-            logging.warning(f"AsicMinerValue: Не удалось найти все данные для ASIC: {row.get_text(strip=True)}")
+        try:
+            power_match = re.search(r'(\d+)', asic_data['power_str'])
+            asic_data['power_watts'] = float(power_match.group(1)) if power_match else 0
+            
+            revenue_match = re.search(r'([\d\.]+)', asic_data['revenue_str'])
+            asic_data['daily_revenue'] = float(revenue_match.group(1)) if revenue_match else 0
+            
+            if asic_data['power_watts'] > 0 and asic_data['daily_revenue'] > 0:
+                parsed_asics.append(asic_data)
+        except (AttributeError, ValueError, IndexError):
+            continue
 
     if not parsed_asics:
         raise ValueError("Не удалось извлечь данные ни одного ASIC с asicminervalue.com")
@@ -258,51 +254,48 @@ def _parse_asicminervalue():
     return parsed_asics
 
 def _parse_whattomine():
-    """Резервный парсер для whattomine.com."""
+    """ИСПРАВЛЕНО: Более надежный резервный парсер для whattomine.com."""
     logging.info("Попытка парсинга whattomine.com")
     headers = {'User-Agent': 'Mozilla/5.0'}
-    r = requests.get("https://whattomine.com/asics", headers=headers, timeout=15)
+    # ИСПРАВЛЕНО: Запрос идет на JSON endpoint, что гораздо надежнее парсинга HTML.
+    r = requests.get("https://whattomine.com/asics.json", headers=headers, timeout=15)
     r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-    asic_divs = soup.find_all('div', class_='asic')
+    data = r.json()
+    asics_data = data.get('asics', {})
 
-    if not asic_divs:
-        raise ValueError("Контейнеры ASIC не найдены на whattomine.com")
+    if not asics_data:
+        raise ValueError("Данные ASIC не найдены в JSON от whattomine.com")
 
-    parsed_asics = []
-    for div in asic_divs:
-        if div.find('h5') and 'sha-256' in div.find('h5').text.lower():
+    sha256_asics = []
+    for key, asic in asics_data.items():
+        if asic.get('algorithm') == 'sha256' and asic.get('profitability_daily'):
             try:
-                name = div.find('a').strong.text.strip()
-                hashrate = div.find('td', text='Hashrate').find_next_sibling('td').text.strip()
-                power_text = div.find('td', text='Power').find_next_sibling('td').text.strip()
-                revenue_text = div.find('td', text=re.compile(r"Revenue\s*24h")).find_next_sibling('td').strong.text.strip()
+                # 'profitability_daily' содержит доходность в BTC, нужно конвертировать
+                btc_price, _ = get_crypto_price()
+                if not btc_price:
+                    logging.warning("Не удалось получить цену BTC для калькулятора WhatToMine")
+                    continue
                 
-                power_watts_match = re.search(r'(\d+)', power_text)
-                power_watts = float(power_watts_match.group(1)) if power_watts_match else 0
+                daily_revenue = float(asic['profitability_daily']) * btc_price
                 
-                revenue_match = re.search(r'([\d\.]+)', revenue_text)
-                revenue = float(revenue_match.group(1)) if revenue_match else 0
-                
-                if all([name, hashrate, power_watts > 0, revenue > 0]):
-                    parsed_asics.append({
-                        "name": name,
-                        "hashrate": hashrate,
-                        "power_watts": power_watts,
-                        "power_str": power_text,
-                        "daily_revenue": revenue,
-                        "revenue_str": f"${revenue:.2f}",
-                    })
-            except (AttributeError, ValueError, IndexError) as e:
-                logging.warning(f"WhatToMine: Не удалось распарсить div: {div.get_text(strip=True)} | Ошибка: {e}")
+                sha256_asics.append({
+                    "name": asic.get('name', 'Unknown ASIC'),
+                    "hashrate": f"{asic.get('hashrate', 0) / 1e12:.2f}Th/s",
+                    "power_watts": float(asic.get('power', 0)),
+                    "power_str": f"{asic.get('power', 0)}W",
+                    "daily_revenue": daily_revenue,
+                    "revenue_str": f"${daily_revenue:.2f}",
+                })
+            except (KeyError, ValueError, TypeError) as e:
+                logging.warning(f"WhatToMine JSON: Не удалось обработать ASIC {key}. Ошибка: {e}")
                 continue
     
-    if not parsed_asics:
-        raise ValueError("Не удалось извлечь данные ни одного SHA-256 ASIC с whattomine.com")
+    if not sha256_asics:
+        raise ValueError("Не удалось извлечь данные ни одного SHA-256 ASIC из JSON whattomine.com")
 
-    parsed_asics.sort(key=lambda x: x['daily_revenue'], reverse=True)
-    logging.info(f"Успешно получено {len(parsed_asics)} ASIC с whattomine.com")
-    return parsed_asics[:5]
+    sha256_asics.sort(key=lambda x: x['daily_revenue'], reverse=True)
+    logging.info(f"Успешно получено {len(sha256_asics)} ASIC с whattomine.com")
+    return sha256_asics[:5]
 
 
 def get_top_asics(force_update: bool = False):
@@ -332,8 +325,8 @@ def get_top_asics(force_update: bool = False):
 
 def get_crypto_news(keywords: list = None):
     """
-    ИЗМЕНЕНО: Получает 3 последние новости с CryptoPanic, суммируя их с помощью GPT.
-    Имеет защиту от некорректных ответов GPT.
+    ИСПРАВЛЕНО: Получает 3 последние новости с CryptoPanic, суммируя их с помощью GPT
+    и делая саммари ссылкой на источник.
     """
     try:
         params = {"auth_token": NEWSAPI_KEY, "public": "true"}
@@ -348,7 +341,6 @@ def get_crypto_news(keywords: list = None):
         if not posts:
             return "[🧐 Новостей по вашему запросу не найдено]"
 
-        # УЛУЧШЕНО: Создаем более надежный промпт для GPT
         titles_for_gpt = "\n".join([f"- {p['title']}" for p in posts])
         prompt_for_gpt = (
             "Сделай краткое саммари на русском (одно предложение) для каждого из следующих заголовков новостей. "
@@ -360,19 +352,17 @@ def get_crypto_news(keywords: list = None):
         summaries_text = ask_gpt(prompt_for_gpt, 'gpt-3.5-turbo')
         
         items = []
-        # Проверяем, что GPT не вернул ошибку
         if summaries_text and "[❌" not in summaries_text:
             summaries = summaries_text.strip().split('\n')
-            # Итерируемся по постам, чтобы гарантировать правильный порядок и количество
             for i, post in enumerate(posts):
-                # Если саммари для этого поста есть, используем его. Иначе - используем оригинальный заголовок.
                 summary = summaries[i].strip() if i < len(summaries) else post['title']
-                items.append(f"🔹 {summary}\n[Источник]({post.get('url', '')})")
+                # ИСПРАВЛЕНО: Делаем саммари ссылкой
+                items.append(f"🔹 [{summary}]({post.get('url', '')})")
         else:
-            # Если GPT вернул ошибку, просто показываем оригинальные заголовки
             logging.warning("GPT не смог сделать саммари новостей, используются оригинальные заголовки.")
             for post in posts:
-                items.append(f"🔹 {post['title']}\n[Источник]({post.get('url', '')})")
+                # ИСПРАВЛЕНО: Делаем заголовок ссылкой
+                items.append(f"🔹 [{post['title']}]({post.get('url', '')})")
 
         return "\n\n".join(items) if items else "[🤷‍♂️ Свежих новостей нет]"
 
@@ -412,6 +402,7 @@ def send_message_with_partner_button(chat_id, text, **kwargs):
 
         kwargs.setdefault('parse_mode', 'Markdown')
         kwargs.setdefault('reply_markup', get_random_partner_button())
+        kwargs.setdefault('disable_web_page_preview', True) # Отключаем превью для ссылок
         bot.send_message(chat_id, full_text, **kwargs)
     except Exception as e:
         logging.error(f"Не удалось отправить сообщение в чат {chat_id}: {e}")
@@ -500,6 +491,7 @@ def auto_send_news():
     try:
         logging.info("Запуск авторассылки новостей...")
         news = get_crypto_news()
+        # ИСПРАВЛЕНО: для авто-рассылки тоже отключаем превью
         bot.send_message(NEWS_CHAT_ID, news, disable_web_page_preview=True, parse_mode='Markdown', reply_markup=get_random_partner_button())
         logging.info(f"Новости успешно отправлены в чат {NEWS_CHAT_ID}")
     except Exception as e:
@@ -667,7 +659,7 @@ def handle_all_text_messages(msg):
         asics_data = get_top_asics()
         if not asics_data or isinstance(asics_data[0], str):
             error_message = asics_data[0] if asics_data else "Не удалось получить данные."
-            bot.send_message(msg.chat.id, error_message)
+            send_message_with_partner_button(msg.chat.id, error_message)
             return
 
         formatted_list = []
@@ -680,7 +672,7 @@ def handle_all_text_messages(msg):
     if text_lower in ["📰 новости", "/news"]:
         bot.send_message(msg.chat.id, "⏳ Ищу свежие новости...")
         keywords = [word.upper() for word in text_lower.split() if word.upper() in ['BTC', 'ETH', 'SOL', 'MINING']]
-        send_message_with_partner_button(msg.chat.id, get_crypto_news(keywords or None), disable_web_page_preview=True)
+        send_message_with_partner_button(msg.chat.id, get_crypto_news(keywords or None))
         return
 
     if text_lower in ["🌦️ погода", "/weather"]:
