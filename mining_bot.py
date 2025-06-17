@@ -664,4 +664,4 @@ if __name__ == '__main__':
     else:
         logger.info("Режим: long-polling.")
         bot.remove_webhook()
-        bot.polling(none_stop=Tr
+        bot.polling(none_stop=True)
