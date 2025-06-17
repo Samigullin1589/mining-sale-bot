@@ -67,13 +67,20 @@ CURRENCY_MAP = {
 HALVING_INTERVAL = 210000
 NEXT_HALVING_BLOCK = 840000
 
+# Обработчик исключений для детального логирования
+class ExceptionHandler(telebot.ExceptionHandler):
+    def handle(self, exception):
+        logger.error("Произошла ошибка в обработчике pyTelegramBotAPI:", exc_info=exception)
+        return True # Продолжаем работу
+
 # --- Инициализация ---
 if not BOT_TOKEN:
     logger.critical("Критическая ошибка: не найдена переменная окружения TG_BOT_TOKEN")
     raise ValueError("Критическая ошибка: TG_BOT_TOKEN не установлен")
 
 try:
-    bot = telebot.TeleBot(BOT_TOKEN, threaded=False, parse_mode='HTML')
+    # Подключаем наш обработчик исключений
+    bot = telebot.TeleBot(BOT_TOKEN, threaded=False, parse_mode='HTML', exception_handler=ExceptionHandler())
     app = Flask(__name__)
     openai_client = OpenAI(api_key=OPENAI_API_KEY)
 except Exception as e:
@@ -338,15 +345,22 @@ def handle_start_help(msg):
                  "<code>/my_rig</code>, <code>/collect</code> - ваша виртуальная ферма.")
     bot.send_message(msg.chat.id, help_text, reply_markup=get_main_keyboard())
 
-@bot.message_handler(commands=['price'])
-def handle_price(msg):
-    coin_symbol = msg.text.split()[1].upper() if len(msg.text.split()) > 1 else "BTC"
+# 📌 ИСПРАВЛЕНО: Логика вынесена в отдельную функцию, чтобы избежать дублирования
+def get_price_and_send(chat_id, coin_symbol="BTC"):
+    """Получает цену и отправляет сообщение."""
     coin_id = CURRENCY_MAP.get(coin_symbol.lower(), coin_symbol.lower())
     price, source = get_crypto_price(coin_id, "usd")
     if price:
-        send_message_with_partner_button(msg.chat.id, f"💹 Курс {coin_symbol}/USD: <b>${price:,.2f}</b>\n<i>(Данные от {source})</i>")
+        text = f"💹 Курс {coin_symbol}/USD: <b>${price:,.2f}</b>\n<i>(Данные от {source})</i>"
+        send_message_with_partner_button(chat_id, text)
     else:
-        bot.send_message(msg.chat.id, f"❌ Не удалось получить курс для {coin_symbol}.")
+        text = f"❌ Не удалось получить курс для {coin_symbol}."
+        bot.send_message(chat_id, text)
+
+@bot.message_handler(commands=['price'])
+def handle_price(msg):
+    coin_symbol = msg.text.split()[1].upper() if len(msg.text.split()) > 1 else "BTC"
+    get_price_and_send(msg.chat.id, coin_symbol)
 
 @bot.message_handler(commands=['fear', 'fng'])
 def handle_fear_and_greed(msg):
@@ -395,57 +409,68 @@ def handle_rig_commands(msg):
 # 6. ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ
 # ========================================================================================
 
+# 📌 ИСПРАВЛЕНО: Вся логика обработки текста теперь в одной функции с четкой структурой
 @bot.message_handler(content_types=['text'])
 def handle_text_messages(msg):
-    user_id = msg.from_user.id
-    text_lower = msg.text.lower().strip()
-    
-    # --- Обработка состояний (ожидание ввода) ---
-    if user_states.get(user_id) == 'weather_request':
-        user_states.pop(user_id, None)
-        bot.send_message(msg.chat.id, f"⏳ Ищу погоду для <b>{telebot.util.escape(msg.text)}</b>...", reply_markup=get_main_keyboard())
-        send_message_with_partner_button(msg.chat.id, get_weather(msg.text))
-        return
-
-    if user_states.get(user_id) == 'calculator_request':
-        try:
-            cost = float(text_lower.replace(',', '.'))
-            user_states.pop(user_id, None)
-            bot.send_message(msg.chat.id, "⏳ Считаю прибыль...", reply_markup=get_main_keyboard())
-            send_message_with_partner_button(msg.chat.id, calculate_and_format_profit(cost))
-        except ValueError:
-            bot.send_message(msg.chat.id, "❌ Неверный формат. Введите число (например: <code>7.5</code>)")
-        return
-
-    # --- Карта команд с клавиатуры ---
-    command_map = {
-        "💹 курс btc": lambda: handle_price(telebot.util.quick_markup({}, row_width=1)), # Фиктивный объект
-        "⛽️ газ eth": lambda: send_message_with_partner_button(msg.chat.id, get_eth_gas_price()),
-        "😱 индекс страха": lambda: handle_fear_and_greed(msg),
-        "⏳ халвинг": lambda: send_message_with_partner_button(msg.chat.id, get_halving_info()),
-        "⚙️ топ-5 asic": lambda: handle_asics_text(msg),
-        "📰 новости": lambda: send_message_with_partner_button(msg.chat.id, get_crypto_news()),
-        "⛏️ калькулятор": lambda: set_user_state(user_id, 'calculator_request', "💡 Введите стоимость электроэнергии в <b>рублях</b> за кВт/ч:"),
-        "🌦️ погода": lambda: set_user_state(user_id, 'weather_request', "🌦 В каком городе показать погоду?"),
-    }
-    if text_lower in command_map:
-        command_map[text_lower]()
-        # Имитируем отправку сообщения для handle_price
-        if text_lower == "💹 курс btc": handle_price(type('obj', (object,), {'text': '/price BTC'}))
-        return
-
-    # --- Анализ объявлений ---
-    sale_words = ["продам", "продать", "куплю", "купить", "в наличии"]
-    item_words = ["asic", "асик", "whatsminer", "antminer", "карта", "ферма"]
-    if any(word in text_lower for word in sale_words) and any(word in text_lower for word in item_words):
-        log_to_sheet([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg.from_user.username or "N/A", msg.text])
-        prompt = f"Пользователь прислал объявление в майнинг-чат. Кратко и неформально прокомментируй его, поддержи диалог. НЕ предлагай другие площадки. Текст: '{msg.text}'"
-        send_message_with_partner_button(msg.chat.id, ask_gpt(prompt))
-        return
+    try:
+        user_id = msg.from_user.id
+        text_lower = msg.text.lower().strip()
         
-    # --- Ответ GPT на всё остальное ---
-    bot.send_chat_action(msg.chat.id, 'typing')
-    send_message_with_partner_button(msg.chat.id, ask_gpt(msg.text))
+        # --- 1. Обработка состояний (ожидание ввода) ---
+        if user_states.get(user_id) == 'weather_request':
+            user_states.pop(user_id, None)
+            bot.send_message(msg.chat.id, f"⏳ Ищу погоду для <b>{telebot.util.escape(msg.text)}</b>...", reply_markup=get_main_keyboard())
+            send_message_with_partner_button(msg.chat.id, get_weather(msg.text))
+            return
+
+        if user_states.get(user_id) == 'calculator_request':
+            try:
+                cost = float(text_lower.replace(',', '.'))
+                user_states.pop(user_id, None)
+                bot.send_message(msg.chat.id, "⏳ Считаю прибыль...", reply_markup=get_main_keyboard())
+                send_message_with_partner_button(msg.chat.id, calculate_and_format_profit(cost))
+            except ValueError:
+                bot.send_message(msg.chat.id, "❌ Неверный формат. Введите число (например: <code>7.5</code>)")
+            return
+
+        # --- 2. Обработка кнопок с клавиатуры ---
+        if text_lower == "💹 курс btc":
+            get_price_and_send(msg.chat.id, "BTC")
+        elif text_lower == "⛽️ газ eth":
+            send_message_with_partner_button(msg.chat.id, get_eth_gas_price())
+        elif text_lower == "😱 индекс страха":
+            handle_fear_and_greed(msg)
+        elif text_lower == "⏳ халвинг":
+            send_message_with_partner_button(msg.chat.id, get_halving_info())
+        elif text_lower == "⚙️ топ-5 asic":
+            handle_asics_text(msg)
+        elif text_lower == "📰 новости":
+            send_message_with_partner_button(msg.chat.id, get_crypto_news())
+        elif text_lower == "⛏️ калькулятор":
+            set_user_state(user_id, 'calculator_request', "💡 Введите стоимость электроэнергии в <b>рублях</b> за кВт/ч:")
+        elif text_lower == "🌦️ погода":
+            set_user_state(user_id, 'weather_request', "🌦 В каком городе показать погоду?")
+        
+        # --- 3. Анализ объявлений (если не была нажата кнопка)---
+        else:
+            sale_words = ["продам", "продать", "куплю", "купить", "в наличии"]
+            item_words = ["asic", "асик", "whatsminer", "antminer", "карта", "ферма"]
+            if any(word in text_lower for word in sale_words) and any(word in text_lower for word in item_words):
+                log_to_sheet([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg.from_user.username or "N/A", msg.text])
+                prompt = f"Пользователь прислал объявление в майнинг-чат. Кратко и неформально прокомментируй его, поддержи диалог. НЕ предлагай другие площадки. Текст: '{msg.text}'"
+                send_message_with_partner_button(msg.chat.id, ask_gpt(prompt))
+                return
+            
+            # --- 4. Ответ GPT на всё остальное ---
+            bot.send_chat_action(msg.chat.id, 'typing')
+            send_message_with_partner_button(msg.chat.id, ask_gpt(msg.text))
+
+    except Exception as e:
+        logger.error(f"Критическая ошибка в handle_text_messages!", exc_info=e)
+        try:
+            bot.send_message(msg.chat.id, "😵 Ой, что-то пошло не так. Команда разработчиков уже уведомлена.")
+        except Exception as e2:
+            logger.error(f"Не удалось даже отправить сообщение об ошибке: {e2}")
 
 def set_user_state(user_id, state, text):
     """Устанавливает состояние пользователя и отправляет сообщение."""
@@ -477,10 +502,15 @@ def handle_asics_text(msg):
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    if request.headers.get('content-type') == 'application/json':
-        bot.process_new_updates([telebot.types.Update.de_json(request.stream.read().decode("utf-8"))])
-        return '', 200
-    return 'Forbidden', 403
+    # Оборачиваем обработчик в try-except для перехвата любых ошибок
+    try:
+        if request.headers.get('content-type') == 'application/json':
+            bot.process_new_updates([telebot.types.Update.de_json(request.stream.read().decode("utf-8"))])
+            return '', 200
+        return 'Forbidden', 403
+    except Exception as e:
+        logger.error("Критическая ошибка в вебхуке!", exc_info=e)
+        return "Error", 500
 
 @app.route("/")
 def index():
