@@ -9,279 +9,398 @@ import gspread
 from google.oauth2.service_account import Credentials
 from telebot import types
 from openai import OpenAI
-from datetime import datetime
+from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 import matplotlib.pyplot as plt
 import io
+import re
+import random
 
+# --- Ключи и Настройки (Загрузка из переменных окружения) ---
 BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
-NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY")
-CRYPTO_API_KEY = os.environ.get("CRYPTO_API_KEY")
-GOOGLE_JSON = os.environ.get("GOOGLE_JSON", "sage-instrument.json")
+NEWSAPI_KEY = os.environ.get("CRYPTO_API_KEY") # CryptoPanic API Key
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+
+NEWS_CHAT_ID = os.environ.get("NEWS_CHAT_ID") # Канал для новостей
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID") # ID админа для отчетов
+
+GOOGLE_JSON_PATH = os.environ.get("GOOGLE_JSON", "sage-instrument.json")
 SHEET_ID = os.environ.get("SHEET_ID")
 SHEET_NAME = os.environ.get("SHEET_NAME", "Лист1")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-NEWS_CHAT_ID = os.environ.get("NEWS_CHAT_ID")
-ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
+
+# --- Настройки Партнерской Ссылки ---
+PARTNER_URL = "https://app.leadteh.ru/w/dTeKr"
+PARTNER_BUTTON_TEXT_OPTIONS = [
+    "🎁 Узнать спеццены", "🔥 Эксклюзивное предложение",
+    "💡 Получить консультацию", "💎 Прайс от экспертов"
+]
+
+# --- Глобальные переменные и кэш ---
+if not BOT_TOKEN:
+    raise ValueError("Критическая ошибка: не найдена переменная окружения TG_BOT_TOKEN")
 
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 app = Flask(__name__)
-client = OpenAI(api_key=OPENAI_API_KEY)
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 pending_weather_requests = {}
-TOP_ASICS = []
+asic_cache = {"data": [], "timestamp": None}
 
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    if request.headers.get('content-type') == 'application/json':
-        update = telebot.types.Update.de_json(request.get_data().decode("utf-8"))
-        bot.process_new_updates([update])
-        return '', 200
-    return '', 403
+# Словарь для универсального парсера валют
+CURRENCY_MAP = {
+    'доллар': 'USD', 'usd': 'USD', '$': 'USD',
+    'евро': 'EUR', 'eur': 'EUR', '€': 'EUR',
+    'рубль': 'RUB', 'rub': 'RUB', '₽': 'RUB',
+    'юань': 'CNY', 'cny': 'CNY',
+    'биткоин': 'BTC', 'btc': 'BTC',
+    'эфир': 'ETH', 'eth': 'ETH',
+}
 
-@app.route("/")
-def index():
-    return "Bot is running!", 200
-
-def set_webhook():
-    bot.remove_webhook()
-    time.sleep(1)
-    bot.set_webhook(url=WEBHOOK_URL.rstrip("/") + "/webhook")
+# ========================================================================================
+# 2. ФУНКЦИИ ДЛЯ РАБОТЫ С ВНЕШНИМИ API И СЕРВИСАМИ
+# ========================================================================================
 
 def get_gsheet():
-    creds = Credentials.from_service_account_file(GOOGLE_JSON, scopes=['https://www.googleapis.com/auth/spreadsheets'])
-    gc = gspread.authorize(creds)
-    return gc.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
+    """Подключается к Google Sheets и возвращает объект листа."""
+    try:
+        creds = Credentials.from_service_account_file(GOOGLE_JSON_PATH, scopes=['https://www.googleapis.com/auth/spreadsheets'])
+        gc = gspread.authorize(creds)
+        return gc.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
+    except Exception as e:
+        print(f"Ошибка подключения к Google Sheets: {e}")
+        raise
 
-def log_error_to_sheet(msg):
+def log_to_sheet(row_data: list):
+    """Логирует данные в новую строку Google Sheets."""
     try:
         sheet = get_gsheet()
-        sheet.append_row([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "error", msg])
-    except: pass
-
-def log_price_to_sheet(user, text):
-    try:
-        sheet = get_gsheet()
-        sheet.append_row([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), user.username or user.first_name, text])
-    except: pass
+        sheet.append_row(row_data, value_input_option='USER_ENTERED')
+    except Exception as e:
+        print(f"Ошибка записи в Google Sheets: {e}")
 
 def get_binance_price(symbol="BTCUSDT"):
+    """Получает цену указанной пары с Binance."""
     try:
         res = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol.upper()}").json()
-        price = float(res['price'])
-        return price
-    except Exception as e:
+        return float(res['price']) if 'price' in res else None
+    except Exception:
         return None
 
-def get_weather(city):
+def get_weather(city: str):
+    """Получает погоду с wttr.in."""
     try:
-        url = f"https://wttr.in/{city}?format=j1"
-        r = requests.get(url).json()
+        r = requests.get(f"https://wttr.in/{city}?format=j1").json()
         current = r["current_condition"][0]
-        temp = current["temp_C"]
-        desc = current["weatherDesc"][0]["value"]
-        humidity = current["humidity"]
-        wind = current["windspeedKmph"]
-        return f"🌍 {city.title()}\n🌡 Температура: {temp}°C\n☁️ Погода: {desc}\n💧 Влажность: {humidity}%\n💨 Ветер: {wind} км/ч"
-    except Exception as e:
-        return f"[Ошибка погоды: {e}]"
+        return (
+            f"🌍 {city.title()}\n"
+            f"🌡 Температура: {current['temp_C']}°C\n"
+            f"☁️ Погода: {current['weatherDesc'][0]['value']}\n"
 
-def get_currency_rate(base="usd", to="eur"):
+            f"💧 Влажность: {current['humidity']}%\n"
+            f"💨 Ветер: {current['windspeedKmph']} км/ч"
+        )
+    except Exception as e:
+        return f"[❌ Ошибка получения погоды: {e}]"
+
+def get_currency_rate(base="USD", to="EUR"):
+    """Получает курс валют с exchangerate.host."""
     try:
         res = requests.get(f"https://api.exchangerate.host/latest?base={base.upper()}&symbols={to.upper()}").json()
         rate = res['rates'][to.upper()]
         return f"💱 {base.upper()} → {to.upper()} = {rate:.2f}"
     except Exception as e:
-        return f"[Ошибка курса: {e}]"
+        return f"[❌ Ошибка получения курса: {e}]"
 
-def ask_gpt(prompt):
+def ask_gpt(prompt: str, model: str = "gpt-4o"):
+    """Отправляет запрос к OpenAI GPT."""
     try:
-        res = client.chat.completions.create(
-            model="gpt-4o",
+        res = openai_client.chat.completions.create(
+            model=model,
             messages=[{"role": "user", "content": prompt}]
         )
         return res.choices[0].message.content.strip()
     except Exception as e:
-        return f"[GPT ошибка: {e}]"
+        return f"[❌ Ошибка GPT: {e}]"
 
-def update_top_asics():
+def get_top_asics():
+    """Получает топ-5 ASIC'ов с asicminervalue.com, использует кэш (1 час)."""
+    global asic_cache
+    now = datetime.now()
+    if asic_cache["data"] and asic_cache["timestamp"] and (now - asic_cache["timestamp"] < timedelta(hours=1)):
+        return asic_cache["data"]
+
     try:
-        url = "https://www.asicminervalue.com/miners/sha-256"
-        r = requests.get(url, timeout=10)
+        r = requests.get("https://www.asicminervalue.com/miners/sha-256", timeout=15)
+        r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
-        TOP_ASICS.clear()
-        for row in soup.select("table tbody tr")[:5]:
-            tds = row.find_all("td")
-            model = tds[0].get_text(strip=True)
-            hr = tds[1].get_text(strip=True)
-            watt = tds[2].get_text(strip=True)
-            profit = tds[3].get_text(strip=True)
-            TOP_ASICS.append(f"{model} — {hr}, {watt}, доход: {profit}/день")
+        
+        updated_asics = [
+            f"• {tds[0].get_text(strip=True)}: {tds[1].get_text(strip=True)}, {tds[2].get_text(strip=True)}, доход ~{tds[3].get_text(strip=True)}/день"
+            for tds in (row.find_all("td") for row in soup.select("table tbody tr")[:5])
+        ]
+        
+        asic_cache = {"data": updated_asics, "timestamp": now}
+        return updated_asics
     except Exception as e:
-        TOP_ASICS.clear()
-        TOP_ASICS.append(f"[Ошибка обновления ASIC: {e}]")
+        return [f"[❌ Ошибка обновления ASIC: {e}]"]
 
-def schedule_asic_updates():
-    schedule.every().day.at("03:00").do(update_top_asics)
-    update_top_asics()
-
-def get_crypto_news():
+def get_crypto_news(keywords: list = None):
+    """Получает 3 новости с CryptoPanic, с возможностью фильтрации."""
     try:
-        r = requests.get(f"https://cryptopanic.com/api/v1/posts/?auth_token={CRYPTO_API_KEY}&currencies=BTC,ETH&public=true").json()
+        params = {"auth_token": NEWSAPI_KEY, "public": "true"}
+        params["currencies"] = ",".join(keywords).upper() if keywords else "BTC,ETH"
+
+        r = requests.get("https://cryptopanic.com/api/v1/posts/", params=params).json()
         posts = r.get("results", [])[:3]
-        items = []
-        for post in posts:
-            translated = ask_gpt(f"Переведи и объясни новость:\n{post['title']}")
-            url = post.get('url') or post.get('source', {}).get('url', '')
-            if url:
-                items.append(f"🔹 {translated}\n{url}")
-            else:
-                items.append(f"🔹 {translated}")
-        return "\n\n".join(items) if items else "[Нет новостей]"
-    except Exception as e:
-        return f"[Ошибка новостей: {e}]"
 
-def send_profit_chart(chat_id):
-    try:
-        sheet = get_gsheet()
-        records = sheet.get_all_values()[1:]
-        dates = [r[0] for r in records]
-        messages = [r[2] for r in records]
-        profits = []
-        for text in messages:
-            if "$" in text:
-                try:
-                    dollar = float(text.split("$")[1].split()[0])
-                    profits.append(dollar)
-                except:
-                    profits.append(0)
-            else:
-                profits.append(0)
-        plt.figure(figsize=(10,4))
-        plt.plot(dates, profits, marker='o')
-        plt.title('Доходность по дням')
-        plt.xlabel('Дата')
-        plt.ylabel('USD')
-        plt.xticks(rotation=45)
-        plt.tight_layout()
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png')
-        buf.seek(0)
-        bot.send_photo(chat_id, buf)
+        if not posts: return "[🧐 Новостей по вашему запросу не найдено]"
+            
+        items = [
+            f"🔹 {ask_gpt(f'Переведи и сократи до 1-2 предложений главную мысль этой новости: {post['title']}', 'gpt-3.5-turbo')}\n[Источник]({post.get('url', '')})"
+            for post in posts
+        ]
+        return "\n\n".join(items) if items else "[🤷‍♂️ Свежих новостей нет]"
     except Exception as e:
-        bot.send_message(chat_id, f"[Ошибка графика: {e}]")
+        return f"[❌ Ошибка получения новостей: {e}]"
+
+# ========================================================================================
+# 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И УТИЛИТЫ
+# ========================================================================================
+
+def parse_currency_pair(text: str):
+    """Извлекает пару валют из текста вроде 'курс доллара к рублю'."""
+    match = re.search(r'(\w+|\$|€|₽)\s+к\s+(\w+|\$|€|₽)', text.lower())
+    if not match: return None
+    
+    base = CURRENCY_MAP.get(match.group(1))
+    quote = CURRENCY_MAP.get(match.group(2))
+    return (base, quote) if base and quote else None
+
+def get_random_partner_button():
+    """Создает инлайн-кнопку со случайным текстом."""
+    markup = types.InlineKeyboardMarkup()
+    button_text = random.choice(PARTNER_BUTTON_TEXT_OPTIONS)
+    markup.add(types.InlineKeyboardButton(button_text, url=PARTNER_URL))
+    return markup
+
+# ========================================================================================
+# 4. ЗАДАЧИ, ВЫПОЛНЯЕМЫЕ ПО РАСПИСАНИЮ (SCHEDULE)
+# ========================================================================================
 
 def auto_send_news():
+    """Задача для отправки новостей в канал."""
+    print(f"[{datetime.now()}] Запуск авторассылки новостей...")
+    if not NEWS_CHAT_ID: return
+
     try:
         news = get_crypto_news()
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("💬 Получить прайс от партнёра", url="https://app.leadteh.ru/w/dTeKr"))
-        bot.send_message(NEWS_CHAT_ID, news, reply_markup=markup)
+        bot.send_message(NEWS_CHAT_ID, news, reply_markup=get_random_partner_button(), parse_mode="Markdown", disable_web_page_preview=True)
+        print("-> Новости успешно отправлены.")
     except Exception as e:
-        print(f"[Авторассылка]: {e}")
+        print(f"-> Ошибка при авторассылке новостей: {e}")
+        if ADMIN_CHAT_ID:
+            bot.send_message(ADMIN_CHAT_ID, f"⚠️ Не удалось выполнить авторассылку новостей:\n{e}")
 
 def auto_check_status():
-    errors = []
-    for key, name in [(BOT_TOKEN, "BOT_TOKEN"), (WEBHOOK_URL, "WEBHOOK_URL"), (OPENAI_API_KEY, "OPENAI_API_KEY")]:
-        if not key or "⚠️" in str(key): errors.append(name)
-    try: ask_gpt("Проверка GPT")
-    except Exception as e: errors.append(f"GPT: {e}")
-    try: get_gsheet()
-    except Exception as e: errors.append(f"Sheets: {e}")
-    status = "✅ Все работает" if not errors else "⚠️ Проблемы:\n" + "\n".join(errors)
-    bot.send_message(ADMIN_CHAT_ID, status)
+    """Задача для проверки работоспособности систем и отправки отчета админу."""
+    print(f"[{datetime.now()}] Запуск проверки состояния систем...")
+    if not ADMIN_CHAT_ID: return
 
-def analyze_mining_prices(text):
-    prompt = (
-        "Это сообщение из Telegram-чата с прайсами на майнинг-оборудование."
-        " Проанализируй как трейдер: есть ли выгодные предложения, актуальные цены, есть ли подозрительно дешевые."
-        " Ответь кратко, на русском, без формальностей.\n\nТекст:\n" + text
-    )
-    return ask_gpt(prompt)
+    errors = []
+    # Проверка ключевых API
+    try:
+        if "ошибка" in ask_gpt("Тест", "gpt-3.5-turbo").lower(): errors.append("API OpenAI (GPT) вернул ошибку.")
+    except Exception: errors.append("Не удалось подключиться к OpenAI.")
+    
+    try: get_gsheet()
+    except Exception: errors.append("Не удалось подключиться к Google Sheets.")
+        
+    try:
+        if "ошибка" in get_crypto_news().lower(): errors.append("API новостей (CryptoPanic) вернул ошибку.")
+    except Exception: errors.append("Не удалось подключиться к CryptoPanic.")
+    
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if not errors:
+        status_msg = f"✅ **Плановая проверка ({ts})**\n\nВсе системы работают в штатном режиме."
+    else:
+        status_msg = f"⚠️ **Плановая проверка ({ts})**\n\nОбнаружены проблемы:\n" + "\n".join([f"🚨 {e}" for e in errors])
+        
+    try:
+        bot.send_message(ADMIN_CHAT_ID, status_msg, parse_mode="Markdown")
+        print("-> Отчет о состоянии отправлен админу.")
+    except Exception as e:
+        print(f"-> Не удалось отправить отчет админу: {e}")
+
+# ========================================================================================
+# 5. ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ TELEGRAM
+# ========================================================================================
 
 @bot.message_handler(commands=['start'])
 def handle_start(msg):
-    bot.send_message(msg.chat.id, "Привет! Я бот для помощи в майнинге и крипте. Введите запрос или команду.")
+    bot.send_message(msg.chat.id, "👋 Привет! Я ваш помощник в мире криптовалют и майнинга. Задайте вопрос или используйте команду.")
 
-@bot.message_handler(commands=['cmc'])
-def handle_cmc(msg):
-    price = get_binance_price("BTCUSDT")
+@bot.message_handler(commands=['price'])
+def handle_price(msg):
+    """Обрабатывает запрос курса /price [ПАРА], например /price ETH-USDT"""
+    try:
+        pair = msg.text.split()[1].replace('-', '').upper()
+    except IndexError:
+        pair = "BTCUSDT" # По умолчанию
+    
+    price = get_binance_price(pair)
     if price:
-        bot.send_message(msg.chat.id, f"💹 Курс BTC по Binance: ${price}")
+        bot.send_message(msg.chat.id, f"💹 Курс {pair} по Binance: ${price:,.2f}")
     else:
-        bot.send_message(msg.chat.id, "[Ошибка получения курса BTC]")
+        bot.send_message(msg.chat.id, f"Не удалось найти пару {pair}. Попробуйте формат `BTCUSDT` или `ETHUSDT`.")
 
 @bot.message_handler(commands=['chart'])
 def handle_chart(msg):
-    send_profit_chart(msg.chat.id)
+    """Рисует график доходности из Google Sheets."""
+    bot.send_message(msg.chat.id, "⏳ Строю график... Это может занять некоторое время.")
+    try:
+        sheet = get_gsheet()
+        records = sheet.get_all_values()[1:]
+        
+        dates, profits = [], []
+        for r in records:
+            try:
+                # Ожидаем дату в столбце 1 (A), текст с ценой в столбце 3 (C)
+                date_obj = datetime.strptime(r[0], "%Y-%m-%d %H:%M:%S")
+                profit_str = re.search(r'\$(\d+\.?\d*)', r[2])
+                if profit_str:
+                    profits.append(float(profit_str.group(1)))
+                    dates.append(date_obj)
+            except (ValueError, IndexError, TypeError):
+                continue
+
+        if not dates or len(dates) < 2:
+            bot.send_message(msg.chat.id, "Недостаточно данных для графика. Нужно минимум 2 записи с датой и суммой в '$'.")
+            return
+
+        plt.style.use('dark_background')
+        fig, ax = plt.subplots(figsize=(12, 6))
+        ax.plot(dates, profits, marker='o', linestyle='-', color='#00aaff')
+        ax.set_title('Динамика доходности', fontsize=16, color='white')
+        ax.set_xlabel('Дата', fontsize=12, color='white')
+        ax.set_ylabel('Доход, USD', fontsize=12, color='white')
+        ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+        ax.tick_params(axis='x', colors='white', rotation=30)
+        ax.tick_params(axis='y', colors='white')
+        fig.tight_layout()
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=150, transparent=True)
+        buf.seek(0)
+        bot.send_photo(msg.chat.id, buf, caption="📈 График доходности на основе ваших данных.")
+        plt.close(fig)
+
+    except Exception as e:
+        bot.send_message(msg.chat.id, f"❌ Не удалось построить график: {e}")
+        if ADMIN_CHAT_ID:
+            bot.send_message(ADMIN_CHAT_ID, f"⚠️ Ошибка при построении графика для пользователя {msg.from_user.id}:\n{e}")
 
 @bot.message_handler(func=lambda msg: True)
 def handle_all_messages(msg):
     user_id = msg.from_user.id
-    text = msg.text.lower()
+    text_lower = msg.text.lower()
 
-    if user_id in pending_weather_requests:
-        response = get_weather(msg.text)
+    if pending_weather_requests.get(user_id):
         del pending_weather_requests[user_id]
-        bot.send_message(msg.chat.id, response)
+        bot.send_message(msg.chat.id, get_weather(msg.text))
         return
 
-    if "погода" in text:
+    if "погода" in text_lower:
         pending_weather_requests[user_id] = True
-        bot.send_message(msg.chat.id, "🌦 В каком городе вас интересует погода?")
+        bot.send_message(msg.chat.id, "🌦 В каком городе показать погоду?")
         return
 
-    if any(k in text for k in ["курс btc", "btc курс", "курс биткоина", "btc price", "btc now", "биткоин курс"]):
+    if any(k in text_lower for k in ["курс btc", "курс биткоина"]):
         price = get_binance_price("BTCUSDT")
         if price:
-            comment = ask_gpt(f"Курс BTC ${price}. Кратко прокомментируй текущую ситуацию в 1 предложении.")
-            bot.send_message(msg.chat.id, f"💰 Курс BTC: ${price}\n{comment}")
+            comment = ask_gpt(f"Курс BTC ${price:,.2f}. Дай краткий, дерзкий комментарий (1 предложение) о рынке.", "gpt-3.5-turbo")
+            bot.send_message(msg.chat.id, f"💰 **Курс BTC: ${price:,.2f}**\n\n*{comment}*")
         else:
-            bot.send_message(msg.chat.id, "[Ошибка получения курса BTC]")
+            bot.send_message(msg.chat.id, "❌ Не удалось получить курс BTC.")
         return
 
-    if "доллар к евро" in text:
-        bot.send_message(msg.chat.id, get_currency_rate("usd", "eur"))
+    currency_pair = parse_currency_pair(text_lower)
+    if currency_pair:
+        bot.send_message(msg.chat.id, get_currency_rate(*currency_pair))
         return
 
-    if "новости" in text:
-        bot.send_message(msg.chat.id, get_crypto_news())
+    if "новости" in text_lower:
+        keywords = [word.upper() for word in text_lower.split() if word.upper() in ['BTC', 'ETH', 'SOL', 'MINING']]
+        news = get_crypto_news(keywords or None)
+        bot.send_message(msg.chat.id, news, parse_mode="Markdown", disable_web_page_preview=True)
         return
 
-    if any(x in text for x in ["продам", "asic", "в наличии", "бу", "$", "usd"]):
-        log_price_to_sheet(msg.from_user, msg.text)
-        bot.send_message(msg.chat.id, analyze_mining_prices(msg.text))
+    if any(x in text_lower for x in ["продам", "в наличии", "предзаказ", "$"]):
+        log_to_sheet([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg.from_user.username or msg.from_user.first_name, msg.text])
+        analysis_prompt = f"Это прайс на майнинг-оборудование. Проанализируй как трейдер: выгодные предложения, актуальность цен, подозрительно дешевые позиции. Ответь кратко, без формальностей.\n\nТекст:\n{msg.text}"
+        bot.send_message(msg.chat.id, ask_gpt(analysis_prompt))
         return
 
-    if any(k in text for k in ["asic", "модель", "розетка", "квт", "выгодно", "доходность"]):
-        models = "\n".join(TOP_ASICS)
-        prompt = (
-            "Ниже представлен актуальный список ASIC SHA‑256 моделей, полученный с сайта asicminervalue.com, "
-            "обновлённый сегодня. Используй исключительно эти данные. Не ссылайся на своё обучение в 2023 году. "
-            "Отвечай как консультант, у которого свежая информация.\n\n"
-            f"{models}\n\nТеперь ответь на вопрос пользователя:\n{text}"
-        )
+    if any(k in text_lower for k in ["asic", "асик", "модель", "розетка", "доходность"]):
+        models_info = "\n".join(get_top_asics())
+        prompt = f"Ты — консультант по майнингу. Вот свежие данные о топ-5 ASIC:\n{models_info}\n\nИспользуй только эти данные. Ответь на вопрос кратко и по делу.\nВопрос: {msg.text}"
     else:
         prompt = msg.text
 
     try:
         answer = ask_gpt(prompt)
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("💬 Прайс от партнёра", url="https://app.leadteh.ru/w/dTeKr"))
-        bot.send_message(msg.chat.id, answer, reply_markup=markup)
+        bot.send_message(msg.chat.id, answer, reply_markup=get_random_partner_button(), parse_mode="Markdown")
     except Exception as e:
-        bot.send_message(msg.chat.id, f"[GPT ошибка: {e}]")
+        bot.send_message(msg.chat.id, f"❌ Произошла ошибка при обработке запроса: {e}")
 
-schedule.every(3).hours.do(auto_send_news)
-schedule.every(3).hours.do(auto_check_status)
-schedule_asic_updates()
+# ========================================================================================
+# 6. ЗАПУСК БОТА, ВЕБХУКА И ПЛАНИРОВЩИКА
+# ========================================================================================
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Принимает обновления от Telegram."""
+    if request.headers.get('content-type') == 'application/json':
+        bot.process_new_updates([telebot.types.Update.de_json(request.stream.read().decode("utf-8"))])
+        return '', 200
+    return 'Forbidden', 403
+
+@app.route("/")
+def index():
+    """Простая страница, чтобы видеть, что бот запущен."""
+    return "Bot is running!", 200
 
 def run_scheduler():
+    """Бесконечный цикл для выполнения задач по расписанию."""
+    # Запуск задач сразу после старта, чтобы не ждать 3 часа
+    get_top_asics()
+    auto_check_status()
+
+    # Настройка расписания
+    schedule.every(3).hours.do(auto_send_news)
+    schedule.every(3).hours.do(auto_check_status)
+    schedule.every(1).hours.do(get_top_asics) # Обновление кэша асиков
+
     while True:
         schedule.run_pending()
         time.sleep(1)
 
 if __name__ == '__main__':
-    set_webhook()
-    threading.Thread(target=run_scheduler).start()
-    app.run(host="0.0.0.0", port=int(os.environ.get('PORT', 10000)))
+    # Установка вебхука
+    if WEBHOOK_URL:
+        print(f"Установка вебхука на: {WEBHOOK_URL}")
+        bot.remove_webhook()
+        time.sleep(1)
+        bot.set_webhook(url=WEBHOOK_URL.rstrip("/") + "/webhook")
+        print("Вебхук успешно установлен.")
+    else:
+        print("Переменная WEBHOOK_URL не установлена. Бот не будет работать через вебхук.")
+    
+    # Запуск планировщика в отдельном потоке
+    scheduler_thread = threading.Thread(target=run_scheduler)
+    scheduler_thread.daemon = True
+    scheduler_thread.start()
+    
+    # Запуск Flask-приложения
+    port = int(os.environ.get('PORT', 10000))
+    print(f"Запуск Flask приложения на порту {port}")
+    app.run(host="0.0.0.0", port=port)
