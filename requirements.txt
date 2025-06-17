@@ -1,12 +1,16 @@
-Flask==2.3.3
-pyTelegramBotAPI==4.12.0
-gunicorn
-gspread
-google-auth-oauthlib # Более современная библиотека для аутентификации Google
-openai
-requests
-schedule
-beautifulsoup4
-lxml # Более быстрый и надежный парсер для BeautifulSoup
-matplotlib
-Pillow # Явно добавляем библиотеку для работы с изображениями, нужна для matplotlib
+=======================================================
+Зависимости для Telegram Crypto Bot
+Установить командой: pip install -r requirements.txt
+=======================================================
+beautifulsoup4==4.12.3   # Для парсинга HTML-страниц (например, сайта с ASIC)
+Flask==2.3.3             # Микрофреймворк для создания веб-сервера (нужен для вебхука)
+gunicorn==22.0.0         # WSGI-сервер для запуска Flask в продакшене
+gspread==6.0.2           # Для удобной работы с Google Sheets
+google-auth-oauthlib==1.2.0 # Для аутентификации в сервисах Google (включая Sheets)
+lxml==5.2.2              # Быстрый XML и HTML парсер для BeautifulSoup
+matplotlib==3.8.4        # Для создания графиков и диаграмм (Индекс страха и жадности)
+openai==1.30.1           # Официальный клиент для работы с API OpenAI (ChatGPT)
+Pillow==10.3.0           # Для работы с изображениями (необходима для сохранения графиков matplotlib)
+pyTelegramBotAPI==4.12.0 # Основная библиотека для создания Telegram-бота
+requests==2.32.3         # Для выполнения HTTP-запросов к различным API
+schedule==1.2.2          # Для запуска задач по расписанию (новости, проверки статуса)
