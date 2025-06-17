@@ -107,6 +107,38 @@ currency_cache = {"rate": None, "timestamp": None}
 # ========================================================================================
 # 2. РАБОТА С ВНЕШНИМИ СЕРВИСАМИ (API)
 # ========================================================================================
+def get_gsheet():
+    try:
+        creds_dict = json.loads(GOOGLE_JSON_STR)
+        creds = Credentials.from_service_account_info(creds_dict, scopes=['https://www.googleapis.com/auth/spreadsheets'])
+        return gspread.authorize(creds).open_by_key(SHEET_ID).worksheet(SHEET_NAME)
+    except Exception as e:
+        logger.error(f"Ошибка подключения к Google Sheets: {e}")
+        raise
+
+def log_to_sheet(row_data: list):
+    try:
+        get_gsheet().append_row(row_data, value_input_option='USER_ENTERED')
+        logger.info(f"Запись в Google Sheets: {row_data}")
+    except Exception as e:
+        logger.error(f"Ошибка записи в Google Sheets: {e}")
+
+# 📌 ИСПРАВЛЕНО: Восстановлена функция `ask_gpt`
+def ask_gpt(prompt: str, model: str = "gpt-4o"):
+    try:
+        res = openai_client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "Ты — полезный ассистент, который отвечает на русском, используя HTML-теги: <b>, <i>, <code>, <pre>."},
+                {"role": "user", "content": prompt}
+            ],
+            timeout=20.0
+        )
+        return res.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error(f"Ошибка вызова OpenAI API: {e}")
+        return "[❌ Ошибка GPT: Не удалось получить ответ.]"
+
 def get_crypto_price(ticker="BTC"):
     ticker = ticker.upper()
     sources = [
@@ -123,6 +155,7 @@ def get_crypto_price(ticker="BTC"):
     logger.error(f"Не удалось получить цену для {ticker}.")
     return (None, None)
 
+# 📌 ИСПРАВЛЕНО: Полностью переписан парсер для стабильности
 def get_top_asics(force_update: bool = False):
     global asic_cache
     if not force_update and asic_cache.get("data") and (datetime.now() - asic_cache["timestamp"] < timedelta(hours=1)):
@@ -132,13 +165,23 @@ def get_top_asics(force_update: bool = False):
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "lxml")
         parsed_asics = []
-        sha256_table = soup.find('h2', id='sha-256').find_next('table')
+        
+        # Более надежный поиск таблицы
+        sha256_header = soup.find('h2', id='sha-256')
+        if not sha256_header:
+            raise ValueError("Не найден заголовок 'sha-256' на странице.")
+        
+        sha256_table = sha256_header.find_next('table')
+        if not sha256_table:
+            raise ValueError("Не найдена таблица после заголовка 'sha-256'.")
+        
         for row in sha256_table.select("tbody tr"):
             cols = [col for col in row.find_all("td")]
             if len(cols) < 5: continue
             
-            name = cols[1].find('a').get_text(strip=True) if cols[1].find('a') else "N/A"
-            if name == "N/A": continue # Пропускаем, если нет имени
+            name_tag = cols[1].find('a')
+            name = name_tag.get_text(strip=True) if name_tag else "N/A"
+            if name == "N/A": continue
 
             hashrate = cols[2].get_text(strip=True)
             power_watts_match = re.search(r'([\d,]+)', cols[3].get_text(strip=True))
@@ -150,7 +193,7 @@ def get_top_asics(force_update: bool = False):
                 if power_watts > 0:
                     parsed_asics.append({'name': name, 'hashrate': hashrate, 'power_watts': power_watts, 'daily_revenue': daily_revenue})
         
-        if not parsed_asics: raise ValueError("Не удалось распарсить ASIC")
+        if not parsed_asics: raise ValueError("Не удалось распарсить ни одного ASIC из таблицы.")
         
         parsed_asics.sort(key=lambda x: x['daily_revenue'], reverse=True)
         asic_cache = {"data": parsed_asics[:5], "timestamp": datetime.now()}
@@ -164,36 +207,46 @@ def get_fear_and_greed_index():
     try:
         data = requests.get("https://api.alternative.me/fng/?limit=1", timeout=5).json()['data'][0]
         value, classification = int(data['value']), data['value_classification']
-        
         plt.style.use('dark_background')
         fig, ax = plt.subplots(figsize=(8, 4.5), subplot_kw={'projection': 'polar'})
-        ax.set_yticklabels([])
-        ax.set_xticklabels([])
-        ax.grid(False)
+        ax.set_yticklabels([]); ax.set_xticklabels([]); ax.grid(False)
         ax.spines['polar'].set_visible(False)
         ax.set_ylim(0, 1)
-        
         colors = ['#d94b4b', '#e88452', '#ece36a', '#b7d968', '#73c269']
         for i in range(100):
             ax.barh(1, 0.0314, left=3.14 - (i * 0.0314), height=0.3, color=colors[min(len(colors) - 1, int(i / 25))])
-        
         angle = 3.14 - (value * 0.0314)
         ax.annotate('', xy=(angle, 1), xytext=(0, 0), arrowprops=dict(facecolor='white', shrink=0.05, width=4, headwidth=10))
-        
-        # Используем text вместо annotate для центрального текста, чтобы он не был полярным
         fig.text(0.5, 0.5, f"{value}", ha='center', va='center', fontsize=48, color='white', weight='bold')
         fig.text(0.5, 0.35, classification, ha='center', va='center', fontsize=20, color='white')
-
         buf = io.BytesIO()
         plt.savefig(buf, format='png', dpi=150, transparent=True)
         buf.seek(0)
         plt.close(fig)
-        
         text = f"😱 <b>Индекс страха и жадности: {value} - {classification}</b>\n"
         return buf, text
     except Exception as e:
         logger.error(f"Ошибка при создании графика индекса страха: {e}", exc_info=True)
         return None, "[❌ Ошибка при получении индекса]"
+
+def get_usd_rub_rate():
+    global currency_cache
+    if currency_cache.get("rate") and (datetime.now() - currency_cache["timestamp"] < timedelta(minutes=30)):
+        return currency_cache["rate"]
+    sources = ["https://api.exchangerate.host/latest?base=USD&symbols=RUB", "https://api.exchangerate-api.com/v4/latest/USD"]
+    for url in sources:
+        try:
+            response = requests.get(url, timeout=4)
+            response.raise_for_status()
+            rate = response.json().get('rates', {}).get('RUB')
+            if rate:
+                currency_cache = {"rate": rate, "timestamp": datetime.now()}
+                logger.info(f"Получен курс {rate} с {url}")
+                return rate
+        except Exception:
+            continue
+    logger.error("Не удалось получить курс USD/RUB ни с одного источника")
+    return None
 
 # ========================================================================================
 # 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -205,7 +258,7 @@ def get_main_keyboard():
                "🏆 Топ майнеров", "🛍️ Магазин"]
     markup.add(*[types.KeyboardButton(text) for text in buttons])
     return markup
-    
+
 def send_message_with_partner_button(chat_id, text, **kwargs):
     try:
         full_text = f"{text}\n\n---\n<i>{random.choice(BOT_HINTS)}</i>"
@@ -225,24 +278,6 @@ def send_photo_with_partner_button(chat_id, photo, caption, **kwargs):
     except Exception as e:
         logger.error(f"Не удалось отправить фото: {e}. Отправляю текстом.")
         send_message_with_partner_button(chat_id, caption, **kwargs)
-
-def get_usd_rub_rate():
-    global currency_cache
-    if currency_cache["rate"] and (datetime.now() - currency_cache["timestamp"] < timedelta(minutes=30)):
-        return currency_cache["rate"]
-    sources = ["https://api.exchangerate.host/latest?base=USD&symbols=RUB", "https://api.exchangerate-api.com/v4/latest/USD"]
-    for url in sources:
-        try:
-            response = requests.get(url, timeout=4)
-            response.raise_for_status()
-            rate = response.json().get('rates', {}).get('RUB')
-            if rate:
-                currency_cache = {"rate": rate, "timestamp": datetime.now()}
-                logger.info(f"Получен курс {rate} с {url}")
-                return rate
-        except Exception: continue
-    logger.error("Не удалось получить курс USD/RUB ни с одного источника")
-    return None
 
 def calculate_and_format_profit(electricity_cost_rub: float):
     rate = get_usd_rub_rate()
@@ -291,7 +326,157 @@ def handle_fear_and_greed(msg):
     photo, text = get_fear_and_greed_index()
     send_photo_with_partner_button(msg.chat.id, photo=photo, caption=text)
 
-# ... (Остальные обработчики команд вынесены в основной обработчик текста)
+def handle_my_rig(msg):
+    user_id = msg.from_user.id
+    if user_id not in user_rigs:
+        user_rigs[user_id] = {'last_collected': None, 'balance': 0.0, 'level': 1, 'streak': 0, 'name': msg.from_user.first_name, 'boost_active_until': None}
+        response = "🎉 Поздравляю! Вы запустили свою первую виртуальную ферму!\n\n"
+    else: response = ""
+    rig = user_rigs[user_id]
+    next_level = rig['level'] + 1
+    upgrade_cost_text = f"Стоимость улучшения до {next_level} уровня: <code>{UPGRADE_COSTS.get(next_level, 'N/A')}</code> BTC." if next_level in UPGRADE_COSTS else "Вы достигли максимального уровня!"
+    boost_status = ""
+    if rig.get('boost_active_until') and datetime.now() < rig['boost_active_until']:
+        time_left = rig['boost_active_until'] - datetime.now()
+        h, rem = divmod(time_left.seconds, 3600)
+        m, _ = divmod(rem, 60)
+        boost_status = f"⚡️ <b>Буст x2 активен еще: {h}ч {m}м</b>\n"
+    response += (f"🖥️ <b>Ферма {telebot.util.escape(rig['name'])}</b>\n\n"
+                 f"<b>Уровень:</b> {rig['level']}\n"
+                 f"<b>Баланс:</b> <code>{rig['balance']:.8f}</code> BTC\n"
+                 f"<b>Дневная серия:</b> {rig['streak']} 🔥 (бонус <b>+{rig['streak'] * STREAK_BONUS_MULTIPLIER:.0%}</b>)\n"
+                 f"{boost_status}\n"
+                 f"{upgrade_cost_text}\n\n"
+                 "<code>/collect</code>, <code>/upgrade_rig</code>, <code>/shop</code>")
+    send_message_with_partner_button(msg.chat.id, response)
+
+def handle_collect(msg):
+    user_id = msg.from_user.id
+    if user_id not in user_rigs:
+        return send_message_with_partner_button(msg.chat.id, "🤔 У вас нет фермы. Начните с команды <code>/my_rig</code>.")
+    rig = user_rigs[user_id]
+    now = datetime.now()
+    if rig['last_collected'] and (now - rig['last_collected']) < timedelta(hours=24):
+        time_left = timedelta(hours=24) - (now - rig['last_collected'])
+        h, m = divmod(time_left.seconds, 3600)[0], divmod(time_left.seconds % 3600, 60)[0]
+        return send_message_with_partner_button(msg.chat.id, f"Вы уже собирали награду. Попробуйте снова через <b>{h}ч {m}м</b>.")
+    if rig['last_collected'] and (now - rig['last_collected']) < timedelta(hours=48): rig['streak'] += 1
+    else: rig['streak'] = 1
+    base_mined = MINING_RATES.get(rig['level'], 0.0001)
+    streak_bonus = base_mined * rig['streak'] * STREAK_BONUS_MULTIPLIER
+    boost_multiplier = 2 if rig.get('boost_active_until') and now < rig['boost_active_until'] else 1
+    total_mined = (base_mined + streak_bonus) * boost_multiplier
+    rig['balance'] += total_mined
+    rig['last_collected'] = now
+    boost_text = " (x2 Буст!)" if boost_multiplier > 1 else ""
+    response = (f"✅ Собрано <b>{total_mined:.8f}</b> BTC{boost_text}!\n"
+                f"  (База: {base_mined:.8f} + Бонус за серию: {streak_bonus:.8f})\n"
+                f"🔥 Ваша серия: <b>{rig['streak']} дней!</b>\n"
+                f"💰 Ваш новый баланс: <code>{rig['balance']:.8f}</code> BTC.")
+    send_message_with_partner_button(msg.chat.id, response)
+
+def handle_upgrade_rig(msg):
+    user_id = msg.from_user.id
+    if user_id not in user_rigs: return send_message_with_partner_button(msg.chat.id, "🤔 У вас нет фермы. Начните с <code>/my_rig</code>.")
+    rig = user_rigs[user_id]
+    next_level, cost = rig['level'] + 1, UPGRADE_COSTS.get(rig['level'] + 1)
+    if not cost: return send_message_with_partner_button(msg.chat.id, "🎉 Поздравляем, у вас максимальный уровень фермы!")
+    if rig['balance'] >= cost:
+        rig['balance'] -= cost
+        rig['level'] = next_level
+        response = f"🚀 <b>Улучшение завершено!</b>\n\nВаша ферма достигла <b>{next_level}</b> уровня! "
+    else:
+        response = f"❌ <b>Недостаточно средств.</b>\n\nДля улучшения до {next_level} уровня требуется <code>{cost}</code> BTC."
+    send_message_with_partner_button(msg.chat.id, response)
+
+def handle_top_miners(msg):
+    if not user_rigs: return send_message_with_partner_button(msg.chat.id, "Пока нет ни одного майнера для составления топа.")
+    sorted_rigs = sorted(user_rigs.values(), key=lambda r: r['balance'], reverse=True)
+    response = ["🏆 <b>Топ-5 Виртуальных Майнеров:</b>\n"]
+    for i, rig in enumerate(sorted_rigs[:5]):
+        response.append(f"<b>{i+1}.</b> {telebot.util.escape(rig['name'])} - <code>{rig['balance']:.6f}</code> BTC (Ур. {rig['level']})")
+    send_message_with_partner_button(msg.chat.id, "\n".join(response))
+
+def handle_shop(msg):
+    text = (f"🛍️ <b>Магазин улучшений</b>\n\n"
+            f"<b>1. Энергетический буст (x2)</b>\n"
+            f"<i>Удваивает всю вашу добычу на 24 часа.</i>\n"
+            f"<b>Стоимость:</b> <code>{BOOST_COST}</code> BTC\n\n"
+            f"Для покупки используйте команду <code>/buy_boost</code>")
+    send_message_with_partner_button(msg.chat.id, text)
+
+def handle_buy_boost(msg):
+    user_id = msg.from_user.id
+    if user_id not in user_rigs: return send_message_with_partner_button(msg.chat.id, "🤔 У вас нет фермы. Начните с <code>/my_rig</code>.")
+    rig = user_rigs[user_id]
+    if rig.get('boost_active_until') and datetime.now() < rig['boost_active_until']:
+        return send_message_with_partner_button(msg.chat.id, "У вас уже активен буст!")
+    if rig['balance'] >= BOOST_COST:
+        rig['balance'] -= BOOST_COST
+        rig['boost_active_until'] = datetime.now() + timedelta(hours=BOOST_DURATION_HOURS)
+        response = f"⚡️ <b>Энергетический буст куплен!</b>\n\nВаша добыча будет удвоена в течение следующих 24 часов."
+    else:
+        response = f"❌ <b>Недостаточно средств.</b>"
+    send_message_with_partner_button(msg.chat.id, response)
+
+def handle_word_of_the_day(msg):
+    term = random.choice(CRYPTO_TERMS)
+    prompt = f"Объясни термин '{term}' простыми словами для новичка в криптовалютах (2-3 предложения)."
+    explanation = ask_gpt(prompt, "gpt-3.5-turbo")
+    text = f"🎓 <b>Слово дня: {term}</b>\n\n{explanation}"
+    send_message_with_partner_button(msg.chat.id, text)
+
+def handle_quiz(msg):
+    user_id = msg.from_user.id
+    shuffled_questions = random.sample(QUIZ_QUESTIONS, len(QUIZ_QUESTIONS))
+    user_states[user_id] = {'quiz_active': True, 'score': 0, 'question_index': 0, 'questions': shuffled_questions}
+    bot.send_message(msg.chat.id, "🔥 <b>Начинаем крипто-викторину!</b>\nОтветьте на 5 вопросов.", reply_markup=types.ReplyKeyboardRemove())
+    send_quiz_question(msg.chat.id, user_id)
+
+def send_quiz_question(chat_id, user_id):
+    state = user_states.get(user_id)
+    if not state or not state.get('quiz_active'): return
+    q_index, questions = state['question_index'], state['questions']
+    if q_index >= len(questions):
+        score = state['score']
+        reward_text = ""
+        if score >= QUIZ_MIN_CORRECT_FOR_REWARD:
+            if user_id in user_rigs:
+                user_rigs[user_id]['balance'] += QUIZ_REWARD
+                reward_text = f"\n\n🎁 За отличный результат вам начислено <b>{QUIZ_REWARD:.4f} BTC!</b>"
+            else:
+                reward_text = f"\n\n🎁 Вы бы получили <b>{QUIZ_REWARD:.4f} BTC</b>, если бы у вас была ферма! Начните с <code>/my_rig</code>."
+        bot.send_message(chat_id, f"🎉 <b>Викторина завершена!</b>\nВаш результат: <b>{score} из {len(questions)}</b>.{reward_text}", reply_markup=get_main_keyboard())
+        user_states.pop(user_id, None)
+        return
+    question_data = questions[q_index]
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    buttons = [types.InlineKeyboardButton(option, callback_data=f"quiz_{q_index}_{i}") for i, option in enumerate(question_data['options'])]
+    markup.add(*buttons)
+    bot.send_message(chat_id, f"<b>Вопрос {q_index + 1}:</b>\n{question_data['question']}", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('quiz_'))
+def handle_quiz_answer(call):
+    user_id = call.from_user.id
+    state = user_states.get(user_id)
+    if not state or not state.get('quiz_active'): return bot.answer_callback_query(call.id, "Викторина уже не активна.")
+    _, q_index, answer_index = map(int, call.data.split('_')[1:])
+    if q_index != state.get('question_index'): return bot.answer_callback_query(call.id, "Вы уже ответили.")
+    
+    question_data = state['questions'][q_index]
+    bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=None)
+    
+    if answer_index == question_data['correct_index']:
+        state['score'] += 1
+        bot.send_message(call.message.chat.id, "✅ Правильно!")
+    else:
+        correct_answer_text = question_data['options'][question_data['correct_index']]
+        bot.send_message(call.message.chat.id, f"❌ Неверно. Правильный ответ: <b>{correct_answer_text}</b>")
+    
+    state['question_index'] += 1
+    time.sleep(1)
+    send_quiz_question(call.message.chat.id, user_id)
+    bot.answer_callback_query(call.id)
 
 # ========================================================================================
 # 5. ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ
@@ -303,46 +488,37 @@ def handle_text_messages(msg):
         text_lower = msg.text.lower().strip()
         current_state = user_states.get(user_id)
 
-        # 1. Обработка состояний (ожидание ввода)
         if current_state:
             state_handlers = {
-                'price_request': lambda: get_price_and_send(msg.chat.id, msg.text),
-                'weather_request': lambda: send_message_with_partner_button(msg.chat.id, get_weather(msg.text)),
-                'calculator_request': lambda: send_message_with_partner_button(msg.chat.id, calculate_and_format_profit(float(msg.text.replace(',', '.'))))
+                'price_request': lambda: get_price_and_send(user_id, msg.text),
+                'weather_request': lambda: send_message_with_partner_button(user_id, get_weather(msg.text)),
+                'calculator_request': lambda: send_message_with_partner_button(user_id, calculate_and_format_profit(float(msg.text.replace(',', '.'))))
             }
             if current_state in state_handlers:
                 user_states.pop(user_id, None)
                 state_handlers[current_state]()
                 return
         
-        # 2. Обработка кнопок с клавиатуры
         command_map = {
             "💹 курс": lambda: set_user_state(user_id, 'price_request', "Курс какой криптовалюты вас интересует? (напр: BTC, ETH, SOL)"),
-            "⚙️ топ-5 asic": lambda: handle_asics_text(msg),
-            "⛏️ калькулятор": lambda: set_user_state(user_id, 'calculator_request', "💡 Введите стоимость электроэнергии в <b>рублях</b> за кВт/ч:"),
-            "📰 новости": lambda: send_message_with_partner_button(msg.chat.id, get_crypto_news()),
-            "😱 индекс страха": lambda: handle_fear_and_greed(msg),
-            "⏳ халвинг": lambda: send_message_with_partner_button(msg.chat.id, get_halving_info()),
-            "🧠 викторина": lambda: handle_quiz(msg),
-            "🎓 слово дня": lambda: handle_word_of_the_day(msg),
-            "🏆 топ майнеров": lambda: handle_top_miners(msg),
-            "🛍️ магазин": lambda: handle_shop(msg),
-            "🌦️ погода": lambda: set_user_state(user_id, 'weather_request', "🌦 В каком городе показать погоду?")
+            "⚙️ топ-5 asic": lambda: handle_asics_text(msg), "⛏️ калькулятор": lambda: set_user_state(user_id, 'calculator_request', "💡 Введите стоимость электроэнергии в <b>рублях</b> за кВт/ч:"),
+            "📰 новости": lambda: send_message_with_partner_button(user_id, get_crypto_news()), "😱 индекс страха": lambda: handle_fear_and_greed(msg),
+            "⏳ халвинг": lambda: send_message_with_partner_button(user_id, get_halving_info()), "🧠 викторина": lambda: handle_quiz(msg),
+            "🎓 слово дня": lambda: handle_word_of_the_day(msg), "🏆 топ майнеров": lambda: handle_top_miners(msg),
+            "🛍️ магазин": lambda: handle_shop(msg), "🌦️ погода": lambda: set_user_state(user_id, 'weather_request', "🌦 В каком городе показать погоду?")
         }
         if text_lower in command_map:
             command_map[text_lower]()
             return
 
-        # 3. Анализ и ответ GPT на остальное
-        sale_words = ["продам", "купить", "в наличии"]
-        item_words = ["asic", "асик", "whatsminer", "antminer"]
+        sale_words = ["продам", "купить", "в наличии"]; item_words = ["asic", "асик", "whatsminer", "antminer"]
         if any(w in text_lower for w in sale_words) and any(w in text_lower for w in item_words):
             log_to_sheet([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg.from_user.username or "N/A", msg.text])
             prompt = f"Пользователь прислал объявление в майнинг-чат. Кратко и неформально прокомментируй его, поддержи диалог. Текст: '{msg.text}'"
-            send_message_with_partner_button(msg.chat.id, ask_gpt(prompt))
+            send_message_with_partner_button(user_id, ask_gpt(prompt))
         else:
-            bot.send_chat_action(msg.chat.id, 'typing')
-            send_message_with_partner_button(msg.chat.id, ask_gpt(msg.text))
+            bot.send_chat_action(user_id, 'typing')
+            send_message_with_partner_button(user_id, ask_gpt(msg.text))
 
     except Exception as e:
         logger.error(f"Критическая ошибка в handle_text_messages!", exc_info=e)
@@ -364,12 +540,9 @@ def handle_asics_text(msg):
     response_text += f"\n\n{ask_gpt(gpt_prompt, 'gpt-4o')}"
     send_message_with_partner_button(msg.chat.id, response_text)
 
-# ... (Остальные игровые обработчики и викторина)
-
 # ========================================================================================
 # 6. ЗАПУСК БОТА И ПЛАНИРОВЩИКА
 # ========================================================================================
-
 @app.route('/webhook', methods=['POST'])
 def webhook():
     try:
@@ -381,7 +554,34 @@ def webhook():
         logger.error("Критическая ошибка в вебхуке!", exc_info=e)
         return "Error", 500
 
-# ... (Остальной код запуска без изменений)
+@app.route("/")
+def index(): return "Bot is running!"
+
+def run_scheduler():
+    if WEBHOOK_URL: schedule.every(25).minutes.do(lambda: requests.get(WEBHOOK_URL.rsplit('/', 1)[0]))
+    schedule.every(4).hours.do(auto_send_news)
+    schedule.every(6).hours.do(auto_check_status)
+    schedule.every(1).hours.do(get_top_asics, force_update=True)
+    logger.info("Планировщик запущен, первоначальный запуск задач...")
+    get_top_asics(force_update=True)
+    auto_check_status()
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+def auto_send_news():
+    if NEWS_CHAT_ID: send_message_with_partner_button(NEWS_CHAT_ID, get_crypto_news())
+
+def auto_check_status():
+    if not ADMIN_CHAT_ID: return
+    errors = []
+    if get_crypto_price("BTC")[0] is None: errors.append("API цены")
+    if "[❌" in ask_gpt("Тест"): errors.append("API OpenAI")
+    try: get_gsheet()
+    except Exception: errors.append("Google Sheets")
+    ts = datetime.now().strftime("%H:%M")
+    status = "✅ Все системы в норме." if not errors else f"⚠️ Сбой в: {', '.join(errors)}"
+    bot.send_message(ADMIN_CHAT_ID, f"<b>Отчет о состоянии ({ts})</b>\n{status}")
 
 if __name__ == '__main__':
     logger.info("Запуск бота...")
