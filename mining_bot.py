@@ -10,7 +10,7 @@ import time
 import threading
 import schedule
 import json
-import html
+# import html # УДАЛЕНО: Эта библиотека вызывала проблемы в среде развертывания
 from flask import Flask, request
 import gspread
 from google.oauth2.service_account import Credentials
@@ -355,9 +355,10 @@ def get_new_quiz_questions():
         
         formatted_questions = []
         for item in response.get("results", []):
-            question_text = html.unescape(item['question'])
-            correct_answer = html.unescape(item['correct_answer'])
-            options = [html.unescape(o) for o in item['incorrect_answers']]
+            # ИЗМЕНЕНО: Используем BeautifulSoup для очистки HTML-сущностей
+            question_text = BeautifulSoup(item['question'], "html.parser").text
+            correct_answer = BeautifulSoup(item['correct_answer'], "html.parser").text
+            options = [BeautifulSoup(o, "html.parser").text for o in item['incorrect_answers']]
             options.append(correct_answer)
             random.shuffle(options)
             correct_index = options.index(correct_answer)
@@ -582,7 +583,7 @@ def handle_shop(msg):
 
 def handle_buy_boost(msg):
     user_id = msg.from_user.id
-    if user_id not in user_rigs: return send_message_with_partner_button(msg.chat.id, "� У вас нет фермы. Начните с <code>/my_rig</code>.")
+    if user_id not in user_rigs: return send_message_with_partner_button(msg.chat.id, "🤔 У вас нет фермы. Начните с <code>/my_rig</code>.")
     
     rig = user_rigs[user_id]
     if rig.get('boost_active_until') and datetime.now() < rig['boost_active_until']:
