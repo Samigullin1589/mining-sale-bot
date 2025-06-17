@@ -20,19 +20,12 @@ import matplotlib.pyplot as plt
 import io
 import re
 import random
-# НОВАЯ БИБЛИОТЕКА ДЛЯ РАБОТЫ С BINANCE API
-from binance.client import Client
-from binance.exceptions import BinanceAPIException
 
 # --- Ключи и Настройки (Загрузка из переменных окружения) ---
 BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 NEWSAPI_KEY = os.environ.get("CRYPTO_API_KEY") # CryptoPanic API Key
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-
-# ДОБАВЛЕНЫ КЛЮЧИ BINANCE
-BINANCE_API_KEY = os.environ.get("BINANCE_API_KEY")
-BINANCE_SECRET_KEY = os.environ.get("BINANCE_SECRET_KEY")
 
 NEWS_CHAT_ID = os.environ.get("NEWS_CHAT_ID") # Канал для новостей
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID") # ID админа для отчетов
@@ -55,15 +48,6 @@ if not BOT_TOKEN:
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 app = Flask(__name__)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
-
-# Инициализация клиента Binance, если ключи предоставлены
-binance_client = None
-if BINANCE_API_KEY and BINANCE_SECRET_KEY:
-    try:
-        binance_client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY)
-    except Exception as e:
-        print(f"Не удалось инициализировать клиент Binance: {e}")
-
 
 pending_weather_requests = {}
 asic_cache = {"data": [], "timestamp": None}
@@ -100,80 +84,38 @@ def log_to_sheet(row_data: list):
     except Exception as e:
         print(f"Ошибка записи в Google Sheets: {e}")
 
-def get_crypto_price(symbol="BTC-USDT"):
+def get_crypto_price(coin_id="bitcoin", vs_currency="usd"):
     """
-    УЛУЧШЕННАЯ ФУНКЦИЯ: Получает цену с Binance, при ошибке переключается на KuCoin.
+    ТРОЙНОЕ РЕЗЕРВИРОВАНИЕ: Получает цену с Binance, при ошибке -> KuCoin, при ошибке -> CoinGecko.
     Возвращает кортеж (цена, источник).
     """
-    # Попытка 1: Binance
+    # Попытка 1: Binance (публичный API)
     try:
-        binance_symbol = symbol.replace('-', '')
-        res = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={binance_symbol.upper()}", timeout=5).json()
+        symbol = "BTCUSDT" # Binance использует такой формат для BTC
+        res = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}", timeout=5).json()
         if 'price' in res:
             return (float(res['price']), "Binance")
     except Exception as e:
-        print(f"Ошибка API Binance: {e}. Пробую запасной вариант.")
+        print(f"Ошибка API Binance: {e}. Пробую KuCoin.")
 
-    # Попытка 2: KuCoin (запасной вариант)
+    # Попытка 2: KuCoin (публичный API)
     try:
-        res = requests.get(f"https://api.kucoin.com/api/v1/market/orderbook/level1?symbol={symbol.upper()}", timeout=5).json()
+        symbol = "BTC-USDT" # KuCoin использует такой формат
+        res = requests.get(f"https://api.kucoin.com/api/v1/market/orderbook/level1?symbol={symbol}", timeout=5).json()
         if res.get('data') and res['data'].get('price'):
             return (float(res['data']['price']), "KuCoin")
     except Exception as e:
-        print(f"Ошибка API KuCoin: {e}.")
+        print(f"Ошибка API KuCoin: {e}. Пробую CoinGecko.")
+
+    # Попытка 3: CoinGecko (самый надежный публичный API)
+    try:
+        res = requests.get(f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies={vs_currency}", timeout=5).json()
+        if coin_id in res and vs_currency in res[coin_id]:
+            return (float(res[coin_id][vs_currency]), "CoinGecko")
+    except Exception as e:
+        print(f"Ошибка API CoinGecko: {e}.")
     
     return (None, None)
-
-def get_binance_balance():
-    """НОВАЯ ФУНКЦИЯ: Получает баланс аккаунта Binance, используя API ключи."""
-    if not binance_client:
-        return "Клиент Binance не настроен. Проверьте переменные окружения BINANCE_API_KEY и BINANCE_SECRET_KEY."
-
-    try:
-        # Получаем информацию об аккаунте
-        account_info = binance_client.get_account()
-        balances = account_info.get('balances', [])
-        
-        # Фильтруем активы, у которых есть баланс
-        non_zero_balances = [b for b in balances if float(b['free']) > 0 or float(b['locked']) > 0]
-        
-        if not non_zero_balances:
-            return "На вашем спотовом аккаунте нет активов с ненулевым балансом."
-
-        # Получаем текущие цены для всех пар к USDT
-        prices = {p['symbol']: float(p['price']) for p in binance_client.get_all_tickers() if 'USDT' in p['symbol']}
-        
-        # Рассчитываем стоимость каждого актива в USD
-        usd_values = []
-        for asset in non_zero_balances:
-            total_balance = float(asset['free']) + float(asset['locked'])
-            asset_name = asset['asset']
-            
-            if asset_name == 'USDT':
-                usd_value = total_balance
-            else:
-                price = prices.get(f"{asset_name}USDT", 0)
-                usd_value = total_balance * price
-            
-            if usd_value > 1: # Показываем только активы стоимостью > $1
-                usd_values.append({'asset': asset_name, 'total_balance': total_balance, 'usd_value': usd_value})
-
-        # Сортируем по стоимости в USD и берем топ-5
-        top_assets = sorted(usd_values, key=lambda x: x['usd_value'], reverse=True)[:5]
-        
-        total_usd_value = sum(item['usd_value'] for item in usd_values)
-
-        response_lines = [f"💎 **Общий баланс: ~${total_usd_value:,.2f}**\n\nТоп-5 активов:"]
-        for asset in top_assets:
-            response_lines.append(
-                f"• **{asset['asset']}**: {asset['total_balance']:.6f} (~${asset['usd_value']:,.2f})"
-            )
-        return "\n".join(response_lines)
-
-    except BinanceAPIException as e:
-        return f"❌ Ошибка API Binance: {e.message}. Проверьте правильность ключей и их разрешения."
-    except Exception as e:
-        return f"❌ Произошла непредвиденная ошибка: {e}"
 
 def get_weather(city: str):
     """Получает погоду с wttr.in."""
@@ -236,6 +178,16 @@ def get_crypto_news(keywords: list = None):
 # 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И УТИЛИТЫ
 # ========================================================================================
 
+def get_main_keyboard():
+    """Создает основную клавиатуру с кнопками."""
+    markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+    btn1 = types.KeyboardButton("💹 Курс BTC")
+    btn2 = types.KeyboardButton("⚙️ Топ-5 ASIC")
+    btn3 = types.KeyboardButton("📰 Новости")
+    btn4 = types.KeyboardButton("🌦️ Погода")
+    markup.add(btn1, btn2, btn3, btn4)
+    return markup
+
 def parse_currency_pair(text: str):
     """Извлекает пару валют из текста вроде 'курс доллара к рублю'."""
     match = re.search(r'(\w+|\$|€|₽)\s+к\s+(\w+|\$|€|₽)', text.lower())
@@ -255,13 +207,26 @@ def get_random_partner_button():
 # 4. ЗАДАЧИ, ВЫПОЛНЯЕМЫЕ ПО РАСПИСАНИЮ (SCHEDULE)
 # ========================================================================================
 
+def keep_alive():
+    """НОВАЯ ФУНКЦИЯ: Отправляет запрос самому себе, чтобы приложение не "засыпало" на хостинге."""
+    if WEBHOOK_URL:
+        try:
+            # Получаем базовый URL (без /webhook)
+            base_url = WEBHOOK_URL.rsplit('/', 1)[0]
+            requests.get(base_url)
+            print(f"[{datetime.now()}] Keep-alive пинг отправлен на {base_url}")
+        except Exception as e:
+            print(f"Ошибка keep-alive пинга: {e}")
+
 def auto_send_news():
     """Задача для отправки новостей в канал."""
     if not NEWS_CHAT_ID: return
     try:
         news = get_crypto_news()
         bot.send_message(NEWS_CHAT_ID, news, reply_markup=get_random_partner_button(), parse_mode="Markdown", disable_web_page_preview=True)
+        print(f"[{datetime.now()}] Новости успешно отправлены в чат {NEWS_CHAT_ID}")
     except Exception as e:
+        print(f"[{datetime.now()}] Ошибка при авторассылке новостей: {e}")
         if ADMIN_CHAT_ID: bot.send_message(ADMIN_CHAT_ID, f"⚠️ Не удалось выполнить авторассылку новостей:\n{e}")
 
 def auto_check_status():
@@ -282,24 +247,18 @@ def auto_check_status():
 # 5. ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ TELEGRAM
 # ========================================================================================
 
-@bot.message_handler(commands=['start'])
-def handle_start(msg):
-    bot.send_message(msg.chat.id, "👋 Привет! Я ваш помощник в мире криптовалют и майнинга. Задайте вопрос или используйте команду `/help`.")
-
-@bot.message_handler(commands=['help'])
-def handle_help(msg):
+@bot.message_handler(commands=['start', 'help'])
+def handle_start_help(msg):
+    """Единый обработчик для /start и /help, который показывает клавиатуру."""
     help_text = (
-        "**Доступные команды:**\n"
-        "`/price [ПАРА]` - узнать курс криптовалюты (например, `/price ETH-USDT`). По умолчанию - BTC.\n"
-        "`/balance` - проверить баланс (только в приватном чате со мной).\n"
-        "`/chart` - построить график доходности из Google Sheets.\n"
-        "\n**Просто напишите мне:**\n"
-        "- `курс btc` - узнать курс биткоина с комментарием.\n"
-        "- `курс доллара к рублю` - конвертер валют.\n"
-        "- `новости` или `новости BTC` - получить свежие крипто-новости.\n"
-        "- `погода` - узнать погоду."
+        "👋 Привет! Я ваш помощник в мире криптовалют и майнинга.\n\n"
+        "Используйте кнопки ниже или отправьте мне команду.\n\n"
+        "**Основные команды:**\n"
+        "`/price [ПАРА]` - узнать курс (по умолчанию - BTC).\n"
+        "`/chart` - построить график доходности из Google Sheets."
     )
-    bot.send_message(msg.chat.id, help_text, parse_mode="Markdown")
+    bot.send_message(msg.chat.id, help_text, parse_mode="Markdown", reply_markup=get_main_keyboard())
+
 
 @bot.message_handler(commands=['price'])
 def handle_price(msg):
@@ -307,24 +266,14 @@ def handle_price(msg):
         pair_text = msg.text.split()[1].upper()
     except IndexError:
         pair_text = "BTC-USDT"
-    price, source = get_crypto_price(pair_text)
+    
+    coin_id = pair_text.split('-')[0].lower()
+    
+    price, source = get_crypto_price(coin_id, "usd")
     if price:
         bot.send_message(msg.chat.id, f"💹 Курс {pair_text.replace('-', '/')}: ${price:,.2f} (данные от {source})")
     else:
         bot.send_message(msg.chat.id, f"❌ Не удалось получить курс для {pair_text} ни с одного источника.")
-
-@bot.message_handler(commands=['balance'])
-def handle_balance(msg):
-    """
-    ИСПРАВЛЕННЫЙ ОБРАБОТЧИК: для получения баланса с проверкой на приватность.
-    """
-    if msg.chat.type != 'private':
-        bot.reply_to(msg, "🔒 В целях безопасности, команда `/balance` работает только в личном чате со мной. Пожалуйста, напишите мне напрямую.")
-        return
-
-    bot.send_message(msg.chat.id, "⏳ Получаю данные о балансе... Это может занять несколько секунд.")
-    balance_report = get_binance_balance()
-    bot.send_message(msg.chat.id, balance_report, parse_mode="Markdown")
 
 @bot.message_handler(commands=['chart'])
 def handle_chart(msg):
@@ -356,18 +305,20 @@ def handle_chart(msg):
     except Exception as e:
         bot.send_message(msg.chat.id, f"❌ Не удалось построить график: {e}")
 
-@bot.message_handler(func=lambda msg: True)
-def handle_all_messages(msg):
+@bot.message_handler(content_types=['text'])
+def handle_all_text_messages(msg):
     user_id = msg.from_user.id
     text_lower = msg.text.lower()
 
     if pending_weather_requests.get(user_id):
-        del pending_weather_requests[user_id]; bot.send_message(msg.chat.id, get_weather(msg.text)); return
-    if "погода" in text_lower:
-        pending_weather_requests[user_id] = True; bot.send_message(msg.chat.id, "🌦 В каком городе показать погоду?"); return
+        del pending_weather_requests[user_id]
+        bot.send_message(msg.chat.id, get_weather(msg.text), reply_markup=get_main_keyboard())
+        return
 
-    if 'курс' in text_lower and ('btc' in text_lower or 'биткоин' in text_lower or 'втс' in text_lower):
-        price, source = get_crypto_price("BTC-USDT")
+    # --- Обработка кнопок клавиатуры и текстовых команд ---
+    
+    if 'курс btc' in text_lower or 'курс' in text_lower and ('биткоин' in text_lower or 'втс' in text_lower):
+        price, source = get_crypto_price("bitcoin", "usd")
         if price:
             comment = ask_gpt(f"Курс BTC ${price:,.2f}. Дай краткий, дерзкий комментарий (1 предложение) о рынке.", "gpt-3.5-turbo")
             bot.send_message(msg.chat.id, f"💰 **Курс BTC: ${price:,.2f}** (данные от {source})\n\n*{comment}*", parse_mode="Markdown")
@@ -375,27 +326,36 @@ def handle_all_messages(msg):
             bot.send_message(msg.chat.id, "❌ Не удалось получить курс BTC ни с одного источника.")
         return
 
-    currency_pair = parse_currency_pair(text_lower)
-    if currency_pair:
-        bot.send_message(msg.chat.id, get_currency_rate(*currency_pair)); return
-
-    if "новости" in text_lower:
+    if 'топ-5 asic' in text_lower:
+        models_info = "\n".join(get_top_asics())
+        bot.send_message(msg.chat.id, f"**Топ-5 самых доходных ASIC на сегодня:**\n{models_info}", parse_mode="Markdown")
+        return
+        
+    if 'новости' in text_lower:
         keywords = [word.upper() for word in text_lower.split() if word.upper() in ['BTC', 'ETH', 'SOL', 'MINING']]
         news = get_crypto_news(keywords or None)
-        bot.send_message(msg.chat.id, news, parse_mode="Markdown", disable_web_page_preview=True); return
+        bot.send_message(msg.chat.id, news, parse_mode="Markdown", disable_web_page_preview=True)
+        return
+
+    if 'погода' in text_lower:
+        pending_weather_requests[user_id] = True
+        bot.send_message(msg.chat.id, "🌦 В каком городе показать погоду?", reply_markup=types.ReplyKeyboardRemove())
+        return
+
+    currency_pair = parse_currency_pair(text_lower)
+    if currency_pair:
+        bot.send_message(msg.chat.id, get_currency_rate(*currency_pair))
+        return
 
     if any(x in text_lower for x in ["продам", "в наличии", "предзаказ", "$"]):
         log_to_sheet([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg.from_user.username or msg.from_user.first_name, msg.text])
         analysis = ask_gpt(f"Это прайс на майнинг-оборудование. Проанализируй как трейдер: выгодные предложения, актуальность цен, подозрительно дешевые позиции. Ответь кратко, без формальностей.\n\nТекст:\n{msg.text}")
-        bot.send_message(msg.chat.id, analysis); return
-
-    if any(k in text_lower for k in ["asic", "асик", "модель", "розетка", "доходность"]):
-        models_info = "\n".join(get_top_asics())
-        prompt = f"Ты — консультант по майнингу. Вот свежие данные о топ-5 ASIC:\n{models_info}\n\nИспользуй только эти данные. Ответь на вопрос кратко и по делу.\nВопрос: {msg.text}"
-    else:
-        prompt = msg.text
+        bot.send_message(msg.chat.id, analysis)
+        return
+    
+    # --- Если ничего не подошло, отправляем в GPT ---
     try:
-        answer = ask_gpt(prompt)
+        answer = ask_gpt(msg.text)
         bot.send_message(msg.chat.id, answer, reply_markup=get_random_partner_button(), parse_mode="Markdown")
     except Exception as e:
         bot.send_message(msg.chat.id, f"❌ Произошла ошибка при обработке запроса: {e}")
@@ -416,11 +376,19 @@ def index():
     return "Bot is running!", 200
 
 def run_scheduler():
-    get_top_asics()
-    auto_check_status()
+    """Бесконечный цикл для выполнения задач по расписанию."""
+    # ДОБАВЛЕНА задача для "прогрева"
+    schedule.every(25).minutes.do(keep_alive)
+    
     schedule.every(3).hours.do(auto_send_news)
     schedule.every(3).hours.do(auto_check_status)
     schedule.every(1).hours.do(get_top_asics)
+
+    # Первоначальный запуск, чтобы не ждать
+    get_top_asics()
+    auto_check_status()
+    keep_alive()
+
     while True:
         schedule.run_pending()
         time.sleep(1)
