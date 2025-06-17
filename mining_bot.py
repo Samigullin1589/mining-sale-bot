@@ -65,6 +65,16 @@ pending_weather_requests = {}
 pending_calculator_requests = {}
 asic_cache = {"data": [], "timestamp": None}
 
+# Список подсказок для вовлечения
+BOT_HINTS = [
+    "💡 Попробуйте команду `/price`",
+    "⚙️ Нажмите на кнопку 'Топ-5 ASIC'",
+    "🌦️ Узнайте погоду, просто написав 'погода'",
+    "⛏️ Рассчитайте прибыль с помощью 'Калькулятора'",
+    "📰 Хотите новости? Просто напишите 'новости'",
+    "⛽️ Узнайте цену на газ командой `/gas`"
+]
+
 # Словарь для универсального парсера валют
 CURRENCY_MAP = {
     'доллар': 'USD', 'usd': 'USD', '$': 'USD',
@@ -177,7 +187,6 @@ def get_currency_rate(base="USD", to="RUB"):
 
     # 2. Резервная попытка с Exchangeratesapi.io
     try:
-        # У этого API другой формат ответа
         res = requests.get(f"https://api.exchangerate-api.com/v4/latest/{base.upper()}", timeout=5).json()
         if res.get('rates') and res['rates'].get(to.upper()):
             rate = res['rates'][to.upper()]
@@ -205,12 +214,17 @@ def ask_gpt(prompt: str, model: str = "gpt-4o"):
         return f"[❌ Ошибка GPT: Не удалось получить ответ. Попробуйте позже.]"
 
 def get_top_asics(force_update: bool = False):
-    """Получает топ-5 ASIC с asicminervalue.com, использует кэш."""
+    """
+    ИЗМЕНЕНО: Получает топ-5 ASIC с asicminervalue.com и возвращает СТРУКТУРИРОВАННЫЕ ДАННЫЕ.
+    """
     global asic_cache
-    cache_is_valid = asic_cache["data"] and asic_cache["timestamp"] and (datetime.now() - asic_cache["timestamp"] < timedelta(hours=1))
+    cache_is_valid = asic_cache.get("data") and asic_cache.get("timestamp") and \
+                     (datetime.now() - asic_cache["timestamp"] < timedelta(hours=1))
+
     if cache_is_valid and not force_update:
         logging.info("Используется кэш ASIC.")
         return asic_cache["data"]
+
     try:
         logging.info("Обновление данных по ASIC с сайта...")
         r = requests.get("https://www.asicminervalue.com/miners/sha-256", timeout=15)
@@ -224,11 +238,30 @@ def get_top_asics(force_update: bool = False):
         for row in table_rows[:5]:
             cols = row.find_all("td")
             if len(cols) > 3:
-                name = cols[0].get_text(strip=True)
-                th = cols[1].get_text(strip=True)
-                power = cols[2].get_text(strip=True)
-                profit = cols[3].get_text(strip=True)
-                updated_asics.append(f"• {name}: {th}, {power}, доход ~{profit}/день")
+                try:
+                    name = cols[0].get_text(strip=True)
+                    hashrate = cols[1].get_text(strip=True)
+                    power_text = cols[2].get_text(strip=True)
+                    revenue_text = cols[3].get_text(strip=True)
+
+                    revenue_match = re.search(r'([\d\.]+)', revenue_text)
+                    revenue = float(revenue_match.group(1)) if revenue_match else 0.0
+
+                    power_match = re.search(r'(\d+)', power_text)
+                    power = float(power_match.group(1)) if power_match else 0.0
+
+                    if name and power > 0 and revenue > 0:
+                        updated_asics.append({
+                            "name": name,
+                            "hashrate": hashrate,
+                            "power_watts": power,
+                            "power_str": power_text,
+                            "daily_revenue": revenue,
+                            "revenue_str": revenue_text,
+                        })
+                except (ValueError, IndexError, AttributeError) as e:
+                    logging.warning(f"Не удалось распарсить строку ASIC: {row.get_text(strip=True)} | Ошибка: {e}")
+                    continue
 
         if not updated_asics:
              return ["[❌ Структура таблицы на сайте изменилась, не удалось извлечь данные.]"]
@@ -239,6 +272,7 @@ def get_top_asics(force_update: bool = False):
     except Exception as e:
         logging.error(f"Ошибка обновления данных по ASIC: {e}")
         return [f"[❌ Ошибка при обновлении списка ASIC: {e}]"]
+
 
 def get_crypto_news(keywords: list = None):
     """Получает 3 последние новости с CryptoPanic."""
@@ -292,11 +326,17 @@ def get_random_partner_button():
     return markup
 
 def send_message_with_partner_button(chat_id, text, **kwargs):
-    """Обертка для отправки сообщения с прикрепленной партнерской кнопкой."""
+    """
+    Обертка для отправки сообщения с прикрепленной партнерской кнопкой
+    и добавлением случайной подсказки.
+    """
     try:
+        hint = random.choice(BOT_HINTS)
+        full_text = f"{text}\n\n---\n_{hint}_"
+
         kwargs.setdefault('parse_mode', 'Markdown')
         kwargs.setdefault('reply_markup', get_random_partner_button())
-        bot.send_message(chat_id, text, **kwargs)
+        bot.send_message(chat_id, full_text, **kwargs)
     except Exception as e:
         logging.error(f"Не удалось отправить сообщение в чат {chat_id}: {e}")
 
@@ -318,45 +358,51 @@ def get_usd_to_rub_rate():
     except Exception as e:
         logging.error(f"Резервный API курсов для калькулятора тоже не ответил: {e}")
 
-    return None # Возвращаем None, если оба API не сработали
+    return None
 
 def calculate_and_format_profit(electricity_cost_rub: float):
-    """Расчет и форматирование доходности ASIC с конвертацией из рублей."""
+    """
+    ИЗМЕНЕНО: Расчет и форматирование доходности ASIC, используя СТРУКТУРИРОВАННЫЕ ДАННЫЕ.
+    """
     usd_to_rub_rate = get_usd_to_rub_rate()
     if usd_to_rub_rate is None:
         return "Не удалось получить курс доллара для расчета ни с одного из источников. Попробуйте позже."
 
     electricity_cost_usd = electricity_cost_rub / usd_to_rub_rate
     asics_data = get_top_asics()
-    if not asics_data or "Ошибка" in asics_data[0]:
-        return "Не удалось получить данные по ASIC для расчета. Попробуйте позже."
+
+    # Проверяем, что данные получены корректно (не строка с ошибкой)
+    if not asics_data or isinstance(asics_data[0], str):
+        error_message = asics_data[0] if asics_data else "Не удалось получить данные по ASIC для расчета."
+        return error_message
 
     result = [f"💰 **Расчет чистой прибыли при цене розетки {electricity_cost_rub:.2f} ₽/кВтч (~${electricity_cost_usd:.3f}/кВтч)**\n"]
-    for asic_string in asics_data:
+    successful_calcs = 0
+    for asic in asics_data:
         try:
-            match = re.search(r"•\s*(.*?):\s*.*?(\d+W).*?\$([\d\.]+)", asic_string)
-            if not match:
-                continue
-
-            name, power_str, revenue_str = match.groups()
-            power_watts = float(power_str.replace('W', ''))
-            daily_revenue = float(revenue_str)
+            power_watts = asic['power_watts']
+            daily_revenue = asic['daily_revenue']
 
             daily_power_kwh = (power_watts / 1000) * 24
             daily_electricity_cost = daily_power_kwh * electricity_cost_usd
             net_profit = daily_revenue - daily_electricity_cost
 
             result.append(
-                f"**{name.strip()}**\n"
+                f"**{asic['name']}**\n"
                 f"  - Доход: `${daily_revenue:.2f}`\n"
                 f"  - Расход: `${daily_electricity_cost:.2f}`\n"
                 f"  - **Чистая прибыль: `${net_profit:.2f}`/день**"
             )
-        except (ValueError, TypeError, IndexError) as e:
-            logging.warning(f"Ошибка парсинга ASIC для калькулятора '{asic_string}': {e}")
+            successful_calcs += 1
+        except (KeyError, ValueError, TypeError) as e:
+            logging.warning(f"Ошибка расчета для ASIC '{asic.get('name', 'N/A')}': {e}")
             continue
 
-    return "\n".join(result) if len(result) > 1 else "Не удалось рассчитать прибыль ни для одного ASIC."
+    if successful_calcs == 0:
+        return "Не удалось рассчитать прибыль ни для одного ASIC. Возможно, изменился формат данных на сайте-источнике."
+    
+    return "\n".join(result)
+
 
 # ========================================================================================
 # 4. ЗАДАЧИ, ВЫПОЛНЯЕМЫЕ ПО РАСПИСАНИЮ (SCHEDULE)
@@ -378,7 +424,7 @@ def auto_send_news():
     try:
         logging.info("Запуск авторассылки новостей...")
         news = get_crypto_news()
-        send_message_with_partner_button(NEWS_CHAT_ID, news, disable_web_page_preview=True)
+        bot.send_message(NEWS_CHAT_ID, news, disable_web_page_preview=True, parse_mode='Markdown', reply_markup=get_random_partner_button())
         logging.info(f"Новости успешно отправлены в чат {NEWS_CHAT_ID}")
     except Exception as e:
         logging.error(f"Ошибка при авторассылке новостей: {e}")
@@ -542,7 +588,17 @@ def handle_all_text_messages(msg):
 
     if text_lower in ["⚙️ топ-5 asic", "/asics"]:
         bot.send_message(msg.chat.id, "⏳ Загружаю актуальный список...")
-        send_message_with_partner_button(msg.chat.id, f"**Топ-5 самых доходных ASIC на сегодня:**\n" + "\n".join(get_top_asics()))
+        asics_data = get_top_asics()
+        if not asics_data or isinstance(asics_data[0], str):
+            error_message = asics_data[0] if asics_data else "Не удалось получить данные."
+            bot.send_message(msg.chat.id, error_message)
+            return
+
+        formatted_list = []
+        for asic in asics_data:
+            formatted_list.append(f"• {asic['name']}: {asic['hashrate']}, {asic['power_str']}, доход ~{asic['revenue_str']}/день")
+        response_text = "**Топ-5 самых доходных ASIC на сегодня:**\n" + "\n".join(formatted_list)
+        send_message_with_partner_button(msg.chat.id, response_text)
         return
 
     if text_lower in ["📰 новости", "/news"]:
@@ -569,7 +625,12 @@ def handle_all_text_messages(msg):
     item_words = ["asic", "асик", "whatsminer", "antminer", "карта", "ферма"]
     if any(word in text_lower for word in sale_words) and any(word in text_lower for word in item_words):
         log_to_sheet([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg.from_user.username or msg.from_user.first_name, msg.text])
-        analysis = ask_gpt(f"Это объявление или прайс на майнинг-оборудование. Проанализируй его как опытный трейдер или поставщик. Укажи на сильные и слабые стороны, дай краткий совет. Ответь неформально.\n\nТекст:\n{msg.text}")
+        prompt = (f"Пользователь прислал прайс-лист или объявление о продаже майнинг-оборудования в наш чат. "
+                  f"Выступи в роли эксперта в этом чате. Кратко и неформально прокомментируй предложение "
+                  f"(например, 'цены выглядят интересно' или 'хороший выбор для новичков'). "
+                  f"НЕ ПРЕДЛАГАЙ размещать объявление на других площадках (Avito, Юла и т.д.). "
+                  f"Твоя задача - поддержать диалог в ЭТОМ чате.\n\nТекст объявления:\n{msg.text}")
+        analysis = ask_gpt(prompt)
         send_message_with_partner_button(msg.chat.id, analysis)
         return
 
