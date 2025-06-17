@@ -44,7 +44,7 @@ SHEET_NAME = os.getenv("SHEET_NAME", "Лист1")
 # --- Настройки Партнерской Ссылки ---
 PARTNER_URL = "https://app.leadteh.ru/w/dTeKr"
 PARTNER_BUTTON_TEXT_OPTIONS = [
-    "🎁 Узнать спеццены", "🔥 Эксклюзивное предложение",
+    "� Узнать спеццены", "🔥 Эксклюзивное предложение",
     "💡 Получить консультацию", "💎 Прайс от экспертов"
 ]
 
@@ -168,7 +168,7 @@ def get_weather(city: str):
         return (f"🌍 {city.title()}\n"
                 f"🌡 Температура: {current['temp_C']}°C (Ощущается как {current['FeelsLikeC']}°C)\n"
                 f"☁️ Погода: {current['lang_ru'][0]['value']}\n"
-                f"� Влажность: {current['humidity']}%\n"
+                f"💧 Влажность: {current['humidity']}%\n"
                 f"💨 Ветер: {current['windspeedKmph']} км/ч")
     except Exception as e:
         logging.error(f"Ошибка получения погоды для '{city}': {e}")
@@ -213,11 +213,100 @@ def ask_gpt(prompt: str, model: str = "gpt-4o"):
         logging.error(f"Ошибка вызова OpenAI API: {e}")
         return f"[❌ Ошибка GPT: Не удалось получить ответ. Попробуйте позже.]"
 
+def _parse_asicminervalue():
+    """Парсер для asicminervalue.com."""
+    logging.info("Попытка парсинга asicminervalue.com")
+    r = requests.get("https://www.asicminervalue.com/miners/sha-256", timeout=15)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    table_rows = soup.select("table tbody tr")
+    if not table_rows:
+        raise ValueError("Таблица ASIC не найдена на asicminervalue.com")
+
+    parsed_asics = []
+    for row in table_rows[:5]:
+        cols = row.find_all("td")
+        if not cols: continue
+
+        asic_data = {}
+        asic_data['name'] = cols[0].get_text(strip=True)
+
+        for col in cols:
+            text = col.get_text(strip=True)
+            if 'h/s' in text.lower() and 'hashrate' not in asic_data:
+                asic_data['hashrate'] = text
+            elif 'W' in text and 'Wh' not in text and 'power_str' not in asic_data:
+                power_match = re.search(r'(\d+)', text)
+                if power_match:
+                    asic_data['power_watts'] = float(power_match.group(1))
+                    asic_data['power_str'] = text
+            elif '$' in text and 'revenue_str' not in asic_data:
+                revenue_match = re.search(r'([\d\.]+)', text)
+                if revenue_match:
+                    asic_data['daily_revenue'] = float(revenue_match.group(1))
+                    asic_data['revenue_str'] = text
+        
+        if all(k in asic_data for k in ['name', 'hashrate', 'power_watts', 'daily_revenue', 'power_str', 'revenue_str']):
+            parsed_asics.append(asic_data)
+        else:
+            logging.warning(f"AsicMinerValue: Не удалось найти все данные для ASIC: {row.get_text(strip=True)}")
+
+    if not parsed_asics:
+        raise ValueError("Не удалось извлечь данные ни одного ASIC с asicminervalue.com")
+    
+    logging.info(f"Успешно получено {len(parsed_asics)} ASIC с asicminervalue.com")
+    return parsed_asics
+
+def _parse_whattomine():
+    """Резервный парсер для whattomine.com."""
+    logging.info("Попытка парсинга whattomine.com")
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    r = requests.get("https://whattomine.com/asics", headers=headers, timeout=15)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    asic_divs = soup.find_all('div', class_='asic')
+
+    if not asic_divs:
+        raise ValueError("Контейнеры ASIC не найдены на whattomine.com")
+
+    parsed_asics = []
+    for div in asic_divs:
+        if div.find('h5') and 'sha-256' in div.find('h5').text.lower():
+            try:
+                name = div.find('a').strong.text.strip()
+                hashrate = div.find('td', text='Hashrate').find_next_sibling('td').text.strip()
+                power_text = div.find('td', text='Power').find_next_sibling('td').text.strip()
+                revenue_text = div.find('td', text=re.compile(r"Revenue\s*24h")).find_next_sibling('td').strong.text.strip()
+                
+                power_watts_match = re.search(r'(\d+)', power_text)
+                power_watts = float(power_watts_match.group(1)) if power_watts_match else 0
+                
+                revenue_match = re.search(r'([\d\.]+)', revenue_text)
+                revenue = float(revenue_match.group(1)) if revenue_match else 0
+                
+                if all([name, hashrate, power_watts > 0, revenue > 0]):
+                    parsed_asics.append({
+                        "name": name,
+                        "hashrate": hashrate,
+                        "power_watts": power_watts,
+                        "power_str": power_text,
+                        "daily_revenue": revenue,
+                        "revenue_str": f"${revenue:.2f}",
+                    })
+            except (AttributeError, ValueError, IndexError) as e:
+                logging.warning(f"WhatToMine: Не удалось распарсить div: {div.get_text(strip=True)} | Ошибка: {e}")
+                continue
+    
+    if not parsed_asics:
+        raise ValueError("Не удалось извлечь данные ни одного SHA-256 ASIC с whattomine.com")
+
+    parsed_asics.sort(key=lambda x: x['daily_revenue'], reverse=True)
+    logging.info(f"Успешно получено {len(parsed_asics)} ASIC с whattomine.com")
+    return parsed_asics[:5]
+
+
 def get_top_asics(force_update: bool = False):
-    """
-    ИЗМЕНЕНО: Получает топ-5 ASIC с asicminervalue.com и возвращает СТРУКТУРИРОВАННЫЕ ДАННЫЕ.
-    Использует умный парсинг по паттернам, а не по порядку колонок.
-    """
+    """Получает топ-5 ASIC с двух источников с резервированием."""
     global asic_cache
     cache_is_valid = asic_cache.get("data") and asic_cache.get("timestamp") and \
                      (datetime.now() - asic_cache["timestamp"] < timedelta(hours=1))
@@ -227,58 +316,25 @@ def get_top_asics(force_update: bool = False):
         return asic_cache["data"]
 
     try:
-        logging.info("Обновление данных по ASIC с сайта...")
-        r = requests.get("https://www.asicminervalue.com/miners/sha-256", timeout=15)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        table_rows = soup.select("table tbody tr")
-        if not table_rows:
-            return ["[❌ Не удалось найти таблицу с асиками на странице.]"]
-
-        updated_asics = []
-        for row in table_rows[:5]:
-            cols = row.find_all("td")
-            if not cols: continue
-
-            asic_data = {}
-            # Первая колонка почти всегда имя
-            asic_data['name'] = cols[0].get_text(strip=True)
-
-            # Ищем остальные данные по паттернам в каждой колонке
-            for col in cols:
-                text = col.get_text(strip=True)
-                if 'h/s' in text.lower() and 'hashrate' not in asic_data:
-                    asic_data['hashrate'] = text
-                elif 'W' in text and not 'Wh' in text and 'power_str' not in asic_data:
-                    power_match = re.search(r'(\d+)', text)
-                    if power_match:
-                        asic_data['power_watts'] = float(power_match.group(1))
-                        asic_data['power_str'] = text
-                elif '$' in text and 'revenue_str' not in asic_data:
-                    revenue_match = re.search(r'([\d\.]+)', text)
-                    if revenue_match:
-                        asic_data['daily_revenue'] = float(revenue_match.group(1))
-                        asic_data['revenue_str'] = text
-            
-            # Проверяем, что все нужные данные найдены
-            if all(k in asic_data for k in ['name', 'hashrate', 'power_watts', 'daily_revenue', 'power_str', 'revenue_str']):
-                updated_asics.append(asic_data)
-            else:
-                logging.warning(f"Не удалось найти все данные для ASIC: {row.get_text(strip=True)}. Найдено: {asic_data}")
-
-        if not updated_asics:
-             return ["[❌ Структура таблицы на сайте изменилась, не удалось извлечь данные.]"]
-
-        asic_cache = {"data": updated_asics, "timestamp": datetime.now()}
-        logging.info("Данные по ASIC успешно обновлены.")
-        return updated_asics
+        asics = _parse_asicminervalue()
+        asic_cache = {"data": asics, "timestamp": datetime.now()}
+        return asics
     except Exception as e:
-        logging.error(f"Ошибка обновления данных по ASIC: {e}")
-        return [f"[❌ Ошибка при обновлении списка ASIC: {e}]"]
+        logging.warning(f"Не удалось получить данные с основного источника (asicminervalue): {e}")
+        try:
+            asics = _parse_whattomine()
+            asic_cache = {"data": asics, "timestamp": datetime.now()}
+            return asics
+        except Exception as e2:
+            logging.error(f"Не удалось получить данные и с резервного источника (whattomine): {e2}")
+            return ["[❌ Не удалось обновить список ASIC ни с одного из источников. Попробуйте позже.]"]
 
 
 def get_crypto_news(keywords: list = None):
-    """Получает 3 последние новости с CryptoPanic."""
+    """
+    ИЗМЕНЕНО: Получает 3 последние новости с CryptoPanic, суммируя их с помощью GPT.
+    Имеет защиту от некорректных ответов GPT.
+    """
     try:
         params = {"auth_token": NEWSAPI_KEY, "public": "true"}
         if keywords:
@@ -286,21 +342,38 @@ def get_crypto_news(keywords: list = None):
         else:
              params["currencies"] = "BTC,ETH"
 
-        r = requests.get("https://cryptopanic.com/api/v1/posts/", params=params, timeout=10).json()
+        r = requests.get(f"https://cryptopanic.com/api/v1/posts/", params=params, timeout=10).json()
         posts = r.get("results", [])[:3]
 
         if not posts:
             return "[🧐 Новостей по вашему запросу не найдено]"
 
+        # УЛУЧШЕНО: Создаем более надежный промпт для GPT
+        titles_for_gpt = "\n".join([f"- {p['title']}" for p in posts])
         prompt_for_gpt = (
-            "Ниже приведены заголовки новостей. Для каждого заголовка сделай краткое саммари на русском (1 предложение). "
-            "Отформатируй ответ так: 'САММАРИ 1\nСАММАРИ 2\nСАММАРИ 3'.\n\n" +
-            "\n".join([f"{i+1}. {p['title']}" for i, p in enumerate(posts)])
+            "Сделай краткое саммари на русском (одно предложение) для каждого из следующих заголовков новостей. "
+            "Верни только саммари, каждое с новой строки. Не добавляй нумерацию или маркеры. "
+            "Количество строк в твоем ответе должно точно совпадать с количеством заголовков.\n\n"
+            f"Заголовки:\n{titles_for_gpt}"
         )
+        
         summaries_text = ask_gpt(prompt_for_gpt, 'gpt-3.5-turbo')
-        summaries = summaries_text.split('\n') if summaries_text and "Ошибка" not in summaries_text else [p['title'] for p in posts]
+        
+        items = []
+        # Проверяем, что GPT не вернул ошибку
+        if summaries_text and "[❌" not in summaries_text:
+            summaries = summaries_text.strip().split('\n')
+            # Итерируемся по постам, чтобы гарантировать правильный порядок и количество
+            for i, post in enumerate(posts):
+                # Если саммари для этого поста есть, используем его. Иначе - используем оригинальный заголовок.
+                summary = summaries[i].strip() if i < len(summaries) else post['title']
+                items.append(f"🔹 {summary}\n[Источник]({post.get('url', '')})")
+        else:
+            # Если GPT вернул ошибку, просто показываем оригинальные заголовки
+            logging.warning("GPT не смог сделать саммари новостей, используются оригинальные заголовки.")
+            for post in posts:
+                items.append(f"🔹 {post['title']}\n[Источник]({post.get('url', '')})")
 
-        items = [f"🔹 {summaries[i].strip()}\n[Источник]({post.get('url', '')})" for i, post in enumerate(posts) if i < len(summaries)]
         return "\n\n".join(items) if items else "[🤷‍♂️ Свежих новостей нет]"
 
     except Exception as e:
