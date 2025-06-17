@@ -44,7 +44,7 @@ SHEET_NAME = os.getenv("SHEET_NAME", "Лист1")
 # --- Настройки Партнерской Ссылки ---
 PARTNER_URL = "https://app.leadteh.ru/w/dTeKr"
 PARTNER_BUTTON_TEXT_OPTIONS = [
-    "� Узнать спеццены", "🔥 Эксклюзивное предложение",
+    "🎁 Узнать спеццены", "🔥 Эксклюзивное предложение",
     "💡 Получить консультацию", "💎 Прайс от экспертов"
 ]
 
@@ -214,7 +214,7 @@ def ask_gpt(prompt: str, model: str = "gpt-4o"):
         return f"[❌ Ошибка GPT: Не удалось получить ответ. Попробуйте позже.]"
 
 def _parse_asicminervalue():
-    """ИСПРАВЛЕНО: Более надежный парсер для asicminervalue.com."""
+    """ИСПРАВЛЕНО: Сверхустойчивый парсер для asicminervalue.com."""
     logging.info("Попытка парсинга asicminervalue.com")
     r = requests.get("https://www.asicminervalue.com/miners/sha-256", timeout=15)
     r.raise_for_status()
@@ -227,15 +227,19 @@ def _parse_asicminervalue():
     for row in table_rows[:5]:
         cols = row.find_all("td")
         if len(cols) < 4: continue
-
-        asic_data = {
-            'name': cols[0].get_text(strip=True),
-            'hashrate': cols[1].get_text(strip=True),
-            'power_str': cols[2].get_text(strip=True),
-            'revenue_str': cols[3].get_text(strip=True),
-        }
-
+        
         try:
+            # Ищем название в ссылке внутри первой колонки
+            name_tag = cols[0].find('a')
+            name = name_tag.get_text(strip=True) if name_tag else cols[0].get_text(strip=True)
+
+            asic_data = {
+                'name': name,
+                'hashrate': cols[1].get_text(strip=True),
+                'power_str': cols[2].get_text(strip=True),
+                'revenue_str': cols[3].get_text(strip=True),
+            }
+            
             power_match = re.search(r'(\d+)', asic_data['power_str'])
             asic_data['power_watts'] = float(power_match.group(1)) if power_match else 0
             
@@ -244,7 +248,8 @@ def _parse_asicminervalue():
             
             if asic_data['power_watts'] > 0 and asic_data['daily_revenue'] > 0:
                 parsed_asics.append(asic_data)
-        except (AttributeError, ValueError, IndexError):
+        except (AttributeError, ValueError, IndexError, TypeError) as e:
+            logging.warning(f"AsicMinerValue: Ошибка парсинга строки. {e}")
             continue
 
     if not parsed_asics:
@@ -254,10 +259,9 @@ def _parse_asicminervalue():
     return parsed_asics
 
 def _parse_whattomine():
-    """ИСПРАВЛЕНО: Более надежный резервный парсер для whattomine.com."""
+    """ИСПРАВЛЕНО: Сверхустойчивый резервный парсер для whattomine.com."""
     logging.info("Попытка парсинга whattomine.com")
     headers = {'User-Agent': 'Mozilla/5.0'}
-    # ИСПРАВЛЕНО: Запрос идет на JSON endpoint, что гораздо надежнее парсинга HTML.
     r = requests.get("https://whattomine.com/asics.json", headers=headers, timeout=15)
     r.raise_for_status()
     data = r.json()
@@ -267,19 +271,18 @@ def _parse_whattomine():
         raise ValueError("Данные ASIC не найдены в JSON от whattomine.com")
 
     sha256_asics = []
+    # Получаем цену BTC один раз для всех расчетов
+    btc_price, _ = get_crypto_price()
+    if not btc_price:
+        raise ValueError("Не удалось получить цену BTC для калькулятора WhatToMine")
+
     for key, asic in asics_data.items():
         if asic.get('algorithm') == 'sha256' and asic.get('profitability_daily'):
             try:
-                # 'profitability_daily' содержит доходность в BTC, нужно конвертировать
-                btc_price, _ = get_crypto_price()
-                if not btc_price:
-                    logging.warning("Не удалось получить цену BTC для калькулятора WhatToMine")
-                    continue
-                
                 daily_revenue = float(asic['profitability_daily']) * btc_price
                 
                 sha256_asics.append({
-                    "name": asic.get('name', 'Unknown ASIC'),
+                    "name": asic.get('name', f"ASIC ID: {key}").replace('_', ' '),
                     "hashrate": f"{asic.get('hashrate', 0) / 1e12:.2f}Th/s",
                     "power_watts": float(asic.get('power', 0)),
                     "power_str": f"{asic.get('power', 0)}W",
@@ -325,7 +328,7 @@ def get_top_asics(force_update: bool = False):
 
 def get_crypto_news(keywords: list = None):
     """
-    ИСПРАВЛЕНО: Получает 3 последние новости с CryptoPanic, суммируя их с помощью GPT
+    Получает 3 последние новости, суммируя их с помощью GPT
     и делая саммари ссылкой на источник.
     """
     try:
@@ -356,12 +359,10 @@ def get_crypto_news(keywords: list = None):
             summaries = summaries_text.strip().split('\n')
             for i, post in enumerate(posts):
                 summary = summaries[i].strip() if i < len(summaries) else post['title']
-                # ИСПРАВЛЕНО: Делаем саммари ссылкой
                 items.append(f"🔹 [{summary}]({post.get('url', '')})")
         else:
             logging.warning("GPT не смог сделать саммари новостей, используются оригинальные заголовки.")
             for post in posts:
-                # ИСПРАВЛЕНО: Делаем заголовок ссылкой
                 items.append(f"🔹 [{post['title']}]({post.get('url', '')})")
 
         return "\n\n".join(items) if items else "[🤷‍♂️ Свежих новостей нет]"
@@ -438,7 +439,6 @@ def calculate_and_format_profit(electricity_cost_rub: float):
     electricity_cost_usd = electricity_cost_rub / usd_to_rub_rate
     asics_data = get_top_asics()
 
-    # Проверяем, что данные получены корректно (не строка с ошибкой)
     if not asics_data or isinstance(asics_data[0], str):
         error_message = asics_data[0] if asics_data else "Не удалось получить данные по ASIC для расчета."
         return error_message
@@ -491,7 +491,6 @@ def auto_send_news():
     try:
         logging.info("Запуск авторассылки новостей...")
         news = get_crypto_news()
-        # ИСПРАВЛЕНО: для авто-рассылки тоже отключаем превью
         bot.send_message(NEWS_CHAT_ID, news, disable_web_page_preview=True, parse_mode='Markdown', reply_markup=get_random_partner_button())
         logging.info(f"Новости успешно отправлены в чат {NEWS_CHAT_ID}")
     except Exception as e:
