@@ -57,7 +57,7 @@ BOT_HINTS = [
     "⛏️ Рассчитайте прибыль с помощью 'Калькулятора'", "📰 Хотите новости? Просто напишите 'новости'",
     "🤑 Улучшайте свою ферму командой `/upgrade_rig`", "😱 Проверьте Индекс Страха и Жадности командой `/fear`",
     "🏆 Посмотрите на лучших майнеров: `/top_miners`", "🎓 Узнайте крипто-термин дня: `/word`",
-    "🧠 Проверьте свои знания в викторине: `/quiz`"
+    "🧠 Проверьте свои знания в викторине: `/quiz`", "🛍️ Загляните в магазин улучшений: `/shop`"
 ]
 CURRENCY_MAP = {
     'доллар': 'USD', 'usd': 'USD', '$': 'USD', 'евро': 'EUR', 'eur': 'EUR', '€': 'EUR',
@@ -75,16 +75,18 @@ QUIZ_QUESTIONS = [
     {"question": "Что означает аббревиатура 'NFT'?", "options": ["Non-Fungible Token", "New Financial Technology", "Network Fee Token", "National Fiscal Token"], "correct_index": 0},
     {"question": "Как называется самая маленькая единица Bitcoin?", "options": ["Копейка", "Цент", "Сатоши", "Вэй"], "correct_index": 2}
 ]
-# 🚀 НОВОЕ: Настройки для улучшений фермы
-MINING_RATES = {1: 0.0001, 2: 0.0002, 3: 0.0004, 4: 0.0008, 5: 0.0016} # Базовая добыча за сбор
-UPGRADE_COSTS = {2: 0.001, 3: 0.005, 4: 0.02, 5: 0.1} # Стоимость перехода на следующий уровень
-STREAK_BONUS_MULTIPLIER = 0.05 # 5% бонус за каждый день серии
+MINING_RATES = {1: 0.0001, 2: 0.0002, 3: 0.0004, 4: 0.0008, 5: 0.0016} 
+UPGRADE_COSTS = {2: 0.001, 3: 0.005, 4: 0.02, 5: 0.1} 
+STREAK_BONUS_MULTIPLIER = 0.05 
+# 🚀 НОВОЕ: Константы для магазина
+BOOST_COST = 0.0005 # Стоимость 24-часового удвоения добычи
+BOOST_DURATION_HOURS = 24
 
 # Обработчик исключений для детального логирования
 class ExceptionHandler(telebot.ExceptionHandler):
     def handle(self, exception):
         logger.error("Произошла ошибка в обработчике pyTelegramBotAPI:", exc_info=exception)
-        return True # Продолжаем работу
+        return True 
 
 # --- Инициализация ---
 if not BOT_TOKEN:
@@ -103,10 +105,12 @@ except Exception as e:
 user_states = {} 
 asic_cache = {"data": [], "timestamp": None}
 user_rigs = {} 
+currency_cache = {"rate": None, "timestamp": None}
 
 # ========================================================================================
 # 2. РАБОТА С ВНЕШНИМИ СЕРВИСАМИ (API)
 # ========================================================================================
+# ... (Этот раздел без изменений, он уже стабилен)
 def get_gsheet():
     """Подключается к Google Sheets."""
     try:
@@ -131,11 +135,8 @@ def get_crypto_price(coin_id="bitcoin", vs_currency="usd"):
         {"name": "CoinGecko", "url": f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies={vs_currency}"},
         {"name": "Binance", "url": f"https://api.binance.com/api/v3/ticker/price?symbol={coin_id.upper()}USDT"}
     ]
-    
-    # Binance поддерживает только определенные тикеры, так что проверяем
     if coin_id.upper() != "BTC":
         sources.pop(1)
-    
     for source in sources:
         try:
             res = requests.get(source["url"], timeout=5).json()
@@ -316,7 +317,7 @@ def get_main_keyboard():
     markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     buttons = ["💹 Курс BTC", "⚙️ Топ-5 ASIC", "⛏️ Калькулятор", "📰 Новости", 
                "😱 Индекс Страха", "⏳ Халвинг", "🧠 Викторина", "🎓 Слово дня",
-               "🏆 Топ майнеров"]
+               "🏆 Топ майнеров", "🛍️ Магазин"]
     markup.add(*[types.KeyboardButton(text) for text in buttons])
     return markup
 
@@ -342,16 +343,46 @@ def send_photo_with_partner_button(chat_id, photo, caption, **kwargs):
         logger.error(f"Не удалось отправить фото в чат {chat_id}: {e}")
         send_message_with_partner_button(chat_id, caption, **kwargs)
 
-def calculate_and_format_profit(electricity_cost_rub: float):
-    """Расчитывает и форматирует доходность ASIC."""
+# 📌 ИСПРАВЛЕНО: Функция получения курса валют с кэшированием и резервированием
+def get_usd_rub_rate():
+    """Получает курс USD/RUB с кэшем и несколькими источниками."""
+    global currency_cache
+    if currency_cache["rate"] and (datetime.now() - currency_cache["timestamp"] < timedelta(minutes=30)):
+        logger.info(f"Используется кэш курса валют: {currency_cache['rate']}")
+        return currency_cache["rate"]
+
+    # Источник 1: Exchangerate.host
     try:
-        response = requests.get("https://api.exchangerate.host/latest?base=USD&symbols=RUB", timeout=5)
+        response = requests.get("https://api.exchangerate.host/latest?base=USD&symbols=RUB", timeout=4)
         response.raise_for_status()
         rate = response.json().get('rates', {}).get('RUB')
-        if not rate: raise ValueError("Курс RUB не найден в ответе API")
+        if rate:
+            currency_cache = {"rate": rate, "timestamp": datetime.now()}
+            logger.info(f"Получен курс {rate} с Exchangerate.host")
+            return rate
     except Exception as e:
-        logger.error(f"Ошибка получения курса для калькулятора: {e}")
+        logger.warning(f"Источник 1 (Exchangerate.host) не удался: {e}")
+
+    # Источник 2: Exchangerate-api.com
+    try:
+        response = requests.get("https://api.exchangerate-api.com/v4/latest/USD", timeout=4)
+        response.raise_for_status()
+        rate = response.json().get('rates', {}).get('RUB')
+        if rate:
+            currency_cache = {"rate": rate, "timestamp": datetime.now()}
+            logger.info(f"Получен курс {rate} с Exchangerate-api.com (резервный)")
+            return rate
+    except Exception as e:
+        logger.error(f"Источник 2 (Exchangerate-api.com) тоже не удался: {e}")
+    
+    return None
+
+def calculate_and_format_profit(electricity_cost_rub: float):
+    """Расчитывает и форматирует доходность ASIC."""
+    rate = get_usd_rub_rate()
+    if not rate:
         return "Не удалось получить курс доллара для расчета. Попробуйте позже."
+        
     cost_usd = electricity_cost_rub / rate
     asics = get_top_asics()
     if not asics: return "Не удалось получить данные по ASIC для расчета."
@@ -372,13 +403,10 @@ def calculate_and_format_profit(electricity_cost_rub: float):
 def handle_start_help(msg):
     help_text = ("👋 Привет! Я ваш крипто-помощник.\n\n"
                  "<b>Основные команды:</b>\n"
-                 "<code>/price</code> - курс BTC, <code>/gas</code> - газ ETH, <code>/news</code> - новости.\n\n"
+                 "<code>/price</code>, <code>/gas</code>, <code>/news</code>\n\n"
                  "<b>Утилиты и игра:</b>\n"
-                 "<code>/fear</code> - Индекс страха, <code>/halving</code> - таймер до халвинга.\n"
-                 "<code>/my_rig</code> - инфо о ферме, <code>/collect</code> - сбор награды.\n"
-                 "<code>/upgrade_rig</code> - улучшение фермы.\n"
-                 "<code>/top_miners</code> - таблица лидеров.\n"
-                 "<code>/quiz</code> - викторина, <code>/word</code> - слово дня.")
+                 "<code>/my_rig</code> - ваша ферма, <code>/collect</code> - сбор, <code>/upgrade_rig</code> - улучшение.\n"
+                 "<code>/shop</code>, <code>/top_miners</code>, <code>/quiz</code>, <code>/word</code>.")
     bot.send_message(msg.chat.id, help_text, reply_markup=get_main_keyboard())
 
 def get_price_and_send(chat_id, coin_symbol="BTC"):
@@ -409,19 +437,28 @@ def handle_my_rig(msg):
     """Показывает информацию о ферме пользователя."""
     user_id = msg.from_user.id
     if user_id not in user_rigs:
-        user_rigs[user_id] = {'last_collected': None, 'balance': 0.0, 'level': 1, 'streak': 0, 'name': msg.from_user.first_name}
+        user_rigs[user_id] = {'last_collected': None, 'balance': 0.0, 'level': 1, 'streak': 0, 'name': msg.from_user.first_name, 'boost_active_until': None}
         response = "🎉 Поздравляю! Вы запустили свою первую виртуальную ферму!\n\n"
     else:
         response = ""
     rig = user_rigs[user_id]
     next_level = rig['level'] + 1
     upgrade_cost_text = f"Стоимость улучшения до {next_level} уровня: <code>{UPGRADE_COSTS.get(next_level, 'N/A')}</code> BTC." if next_level in UPGRADE_COSTS else "Вы достигли максимального уровня!"
+    
+    boost_status = ""
+    if rig.get('boost_active_until') and datetime.now() < rig['boost_active_until']:
+        time_left = rig['boost_active_until'] - datetime.now()
+        h, rem = divmod(time_left.seconds, 3600)
+        m, _ = divmod(rem, 60)
+        boost_status = f"⚡️ <b>Буст x2 активен еще: {h}ч {m}м</b>\n"
+        
     response += (f"🖥️ <b>Ферма {telebot.util.escape(rig['name'])}</b>\n\n"
                  f"<b>Уровень:</b> {rig['level']}\n"
-                 f"<b>Баланс:</b> <code>{rig['balance']:.6f}</code> BTC\n"
-                 f"<b>Дневная серия:</b> {rig['streak']} 🔥 (дает бонус <b>{rig['streak'] * STREAK_BONUS_MULTIPLIER:.0%}</b>)\n\n"
+                 f"<b>Баланс:</b> <code>{rig['balance']:.8f}</code> BTC\n"
+                 f"<b>Дневная серия:</b> {rig['streak']} 🔥 (бонус <b>+{rig['streak'] * STREAK_BONUS_MULTIPLIER:.0%}</b>)\n"
+                 f"{boost_status}\n"
                  f"{upgrade_cost_text}\n\n"
-                 "Используйте <code>/collect</code> для сбора и <code>/upgrade_rig</code> для улучшения.")
+                 "<code>/collect</code>, <code>/upgrade_rig</code>, <code>/shop</code>")
     send_message_with_partner_button(msg.chat.id, response)
 
 @bot.message_handler(commands=['collect'])
@@ -442,13 +479,20 @@ def handle_collect(msg):
         rig['streak'] = 1
     base_mined = MINING_RATES.get(rig['level'], 0.0001)
     streak_bonus = base_mined * rig['streak'] * STREAK_BONUS_MULTIPLIER
-    total_mined = base_mined + streak_bonus
+    
+    boost_multiplier = 1
+    if rig.get('boost_active_until') and now < rig['boost_active_until']:
+        boost_multiplier = 2
+        
+    total_mined = (base_mined + streak_bonus) * boost_multiplier
     rig['balance'] += total_mined
     rig['last_collected'] = now
-    response = (f"✅ Собрано <b>{total_mined:.6f}</b> BTC!\n"
-                f"  (Базовая добыча: {base_mined:.6f} + Бонус за серию: {streak_bonus:.6f})\n"
+    
+    boost_text = " (x2 Буст!)" if boost_multiplier > 1 else ""
+    response = (f"✅ Собрано <b>{total_mined:.8f}</b> BTC{boost_text}!\n"
+                f"  (База: {base_mined:.8f} + Бонус за серию: {streak_bonus:.8f})\n"
                 f"🔥 Ваша серия: <b>{rig['streak']} дней!</b>\n"
-                f"💰 Ваш новый баланс: <code>{rig['balance']:.6f}</code> BTC.")
+                f"💰 Ваш новый баланс: <code>{rig['balance']:.8f}</code> BTC.")
     send_message_with_partner_button(msg.chat.id, response)
 
 @bot.message_handler(commands=['upgrade_rig'])
@@ -467,12 +511,12 @@ def handle_upgrade_rig(msg):
         rig['level'] = next_level
         response = f"🚀 <b>Улучшение завершено!</b>\n\nВаша ферма достигла <b>{next_level}</b> уровня! " \
                    f"Теперь вы будете добывать больше.\n" \
-                   f"💰 Ваш баланс: <code>{rig['balance']:.6f}</code> BTC."
+                   f"💰 Ваш баланс: <code>{rig['balance']:.8f}</code> BTC."
     else:
         needed = cost - rig['balance']
         response = f"❌ <b>Недостаточно средств.</b>\n\n" \
                    f"Для улучшения до {next_level} уровня требуется <code>{cost}</code> BTC.\n" \
-                   f"Вам не хватает <code>{needed:.6f}</code> BTC. Копите дальше!"
+                   f"Вам не хватает <code>{needed:.8f}</code> BTC. Копите дальше!"
     send_message_with_partner_button(msg.chat.id, response)
 
 @bot.message_handler(commands=['top_miners'])
@@ -485,6 +529,33 @@ def handle_top_miners(msg):
     for i, rig in enumerate(sorted_rigs[:5]):
         response.append(f"<b>{i+1}.</b> {telebot.util.escape(rig['name'])} - <code>{rig['balance']:.6f}</code> BTC (Ур. {rig['level']})")
     send_message_with_partner_button(msg.chat.id, "\n".join(response))
+    
+# 🚀 НОВЫЕ КОМАНДЫ ДЛЯ МАГАЗИНА
+@bot.message_handler(commands=['shop'])
+def handle_shop(msg):
+    text = (f"🛍️ <b>Магазин улучшений</b>\n\n"
+            f"Здесь вы можете потратить свои BTC на временные усилители.\n\n"
+            f"<b>1. Энергетический буст (x2)</b>\n"
+            f"<i>Удваивает всю вашу добычу на 24 часа.</i>\n"
+            f"<b>Стоимость:</b> <code>{BOOST_COST}</code> BTC\n\n"
+            f"Для покупки используйте команду <code>/buy_boost</code>")
+    send_message_with_partner_button(msg.chat.id, text)
+
+@bot.message_handler(commands=['buy_boost'])
+def handle_buy_boost(msg):
+    user_id = msg.from_user.id
+    if user_id not in user_rigs:
+        return send_message_with_partner_button(msg.chat.id, "🤔 У вас нет фермы. Начните с команды <code>/my_rig</code>.")
+    rig = user_rigs[user_id]
+    if rig.get('boost_active_until') and datetime.now() < rig['boost_active_until']:
+        return send_message_with_partner_button(msg.chat.id, "У вас уже активен буст!")
+    if rig['balance'] >= BOOST_COST:
+        rig['balance'] -= BOOST_COST
+        rig['boost_active_until'] = datetime.now() + timedelta(hours=BOOST_DURATION_HOURS)
+        response = f"⚡️ <b>Энергетический буст куплен!</b>\n\nВаша добыча будет удвоена в течение следующих 24 часов."
+    else:
+        response = f"❌ <b>Недостаточно средств.</b>\n\nДля покупки буста требуется <code>{BOOST_COST}</code> BTC."
+    send_message_with_partner_button(msg.chat.id, response)
 
 # --- Обработчики викторины и слова дня ---
 @bot.message_handler(commands=['word'])
@@ -576,6 +647,7 @@ def handle_text_messages(msg):
             "🧠 викторина": lambda: handle_quiz(msg),
             "🎓 слово дня": lambda: handle_word_of_the_day(msg),
             "🏆 топ майнеров": lambda: handle_top_miners(msg),
+            "🛍️ магазин": lambda: handle_shop(msg),
             "🌦️ погода": lambda: set_user_state(user_id, 'weather_request', "🌦 В каком городе показать погоду?")
         }
         if text_lower in command_map:
@@ -679,4 +751,4 @@ if __name__ == '__main__':
     else:
         logger.info("Запуск в режиме long-polling...")
         bot.remove_webhook()
-        bot.polling(none_stop=Tr
+        bot.polling(none_stop=True)
