@@ -355,7 +355,20 @@ def get_crypto_news():
         params = {"auth_token": NEWSAPI_KEY, "public": "true", "currencies": "BTC,ETH"}
         posts = requests.get("https://cryptopanic.com/api/v1/posts/", params=params, timeout=10).json().get("results", [])[:3]
         if not posts: return "[🧐 Новостей по вашему запросу не найдено]"
-        items = [f'🔹 <a href="{p.get("url", "")}">{ask_gpt(f"Сделай краткое саммари (1 предложение): \'{p[\'title\']}\'", "gpt-4o-mini")}</a>' for p in posts]
+        
+        items = []
+        for p in posts:
+            title = p['title']
+            # Исправлено: Убрана вложенная f-строка
+            prompt = f"Сделай краткое саммари (1 предложение): '{title}'"
+            summary = ask_gpt(prompt, "gpt-4o-mini")
+            
+            if '[❌' in summary:
+                summary = telebot.util.escape(title)
+            
+            link = p.get("url", "")
+            items.append(f'🔹 <a href="{link}">{summary}</a>')
+            
         return "📰 <b>Последние крипто-новости:</b>\n\n" + "\n\n".join(items)
     except requests.RequestException as e: logger.error(f"Ошибка API новостей: {e}"); return "[❌ Ошибка API новостей]"
 
@@ -423,7 +436,7 @@ def calculate_and_format_profit(electricity_cost_rub: float):
     for asic in asics:
         cost = (asic['power_watts'] / 1000) * 24 * cost_usd; profit = asic['daily_revenue'] - cost
         result.append(f"<b>{telebot.util.escape(asic['name'])}</b>\n  Профит: <b>${profit:.2f}/день</b> (Доход: ${asic['daily_revenue']:.2f}, Расход: ${cost:.2f})")
-    return "\n\n".join(result)
+    return "\n".join(result)
 
 # ========================================================================================
 # 5. ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ
