@@ -154,7 +154,6 @@ def get_top_asics(force_update: bool = False):
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "lxml")
         parsed_asics = []
-        
         sha256_header = soup.find('h2', id='sha-256')
         if not sha256_header: raise ValueError("Не найден заголовок 'sha-256' на странице.")
         sha256_table = sha256_header.find_next('table')
@@ -288,20 +287,18 @@ def get_main_keyboard():
 
 def send_message_with_partner_button(chat_id, text, **kwargs):
     try:
-        full_text = f"{text}\n\n---\n<i>{random.choice(BOT_HINTS)}</i>"
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton(random.choice(PARTNER_BUTTON_TEXT_OPTIONS), url=PARTNER_URL))
-        bot.send_message(chat_id, full_text, reply_markup=markup, disable_web_page_preview=True)
+        bot.send_message(chat_id, f"{text}\n\n---\n<i>{random.choice(BOT_HINTS)}</i>", reply_markup=markup, disable_web_page_preview=True)
     except Exception as e:
         logger.error(f"Не удалось отправить сообщение в чат {chat_id}: {e}")
 
 def send_photo_with_partner_button(chat_id, photo, caption, **kwargs):
     try:
         if not photo: raise ValueError("Объект фото пустой")
-        full_caption = f"{caption}\n\n---\n<i>{random.choice(BOT_HINTS)}</i>"
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton(random.choice(PARTNER_BUTTON_TEXT_OPTIONS), url=PARTNER_URL))
-        bot.send_photo(chat_id, photo, caption=full_caption, reply_markup=markup)
+        bot.send_photo(chat_id, photo, caption=f"{caption}\n\n---\n<i>{random.choice(BOT_HINTS)}</i>", reply_markup=markup)
     except Exception as e:
         logger.error(f"Не удалось отправить фото: {e}. Отправляю текстом.")
         send_message_with_partner_button(chat_id, caption)
@@ -350,7 +347,7 @@ def handle_asics_text(msg):
     rows = [f"{a['name']:<20.19}| {a['hashrate']:<9}| {a['power_watts']:<5.0f}| ${a['daily_revenue']:<10.2f}" for a in asics]
     response_text = f"<pre>{header}\n{divider}\n" + "\n".join(rows) + "</pre>"
     gpt_prompt = "Вот список доходных ASIC. Напиши короткий мотивирующий комментарий (1-2 предложения) для майнинг-чата. Подтолкни к мысли об обновлении."
-    response_text += f"\n\n{ask_gpt(gpt_prompt, 'gpt-4o')}"
+    response_text += f"\n\n{ask_gpt(prompt, 'gpt-4o')}"
     send_message_with_partner_button(msg.chat.id, response_text)
 
 def handle_my_rig(msg):
@@ -530,19 +527,19 @@ def handle_text_messages(msg):
                 state_handlers[current_state]()
                 return
         
-        command_handlers = {
+        command_map = {
             "/start": handle_start_help, "/help": handle_start_help, "/price": handle_price,
-            "/fear": handle_fear_and_greed, "/fng": handle_fear_and_greed,
+            "/fear": handle_fear_and_greed, "/fng": handle_fear_and_greed, "/gas": lambda m: send_message_with_partner_button(m.chat.id, get_eth_gas_price()),
             "/my_rig": handle_my_rig, "/collect": handle_collect, "/upgrade_rig": handle_upgrade_rig,
             "/top_miners": handle_top_miners, "/shop": handle_shop, "/buy_boost": handle_buy_boost,
             "/word": handle_word_of_the_day, "/quiz": handle_quiz
         }
-        text_command = msg.text.split()[0]
-        if text_command in command_handlers:
-            command_handlers[text_command](msg)
+        text_command = msg.text.split()[0].lower()
+        if text_command in command_map:
+            command_map[text_command](msg)
             return
 
-        button_handlers = {
+        button_map = {
             "💹 курс": lambda: set_user_state(user_id, 'price_request', "Курс какой криптовалюты вас интересует? (напр: BTC, ETH, SOL)"),
             "⚙️ топ-5 asic": lambda: handle_asics_text(msg),
             "⛏️ калькулятор": lambda: set_user_state(user_id, 'calculator_request', "💡 Введите стоимость электроэнергии в <b>рублях</b> за кВт/ч:"),
@@ -553,10 +550,10 @@ def handle_text_messages(msg):
             "🎓 слово дня": lambda: handle_word_of_the_day(msg),
             "🏆 топ майнеров": lambda: handle_top_miners(msg),
             "🛍️ магазин": lambda: handle_shop(msg),
-            "🌦️ погода": lambda: set_user_state(user_id, 'weather_request', "🌦 В каком городе показать погоду?")
+            "🌦️ погода": lambda: set_user_state(user_id, 'weather_request', "� В каком городе показать погоду?")
         }
-        if text_lower in button_handlers:
-            button_handlers[text_lower]()
+        if text_lower in button_map:
+            button_map[text_lower]()
             return
 
         sale_words = ["продам", "купить", "в наличии"]; item_words = ["asic", "асик", "whatsminer", "antminer"]
