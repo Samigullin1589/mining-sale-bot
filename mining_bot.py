@@ -88,9 +88,10 @@ class ExceptionHandler(telebot.ExceptionHandler):
 try:
     bot = telebot.TeleBot(BOT_TOKEN, threaded=False, parse_mode='HTML', exception_handler=ExceptionHandler())
     app = Flask(__name__)
+    # ИЗМЕНЕНО: Исправлен способ инициализации клиента OpenAI для v1.x
     openai_client = OpenAI(api_key=OPENAI_API_KEY)
 except Exception as e:
-    logger.critical(f"Не удалось инициализировать клиентов API: {e}")
+    logger.critical(f"Не удалось инициализировать клиентов API: {e}", exc_info=True)
     raise
 
 # --- Глобальные переменные ---
@@ -148,6 +149,9 @@ def load_user_data():
 def get_gsheet():
     """Подключается к Google Sheets и возвращает объект рабочего листа."""
     try:
+        if not GOOGLE_JSON_STR:
+            logger.warning("Переменная GOOGLE_JSON не установлена. Работа с Google Sheets будет пропущена.")
+            return None
         creds_dict = json.loads(GOOGLE_JSON_STR)
         creds = Credentials.from_service_account_info(creds_dict, scopes=['https://www.googleapis.com/auth/spreadsheets'])
         return gspread.authorize(creds).open_by_key(SHEET_ID).worksheet(SHEET_NAME)
@@ -162,13 +166,15 @@ def log_to_sheet(row_data: list):
         if sheet:
             sheet.append_row(row_data, value_input_option='USER_ENTERED')
         else:
-            logger.error("Не удалось получить объект листа для записи.")
+            logger.error("Не удалось получить объект листа для записи в Google Sheets.")
     except Exception as e:
         logger.error(f"Ошибка записи в Google Sheets: {e}")
 
 def ask_gpt(prompt: str, model: str = "gpt-4o"):
     """Отправляет запрос к OpenAI API и возвращает ответ."""
     try:
+        if not openai_client:
+             return "[❌ Ошибка: Клиент OpenAI не инициализирован.]"
         res = openai_client.chat.completions.create(
             model=model,
             messages=[
