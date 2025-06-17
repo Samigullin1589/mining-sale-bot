@@ -100,6 +100,21 @@ currency_cache = {"rate": None, "timestamp": None}
 # ========================================================================================
 # 2. РАБОТА С ВНЕШНИМИ СЕРВИСАМИ (API)
 # ========================================================================================
+def get_gsheet():
+    try:
+        creds_dict = json.loads(GOOGLE_JSON_STR)
+        creds = Credentials.from_service_account_info(creds_dict, scopes=['https://www.googleapis.com/auth/spreadsheets'])
+        return gspread.authorize(creds).open_by_key(SHEET_ID).worksheet(SHEET_NAME)
+    except Exception as e:
+        logger.error(f"Ошибка подключения к Google Sheets: {e}")
+        raise
+
+def log_to_sheet(row_data: list):
+    try:
+        get_gsheet().append_row(row_data, value_input_option='USER_ENTERED')
+    except Exception as e:
+        logger.error(f"Ошибка записи в Google Sheets: {e}")
+
 def ask_gpt(prompt: str, model: str = "gpt-4o"):
     try:
         res = openai_client.chat.completions.create(
@@ -108,8 +123,7 @@ def ask_gpt(prompt: str, model: str = "gpt-4o"):
                 {"role": "system", "content": "Ты — полезный ассистент, который отвечает на русском, используя HTML-теги: <b>, <i>, <code>, <pre>."},
                 {"role": "user", "content": prompt}
             ],
-            timeout=20.0
-        )
+            timeout=20.0)
         return res.choices[0].message.content.strip()
     except Exception as e:
         logger.error(f"Ошибка вызова OpenAI API: {e}")
@@ -140,6 +154,7 @@ def get_top_asics(force_update: bool = False):
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "lxml")
         parsed_asics = []
+        
         sha256_header = soup.find('h2', id='sha-256')
         if not sha256_header: raise ValueError("Не найден заголовок 'sha-256' на странице.")
         sha256_table = sha256_header.find_next('table')
@@ -231,10 +246,9 @@ def get_halving_info():
         logger.error(f"Ошибка получения данных для халвинга: {e}")
         return "[❌ Не удалось получить данные о халвинге]"
 
-def get_crypto_news(keywords: list = None):
+def get_crypto_news():
     try:
         params = {"auth_token": NEWSAPI_KEY, "public": "true", "currencies": "BTC,ETH"}
-        if keywords: params["currencies"] = ",".join(keywords).upper()
         posts = requests.get("https://cryptopanic.com/api/v1/posts/", params=params, timeout=10).json().get("results", [])[:3]
         if not posts: return "[🧐 Новостей по вашему запросу не найдено]"
         items = []
@@ -246,6 +260,20 @@ def get_crypto_news(keywords: list = None):
     except requests.RequestException as e:
         logger.error(f"Ошибка API новостей: {e}")
         return "[❌ Ошибка API новостей]"
+
+def get_eth_gas_price():
+    try:
+        res = requests.get(f"https://api.etherscan.io/api?module=gastracker&action=gasoracle&apikey={ETHERSCAN_API_KEY}", timeout=5).json()
+        if res.get("status") == "1" and res.get("result"):
+            gas = res["result"]
+            return (f"⛽️ <b>Актуальная цена газа (Gwei):</b>\n\n"
+                    f"🐢 <b>Медленно:</b> <code>{gas['SafeGasPrice']}</code>\n"
+                    f"🚶‍♂️ <b>Средне:</b> <code>{gas['ProposeGasPrice']}</code>\n"
+                    f"🚀 <b>Быстро:</b> <code>{gas['FastGasPrice']}</code>")
+        return "[❌ Не удалось получить данные о газе]"
+    except requests.RequestException as e:
+        logger.error(f"Ошибка сети при запросе цены на газ: {e}")
+        return "[❌ Сетевая ошибка при запросе цены на газ]"
 
 # ========================================================================================
 # 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -263,7 +291,7 @@ def send_message_with_partner_button(chat_id, text, **kwargs):
         full_text = f"{text}\n\n---\n<i>{random.choice(BOT_HINTS)}</i>"
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton(random.choice(PARTNER_BUTTON_TEXT_OPTIONS), url=PARTNER_URL))
-        bot.send_message(chat_id, full_text, reply_markup=markup, disable_web_page_preview=True, **kwargs)
+        bot.send_message(chat_id, full_text, reply_markup=markup, disable_web_page_preview=True)
     except Exception as e:
         logger.error(f"Не удалось отправить сообщение в чат {chat_id}: {e}")
 
@@ -273,10 +301,10 @@ def send_photo_with_partner_button(chat_id, photo, caption, **kwargs):
         full_caption = f"{caption}\n\n---\n<i>{random.choice(BOT_HINTS)}</i>"
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton(random.choice(PARTNER_BUTTON_TEXT_OPTIONS), url=PARTNER_URL))
-        bot.send_photo(chat_id, photo, caption=full_caption, reply_markup=markup, **kwargs)
+        bot.send_photo(chat_id, photo, caption=full_caption, reply_markup=markup)
     except Exception as e:
         logger.error(f"Не удалось отправить фото: {e}. Отправляю текстом.")
-        send_message_with_partner_button(chat_id, caption, **kwargs)
+        send_message_with_partner_button(chat_id, caption)
 
 def calculate_and_format_profit(electricity_cost_rub: float):
     rate = get_usd_rub_rate()
@@ -456,7 +484,14 @@ def handle_quiz_answer(call):
     user_id = call.from_user.id
     state = user_states.get(user_id)
     if not state or not state.get('quiz_active'): return bot.answer_callback_query(call.id, "Викторина уже не активна.")
-    _, q_index, answer_index = map(int, call.data.split('_')[1:])
+    
+    try:
+        _, q_index_str, answer_index_str = call.data.split('_')
+        q_index, answer_index = int(q_index_str), int(answer_index_str)
+    except ValueError:
+        logger.error(f"Некорректные данные в callback викторины: {call.data}")
+        return bot.answer_callback_query(call.id, "Ошибка в данных викторины.")
+
     if q_index != state.get('question_index'): return bot.answer_callback_query(call.id, "Вы уже ответили.")
     
     question_data = state['questions'][q_index]
@@ -495,7 +530,19 @@ def handle_text_messages(msg):
                 state_handlers[current_state]()
                 return
         
-        command_map = {
+        command_handlers = {
+            "/start": handle_start_help, "/help": handle_start_help, "/price": handle_price,
+            "/fear": handle_fear_and_greed, "/fng": handle_fear_and_greed,
+            "/my_rig": handle_my_rig, "/collect": handle_collect, "/upgrade_rig": handle_upgrade_rig,
+            "/top_miners": handle_top_miners, "/shop": handle_shop, "/buy_boost": handle_buy_boost,
+            "/word": handle_word_of_the_day, "/quiz": handle_quiz
+        }
+        text_command = msg.text.split()[0]
+        if text_command in command_handlers:
+            command_handlers[text_command](msg)
+            return
+
+        button_handlers = {
             "💹 курс": lambda: set_user_state(user_id, 'price_request', "Курс какой криптовалюты вас интересует? (напр: BTC, ETH, SOL)"),
             "⚙️ топ-5 asic": lambda: handle_asics_text(msg),
             "⛏️ калькулятор": lambda: set_user_state(user_id, 'calculator_request', "💡 Введите стоимость электроэнергии в <b>рублях</b> за кВт/ч:"),
@@ -508,8 +555,8 @@ def handle_text_messages(msg):
             "🛍️ магазин": lambda: handle_shop(msg),
             "🌦️ погода": lambda: set_user_state(user_id, 'weather_request', "🌦 В каком городе показать погоду?")
         }
-        if text_lower in command_map:
-            command_map[text_lower]()
+        if text_lower in button_handlers:
+            button_handlers[text_lower]()
             return
 
         sale_words = ["продам", "купить", "в наличии"]; item_words = ["asic", "асик", "whatsminer", "antminer"]
@@ -528,7 +575,7 @@ def handle_text_messages(msg):
 def set_user_state(user_id, state, text):
     user_states[user_id] = state
     bot.send_message(user_id, text, reply_markup=types.ReplyKeyboardRemove())
-    
+
 # ========================================================================================
 # 6. ЗАПУСК БОТА И ПЛАНИРОВЩИКА
 # ========================================================================================
