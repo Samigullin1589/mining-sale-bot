@@ -168,7 +168,7 @@ def get_weather(city: str):
         return (f"🌍 {city.title()}\n"
                 f"🌡 Температура: {current['temp_C']}°C (Ощущается как {current['FeelsLikeC']}°C)\n"
                 f"☁️ Погода: {current['lang_ru'][0]['value']}\n"
-                f"💧 Влажность: {current['humidity']}%\n"
+                f"� Влажность: {current['humidity']}%\n"
                 f"💨 Ветер: {current['windspeedKmph']} км/ч")
     except Exception as e:
         logging.error(f"Ошибка получения погоды для '{city}': {e}")
@@ -216,6 +216,7 @@ def ask_gpt(prompt: str, model: str = "gpt-4o"):
 def get_top_asics(force_update: bool = False):
     """
     ИЗМЕНЕНО: Получает топ-5 ASIC с asicminervalue.com и возвращает СТРУКТУРИРОВАННЫЕ ДАННЫЕ.
+    Использует умный парсинг по паттернам, а не по порядку колонок.
     """
     global asic_cache
     cache_is_valid = asic_cache.get("data") and asic_cache.get("timestamp") and \
@@ -237,31 +238,33 @@ def get_top_asics(force_update: bool = False):
         updated_asics = []
         for row in table_rows[:5]:
             cols = row.find_all("td")
-            if len(cols) > 3:
-                try:
-                    name = cols[0].get_text(strip=True)
-                    hashrate = cols[1].get_text(strip=True)
-                    power_text = cols[2].get_text(strip=True)
-                    revenue_text = cols[3].get_text(strip=True)
+            if not cols: continue
 
-                    revenue_match = re.search(r'([\d\.]+)', revenue_text)
-                    revenue = float(revenue_match.group(1)) if revenue_match else 0.0
+            asic_data = {}
+            # Первая колонка почти всегда имя
+            asic_data['name'] = cols[0].get_text(strip=True)
 
-                    power_match = re.search(r'(\d+)', power_text)
-                    power = float(power_match.group(1)) if power_match else 0.0
-
-                    if name and power > 0 and revenue > 0:
-                        updated_asics.append({
-                            "name": name,
-                            "hashrate": hashrate,
-                            "power_watts": power,
-                            "power_str": power_text,
-                            "daily_revenue": revenue,
-                            "revenue_str": revenue_text,
-                        })
-                except (ValueError, IndexError, AttributeError) as e:
-                    logging.warning(f"Не удалось распарсить строку ASIC: {row.get_text(strip=True)} | Ошибка: {e}")
-                    continue
+            # Ищем остальные данные по паттернам в каждой колонке
+            for col in cols:
+                text = col.get_text(strip=True)
+                if 'h/s' in text.lower() and 'hashrate' not in asic_data:
+                    asic_data['hashrate'] = text
+                elif 'W' in text and not 'Wh' in text and 'power_str' not in asic_data:
+                    power_match = re.search(r'(\d+)', text)
+                    if power_match:
+                        asic_data['power_watts'] = float(power_match.group(1))
+                        asic_data['power_str'] = text
+                elif '$' in text and 'revenue_str' not in asic_data:
+                    revenue_match = re.search(r'([\d\.]+)', text)
+                    if revenue_match:
+                        asic_data['daily_revenue'] = float(revenue_match.group(1))
+                        asic_data['revenue_str'] = text
+            
+            # Проверяем, что все нужные данные найдены
+            if all(k in asic_data for k in ['name', 'hashrate', 'power_watts', 'daily_revenue', 'power_str', 'revenue_str']):
+                updated_asics.append(asic_data)
+            else:
+                logging.warning(f"Не удалось найти все данные для ASIC: {row.get_text(strip=True)}. Найдено: {asic_data}")
 
         if not updated_asics:
              return ["[❌ Структура таблицы на сайте изменилась, не удалось извлечь данные.]"]
@@ -362,7 +365,7 @@ def get_usd_to_rub_rate():
 
 def calculate_and_format_profit(electricity_cost_rub: float):
     """
-    ИЗМЕНЕНО: Расчет и форматирование доходности ASIC, используя СТРУКТУРИРОВАННЫЕ ДАННЫЕ.
+    Расчет и форматирование доходности ASIC, используя СТРУКТУРИРОВАННЫЕ ДАННЫЕ.
     """
     usd_to_rub_rate = get_usd_to_rub_rate()
     if usd_to_rub_rate is None:
