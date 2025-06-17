@@ -2,13 +2,11 @@ Flask==2.3.3
 pyTelegramBotAPI==4.12.0
 gunicorn
 gspread
-google-auth
+google-auth-oauthlib # Более современная библиотека для аутентификации Google
 openai
 requests
-fpdf
-pytz
-feedparser
-oauth2client
 schedule
 beautifulsoup4
+lxml # Более быстрый и надежный парсер для BeautifulSoup
 matplotlib
+Pillow # Явно добавляем библиотеку для работы с изображениями, нужна для matplotlib
