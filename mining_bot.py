@@ -68,7 +68,7 @@ class Config:
         "💡 Узнайте курс любой монеты командой `/price`", "⚙️ Посмотрите на самые доходные ASIC",
         "⛏️ Рассчитайте прибыль с помощью 'Калькулятора'", "📰 Хотите свежие крипто-новости?",
         "🤑 Попробуйте наш симулятор майнинга!", "😱 Проверьте Индекс Страха и Жадности",
-        "� Сравните себя с лучшими в таблице лидеров", "🎓 Что такое 'HODL'? Узнайте: `/word`",
+        "🏆 Сравните себя с лучшими в таблице лидеров", "🎓 Что такое 'HODL'? Узнайте: `/word`",
         "🧠 Проверьте знания и заработайте в `/quiz`", "🛍️ Загляните в магазин улучшений"
     ]
     HALVING_INTERVAL = 210000
@@ -583,6 +583,12 @@ class SpamAnalyzer:
         text_lower = msg.text.lower() if msg.text else ''
         if any(keyword in text_lower for keyword in Config.SPAM_KEYWORDS):
             profile['spam_count'] += 1
+    
+    def manual_spam_increment(self, user_id):
+        profile = self.user_profiles.get(user_id)
+        if profile:
+            profile['spam_count'] += 1
+
 
     def get_user_info_text(self, user_id: int) -> str:
         profile = self.user_profiles.get(user_id)
@@ -638,12 +644,15 @@ def send_photo_with_partner_button(chat_id, photo, caption):
         logger.error(f"Не удалось отправить фото: {e}. Отправляю текстом."); 
         send_message_with_partner_button(chat_id, caption)
 
+def is_admin(msg):
+    return msg.from_user.id in [admin.user.id for admin in bot.get_chat_administrators(msg.chat.id)]
+
 # ========================================================================================
 # 5. ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ
 # ========================================================================================
 @bot.message_handler(commands=['start', 'help'])
 def handle_start_help(msg):
-    bot.send_message(msg.chat.id, "👋 Привет! Я ваш крипто-помощник.\n\nДля проверки пользователя используйте команду <code>/userinfo</code>, ответив на его сообщение.", reply_markup=get_main_keyboard())
+    bot.send_message(msg.chat.id, "👋 Привет! Я ваш крипто-помощник.\n\n<b>Команды модерации:</b>\n<code>/userinfo</code> - информация о пользователе\n<code>/spam</code> - пометить сообщение как спам\n<code>/ban</code> - забанить пользователя\n<code>/unban</code> - разбанить пользователя", reply_markup=get_main_keyboard())
 
 @bot.message_handler(commands=['userinfo'])
 def handle_userinfo(msg):
@@ -660,6 +669,45 @@ def handle_userinfo(msg):
     if target_id:
         info_text = spam_analyzer.get_user_info_text(target_id)
         bot.send_message(msg.chat.id, info_text)
+
+# --- Команды модерации ---
+@bot.message_handler(commands=['ban', 'spam', 'unban'])
+def handle_moderation(msg):
+    if not is_admin(msg):
+        return bot.reply_to(msg, "Эта команда доступна только администраторам.")
+        
+    command = msg.text.split('@')[0].split(' ')[0]
+
+    if command == '/unban':
+        try:
+            user_id_to_unban = int(msg.text.split()[1])
+            bot.unban_chat_member(msg.chat.id, user_id_to_unban)
+            bot.reply_to(msg, f"Пользователь <code>{user_id_to_unban}</code> разбанен.")
+        except Exception as e:
+            bot.reply_to(msg, "Ошибка. Используйте формат: <code>/unban ID_пользователя</code>")
+        return
+
+    if not msg.reply_to_message:
+        return bot.reply_to(msg, "Пожалуйста, используйте эту команду в ответ на сообщение пользователя.")
+
+    user_to_act = msg.reply_to_message.from_user
+    
+    if command == '/ban':
+        try:
+            bot.ban_chat_member(msg.chat.id, user_to_act.id)
+            bot.delete_message(msg.chat.id, msg.reply_to_message.message_id)
+            bot.reply_to(msg, f"Пользователь {user_to_act.full_name} забанен.")
+        except Exception as e:
+            logger.error(f"Не удалось забанить пользователя: {e}")
+            bot.reply_to(msg, "Не удалось забанить пользователя. Проверьте мои права.")
+            
+    elif command == '/spam':
+        try:
+            spam_analyzer.manual_spam_increment(user_to_act.id)
+            bot.delete_message(msg.chat.id, msg.reply_to_message.message_id)
+            bot.reply_to(msg, f"Сообщение от {user_to_act.full_name} помечено как спам.")
+        except Exception as e:
+            logger.error(f"Не удалось удалить спам-сообщение: {e}")
 
 
 @bot.message_handler(func=lambda msg: msg.text == "💹 Курс", content_types=['text'])
