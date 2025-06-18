@@ -73,7 +73,13 @@ class Config:
     HALVING_INTERVAL = 210000
 
     CRYPTO_TERMS = ["Блокчейн", "Газ (Gas)", "Халвинг", "ICO", "DeFi", "NFT", "Сатоши", "Кит (Whale)", "HODL", "DEX", "Смарт-контракт"]
-    MINING_RATES = {1: 0.0001, 2: 0.0002, 3: 0.0004, 4: 0.0008, 5: 0.0016}
+    
+    STARTER_ASICS = {
+        's9': {'name': 'Старенький Antminer S9', 'rate': 0.00008},
+        'm30s': {'name': 'Надежный Whatsminer M30S', 'rate': 0.00010},
+        'a1246': {'name': 'Эффективный Avalon A1246', 'rate': 0.00012}
+    }
+    LEVEL_MULTIPLIERS = {1: 1, 2: 1.5, 3: 2.2, 4: 3.5, 5: 5}
     UPGRADE_COSTS = {2: 0.001, 3: 0.005, 4: 0.02, 5: 0.1}
     STREAK_BONUS_MULTIPLIER = 0.05
     BOOST_COST = 0.0005
@@ -393,11 +399,37 @@ class GameLogic:
         except Exception as e:
             logger.error(f"Ошибка при сохранении данных пользователей: {e}", exc_info=True)
 
+    def create_rig(self, user_id, user_name, asic_key):
+        if user_id in self.user_rigs:
+            return "У вас уже есть ферма!"
+        
+        starter_asic = Config.STARTER_ASICS.get(asic_key)
+        if not starter_asic:
+            return "Произошла ошибка при выборе ASIC."
+            
+        self.user_rigs[user_id] = {
+            'last_collected': None, 
+            'balance': 0.0, 
+            'level': 1, 
+            'streak': 0, 
+            'name': user_name, 
+            'boost_active_until': None,
+            'asic_model': starter_asic['name'],
+            'base_rate': starter_asic['rate']
+        }
+        return f"🎉 Поздравляем! Ваша ферма с <b>{starter_asic['name']}</b> успешно создана!"
+
     def get_rig_info(self, user_id, user_name):
-        rig = self.user_rigs.setdefault(user_id, {
-            'last_collected': None, 'balance': 0.0, 'level': 1, 
-            'streak': 0, 'name': user_name, 'boost_active_until': None
-        })
+        rig = self.user_rigs.get(user_id)
+        if not rig:
+            # Если фермы нет, предлагаем создать
+            markup = types.InlineKeyboardMarkup(row_width=1)
+            buttons = [
+                types.InlineKeyboardButton(f"Выбрать {asic['name']}", callback_data=f"start_rig_{key}")
+                for key, asic in Config.STARTER_ASICS.items()
+            ]
+            markup.add(*buttons)
+            return "Добро пожаловать! Давайте создадим вашу первую виртуальную ферму. Выберите, с какого ASIC вы хотите начать:", markup
         
         next_level = rig['level'] + 1
         upgrade_cost_text = f"Стоимость улучшения: <code>{Config.UPGRADE_COSTS.get(next_level, 'N/A')}</code> BTC." if next_level in Config.UPGRADE_COSTS else "Вы достигли максимального уровня!"
@@ -408,12 +440,18 @@ class GameLogic:
             time_left = (datetime.fromisoformat(boost_until) if isinstance(boost_until, str) else boost_until) - datetime.now()
             h, rem = divmod(time_left.seconds, 3600); m, _ = divmod(rem, 60)
             boost_status = f"⚡️ <b>Буст x2 активен еще: {h}ч {m}м</b>\n"
+        
+        base_rate = rig.get('base_rate', 0.0001) # Для совместимости со старыми данными
+        current_rate = base_rate * Config.LEVEL_MULTIPLIERS.get(rig['level'], 1)
 
-        return (f"🖥️ <b>Ферма {telebot.util.escape(rig['name'])}</b>\n\n"
+        text = (f"🖥️ <b>Ферма {telebot.util.escape(rig['name'])}</b>\n"
+                f"<i>Оборудование: {rig.get('asic_model', 'Стандартное')}</i>\n\n"
                 f"<b>Уровень:</b> {rig['level']}\n"
+                f"<b>Базовая добыча:</b> <code>{current_rate:.8f} BTC/день</code>\n"
                 f"<b>Баланс:</b> <code>{rig['balance']:.8f}</code> BTC\n"
                 f"<b>Дневная серия:</b> {rig['streak']} 🔥 (бонус <b>+{rig['streak'] * Config.STREAK_BONUS_MULTIPLIER:.0%}</b>)\n"
                 f"{boost_status}\n{upgrade_cost_text}")
+        return text, None # Возвращаем текст и None для разметки
 
     def collect_reward(self, user_id):
         rig = self.user_rigs.get(user_id)
@@ -429,7 +467,11 @@ class GameLogic:
             return f"Вы уже собирали награду. Попробуйте снова через <b>{h}ч {m}м</b>."
         
         rig['streak'] = rig['streak'] + 1 if last_collected_dt and (now - last_collected_dt) < timedelta(hours=48) else 1
-        base_mined = Config.MINING_RATES.get(rig['level'], 0)
+        
+        base_rate = rig.get('base_rate', 0.0001)
+        level_multiplier = Config.LEVEL_MULTIPLIERS.get(rig['level'], 1)
+        base_mined = base_rate * level_multiplier
+
         streak_bonus = base_mined * rig['streak'] * Config.STREAK_BONUS_MULTIPLIER
         
         boost_until = rig.get('boost_active_until')
@@ -470,7 +512,7 @@ class GameLogic:
 
     def buy_boost(self, user_id):
         rig = self.user_rigs.get(user_id)
-        if not rig: return "🤔 У вас нет фермы."
+        if not rig: return "� У вас нет фермы."
         boost_until = rig.get('boost_active_until')
         boost_until_dt = datetime.fromisoformat(boost_until) if isinstance(boost_until, str) else boost_until
         if boost_until_dt and datetime.now() < boost_until_dt: return "У вас уже активен буст!"
@@ -723,80 +765,108 @@ def handle_quiz_answer(call):
     state['question_index'] += 1; time.sleep(1.5); send_quiz_question(call.message.chat.id, user_id)
     bot.answer_callback_query(call.id)
 
-@bot.message_handler(func=lambda msg: msg.text == "🕹️ Виртуальный Майнинг", content_types=['text'])
+# ======================= Игровые обработчики ========================
+
+@bot.message_handler(func=lambda msg: msg.text == "🕹️ Виртуальный Майнинг")
 def handle_game_hub(msg):
+    text, markup = get_game_menu(msg.from_user.id, msg.from_user.first_name)
+    bot.send_message(msg.chat.id, text, reply_markup=markup)
+
+def get_game_menu(user_id, user_name):
+    """Возвращает текст и кнопки для главного игрового меню."""
+    rig_info_text, rig_info_markup = game.get_rig_info(user_id, user_name)
+    
+    if rig_info_markup: # Если вернулась разметка для создания фермы
+        return rig_info_text, rig_info_markup
+    
+    # Если ферма уже есть, показываем игровое меню
     markup = types.InlineKeyboardMarkup(row_width=2)
     buttons = [
-        types.InlineKeyboardButton("🖥️ Моя Ферма", callback_data="game_rig"),
-        types.InlineKeyboardButton("🚀 Улучшить", callback_data="game_upgrade"),
         types.InlineKeyboardButton("💰 Собрать", callback_data="game_collect"),
+        types.InlineKeyboardButton("🚀 Улучшить", callback_data="game_upgrade"),
         types.InlineKeyboardButton("🏆 Топ Майнеров", callback_data="game_top"),
         types.InlineKeyboardButton("🛍️ Магазин", callback_data="game_shop"),
-        types.InlineKeyboardButton("💵 Вывести в реал", callback_data="game_withdraw")
+        types.InlineKeyboardButton("💵 Вывести в реал", callback_data="game_withdraw"),
+        types.InlineKeyboardButton("🔄 Обновить", callback_data="game_rig") # Кнопка для обновления инфо
     ]
     markup.add(*buttons)
-    bot.send_message(msg.chat.id, "Добро пожаловать в симулятор майнинга! Выберите действие:", reply_markup=markup)
+    return rig_info_text, markup
+
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('game_'))
 def handle_game_callbacks(call):
     action = call.data.split('_')[1]
     user_id = call.from_user.id
+    message = call.message
+    
+    response_text = ""
+    if action == 'collect':
+        response_text = game.collect_reward(user_id)
+        bot.answer_callback_query(call.id, "✅ Награда собрана!")
+    elif action == 'upgrade':
+        response_text = game.upgrade_rig(user_id)
+        bot.answer_callback_query(call.id, "Попытка улучшения...")
+    
+    # После действия обновляем игровое меню
+    if response_text:
+        bot.send_message(message.chat.id, response_text)
+    
+    text, markup = get_game_menu(user_id, call.from_user.first_name)
+    bot.edit_message_text(text, message.chat.id, message.message_id, reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('start_rig_'))
+def handle_start_rig_callback(call):
+    asic_key = call.data.split('_')[-1]
+    user_id = call.from_user.id
     user_name = call.from_user.first_name
     
-    text = ""
-    if action == 'rig':
-        text = game.get_rig_info(user_id, user_name)
-    elif action == 'collect':
-        text = game.collect_reward(user_id)
-    elif action == 'upgrade':
-        text = game.upgrade_rig(user_id)
-    elif action == 'top':
-        text = game.get_top_miners()
-    elif action == 'shop':
-        text = (f"🛍️ <b>Магазин улучшений</b>\n\nЗдесь вы можете потратить заработанные BTC, чтобы ускорить свой прогресс!\n\n"
-                f"<b>1. Энергетический буст (x2)</b>\n"
-                f"<i>Удваивает всю вашу добычу на 24 часа.</i>\n"
-                f"<b>Стоимость:</b> <code>{Config.BOOST_COST}</code> BTC\n\n"
-                f"Для покупки используйте команду <code>/buy_boost</code>")
-    elif action == 'withdraw':
-        text = random.choice(Config.PARTNER_AD_TEXT_OPTIONS)
-
-    try:
-        bot.answer_callback_query(call.id)
-        if text:
-            send_message_with_partner_button(call.message.chat.id, text)
-    except Exception as e:
-        logger.error(f"Ошибка в игровом колбэке: {e}")
-
-@bot.message_handler(content_types=['text'])
-def handle_other_text(msg):
-    spam_analyzer.process_message(msg)
+    creation_message = game.create_rig(user_id, user_name, asic_key)
+    bot.answer_callback_query(call.id, "Ферма создается...")
     
-    if msg.chat.type in ('group', 'supergroup'):
-        if not (msg.reply_to_message and msg.reply_to_message.from_user.id == bot.get_me().id) and \
-           f"@{bot.get_me().username}" not in msg.text:
-            return
+    # После создания показываем главное игровое меню
+    text, markup = get_game_menu(user_id, user_name)
+    # Редактируем сообщение, в котором был выбор асика
+    bot.edit_message_text(f"{creation_message}\n\n{text}", call.message.chat.id, call.message.message_id, reply_markup=markup)
 
-    text_lower = msg.text.lower()
-    if any(kw in text_lower for kw in Config.TECH_QUESTION_KEYWORDS) and any(kw in text_lower for kw in Config.TECH_SUBJECT_KEYWORDS) and '?' in msg.text:
-        handle_technical_question(msg)
-    elif any(w in text_lower for w in ["продам", "купить", "в наличии"]) and any(w in text_lower for w in ["asic", "асик", "whatsminer", "antminer"]):
-        api.log_to_sheet([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg.from_user.username or "N/A", msg.text])
-        prompt = f"Пользователь прислал объявление в майнинг-чат. Кратко и неформально прокомментируй его, поддержи диалог. Текст: '{msg.text}'"
-        response = api.ask_gpt(prompt)
-        send_message_with_partner_button(msg.chat.id, response)
-    else:
-        try:
-            bot.send_chat_action(msg.chat.id, 'typing')
-        except Exception as e:
-            logger.warning(f"Не удалось отправить 'typing' action: {e}")
-        response = api.ask_gpt(msg.text)
-        send_message_with_partner_button(msg.chat.id, response)
+# ======================= Конец игровых обработчиков ========================
+
+
+@bot.message_handler(content_types=['text'], func=lambda msg: not msg.text.startswith('/'))
+def handle_non_command_text(msg):
+    try:
+        spam_analyzer.process_message(msg)
+        
+        # В группе отвечаем только на прямое упоминание или ответ на сообщение бота
+        if msg.chat.type in ('group', 'supergroup'):
+            if not (msg.reply_to_message and msg.reply_to_message.from_user.id == bot.get_me().id) and \
+               f"@{bot.get_me().username}" not in msg.text:
+                return
+
+        text_lower = msg.text.lower()
+        if any(kw in text_lower for kw in Config.TECH_QUESTION_KEYWORDS) and any(kw in text_lower for kw in Config.TECH_SUBJECT_KEYWORDS) and '?' in msg.text:
+            handle_technical_question(msg)
+        elif any(w in text_lower for w in ["продам", "купить", "в наличии"]) and any(w in text_lower for w in ["asic", "асик", "whatsminer", "antminer"]):
+            api.log_to_sheet([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg.from_user.username or "N/A", msg.text])
+            prompt = f"Пользователь прислал объявление в майнинг-чат. Кратко и неформально прокомментируй его, поддержи диалог. Текст: '{msg.text}'"
+            response = api.ask_gpt(prompt)
+            send_message_with_partner_button(msg.chat.id, response)
+        else:
+            try:
+                bot.send_chat_action(msg.chat.id, 'typing')
+            except Exception as e:
+                logger.warning(f"Не удалось отправить 'typing' action: {e}")
+            response = api.ask_gpt(msg.text)
+            send_message_with_partner_button(msg.chat.id, response)
+    except Exception as e:
+        logger.error("Критическая ошибка в handle_other_text!", exc_info=e)
+        bot.send_message(msg.chat.id, "😵 Ой, что-то пошло не так. Мы уже разбираемся!")
 
 def handle_technical_question(msg):
     try:
         bot.send_chat_action(msg.chat.id, 'typing')
-        # В реальном приложении здесь был бы поиск по базе знаний или Google
+        # Для простоты и скорости, отправляем вопрос напрямую в GPT
+        # В будущем здесь можно добавить поиск по базе знаний или Google
         prompt = (
             "Ты — опытный и дружелюбный эксперт в чате по майнингу. "
             f"Пользователь задал технический вопрос: \"{msg.text}\"\n\n"
