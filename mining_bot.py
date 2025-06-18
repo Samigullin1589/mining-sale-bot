@@ -39,7 +39,6 @@ logger = logging.getLogger(__name__)
 
 class Config:
     """Класс для хранения всех настроек и констант."""
-    # --- Ключи и Настройки (Загрузка из переменных окружения) ---
     BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
     WEBHOOK_URL = os.getenv("WEBHOOK_URL")
     CRYPTO_API_KEY = os.getenv("CRYPTO_API_KEY")
@@ -51,12 +50,10 @@ class Config:
     SHEET_NAME = os.getenv("SHEET_NAME", "Лист1")
     DATA_FILE = "user_data.json"
 
-    # --- Проверка наличия токена ---
     if not BOT_TOKEN:
         logger.critical("Критическая ошибка: TG_BOT_TOKEN не установлен.")
         raise ValueError("Критическая ошибка: TG_BOT_TOKEN не установлен")
 
-    # --- Статические константы ---
     PARTNER_URL = "https://app.leadteh.ru/w/dTeKr"
     PARTNER_BUTTON_TEXT_OPTIONS = ["🎁 Узнать спеццены", "🔥 Эксклюзивное предложение", "💡 Получить консультацию", "💎 Прайс от экспертов"]
     BOT_HINTS = [
@@ -68,7 +65,6 @@ class Config:
     ]
     HALVING_INTERVAL = 210000
 
-    # --- Игровые константы ---
     CRYPTO_TERMS = ["Блокчейн", "Газ (Gas)", "Халвинг", "ICO", "DeFi", "NFT", "Сатоши", "Кит (Whale)", "HODL", "DEX", "Смарт-контракт"]
     MINING_RATES = {1: 0.0001, 2: 0.0002, 3: 0.0004, 4: 0.0008, 5: 0.0016}
     UPGRADE_COSTS = {2: 0.001, 3: 0.005, 4: 0.02, 5: 0.1}
@@ -99,16 +95,12 @@ except Exception as e:
     openai_client = None
     logger.critical(f"Не удалось инициализировать клиент OpenAI: {e}", exc_info=True)
 
-
-# --- Глобальные переменные и кэш ---
-user_quiz_states = {} # Состояния для викторины
-
+user_quiz_states = {}
 
 # ========================================================================================
 # 2. КЛАССЫ ЛОГИКИ (API, ИГРА)
 # ========================================================================================
 class ApiHandler:
-    """Класс для инкапсуляции всех вызовов к внешним API."""
     def __init__(self):
         self.asic_cache = {"data": [], "timestamp": None}
         self.currency_cache = {"rate": None, "timestamp": None}
@@ -120,8 +112,7 @@ class ApiHandler:
             creds = Credentials.from_service_account_info(creds_dict, scopes=['https://www.googleapis.com/auth/spreadsheets'])
             return gspread.authorize(creds).open_by_key(Config.SHEET_ID).worksheet(Config.SHEET_NAME)
         except Exception as e:
-            logger.error(f"Ошибка подключения к Google Sheets: {e}")
-            return None
+            logger.error(f"Ошибка подключения к Google Sheets: {e}"); return None
 
     def log_to_sheet(self, row_data: list):
         try:
@@ -130,9 +121,12 @@ class ApiHandler:
         except Exception as e: logger.error(f"Ошибка записи в Google Sheets: {e}")
 
     def _sanitize_html(self, html_string: str) -> str:
-        """Удаляет неподдерживаемые Telegram теги, оставляя только разрешенные."""
-        sanitized = re.sub(r'</?p>|<br\s*/?>', '\n', html_string)
-        return sanitized.strip()
+        soup = BeautifulSoup(html_string, "html.parser")
+        allowed_tags = ['b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del', 'a', 'code', 'pre']
+        for tag in soup.find_all(True):
+            if tag.name not in allowed_tags:
+                tag.unwrap()
+        return str(soup)
 
     def ask_gpt(self, prompt: str, model: str = "gpt-4o"):
         if not openai_client: return "[❌ Ошибка: Клиент OpenAI не инициализирован.]"
@@ -157,31 +151,31 @@ class ApiHandler:
     def get_top_asics(self, force_update: bool = False):
         if not force_update and self.asic_cache.get("data") and (datetime.now() - self.asic_cache.get("timestamp", datetime.min) < timedelta(hours=1)): return self.asic_cache.get("data")
         try:
-            r = requests.get("https://www.asicminervalue.com", timeout=15); r.raise_for_status()
-            soup = BeautifulSoup(r.text, "lxml"); parsed_asics = []
+            r = requests.get("https://hashrate.no/api/v1/asics", timeout=15)
+            r.raise_for_status()
+            all_asics = r.json()
+            sha256_asics = [asic for asic in all_asics if asic.get('algorithm') == 'SHA-256' and asic.get('revenue24h') is not None]
             
-            sha256_header = soup.find('h2', id='sha-256')
-            if not sha256_header:
-                logger.warning("Не удалось найти заголовок 'sha-256' на странице asicminervalue.com.")
-                return []
-            table = sha256_header.find_next('table')
-            if not table:
-                logger.warning("Не удалось найти таблицу ASIC после заголовка.")
-                return []
+            if not sha256_asics:
+                raise ValueError("Не найдено ASIC с алгоритмом SHA-256 в API hashrate.no")
 
-            for row in table.select("tbody tr"):
-                cols = row.find_all("td"); name_tag = cols[1].find('a')
-                if len(cols) < 5 or not name_tag: continue
-                name = name_tag.get_text(strip=True); hashrate = cols[2].get_text(strip=True)
-                power = re.search(r'([\d,]+)', cols[3].get_text(strip=True))
-                revenue = re.search(r'([\d\.]+)', cols[4].get_text(strip=True).replace('$', ''))
-                if power and revenue: parsed_asics.append({'name': name, 'hashrate': hashrate, 'power_watts': float(power.group(1).replace(',', '')), 'daily_revenue': float(revenue.group(1))})
-            if not parsed_asics: raise ValueError("Не удалось распарсить ASIC.")
-            parsed_asics.sort(key=lambda x: x['daily_revenue'], reverse=True)
-            self.asic_cache = {"data": parsed_asics[:5], "timestamp": datetime.now()}
-            logger.info(f"Успешно получено {len(self.asic_cache['data'])} ASIC.")
+            sorted_asics = sorted(sha256_asics, key=lambda x: x['revenue24h'], reverse=True)
+            
+            top_asics = []
+            for a in sorted_asics[:5]:
+                top_asics.append({
+                    'name': a.get('name', 'N/A'),
+                    'hashrate': f"{a.get('hashrate', 0) / 1e12:.2f} TH/s", # Конвертируем в TH/s
+                    'power_watts': a.get('power', 0),
+                    'daily_revenue': a.get('revenue24h', 0)
+                })
+
+            self.asic_cache = {"data": top_asics, "timestamp": datetime.now()}
+            logger.info(f"Успешно получено {len(top_asics)} ASIC из API hashrate.no.")
             return self.asic_cache["data"]
-        except Exception as e: logger.error(f"Не удалось получить данные по ASIC: {e}", exc_info=True); return []
+        except Exception as e:
+            logger.error(f"Не удалось получить данные по ASIC из нового API: {e}", exc_info=True)
+            return []
 
     def get_fear_and_greed_index(self):
         try:
@@ -196,7 +190,7 @@ class ApiHandler:
             fig.text(0.5, 0.5, f"{value}", ha='center', va='center', fontsize=48, color='white', weight='bold')
             fig.text(0.5, 0.35, classification, ha='center', va='center', fontsize=20, color='white')
             buf = io.BytesIO(); plt.savefig(buf, format='png', dpi=150, transparent=True); buf.seek(0); plt.close(fig)
-            prompt = f"Кратко объясни для майнера, как 'Индекс страха и жадности' со значением '{value} ({classification})' влияет на рынок и его возможные действия. (2-3 предложения)"
+            prompt = f"Кратко объясни для майнера, как 'Индекс страха и жадности' со значением '{value} ({classification})' влияет на рынок."
             explanation = self.ask_gpt(prompt)
             text = f"😱 <b>Индекс страха и жадности: {value} - {classification}</b>\n\n{explanation}"
             return buf, text
@@ -247,6 +241,43 @@ class ApiHandler:
                     f"<i>Данные от ethgas.watch</i>")
         except Exception as e: logger.error(f"Ошибка сети при запросе цены на газ: {e}"); return "[❌ Не удалось получить данные о газе]"
 
+    def get_btc_network_status(self):
+        try:
+            session = requests.Session()
+            height_url = "https://mempool.space/api/blocks/tip/height"
+            fees_url = "https://mempool.space/api/v1/fees/recommended"
+            mempool_url = "https://mempool.space/api/mempool"
+
+            height_res = session.get(height_url, timeout=5)
+            fees_res = session.get(fees_url, timeout=5)
+            mempool_res = session.get(mempool_url, timeout=5)
+
+            height_res.raise_for_status()
+            fees_res.raise_for_status()
+            mempool_res.raise_for_status()
+
+            height = int(height_res.text)
+            fees = fees_res.json()
+            mempool = mempool_res.json()
+
+            unconfirmed_txs = mempool.get('count', 'N/A')
+            fastest_fee = fees.get('fastestFee', 'N/A')
+            half_hour_fee = fees.get('halfHourFee', 'N/A')
+            hour_fee = fees.get('hourFee', 'N/A')
+            
+            return (f"📡 <b>Статус сети Bitcoin:</b>\n\n"
+                    f"🧱 <b>Текущий блок:</b> <code>{height:,}</code>\n"
+                    f"📈 <b>Неподтвержденные транзакции:</b> <code>{unconfirmed_txs:,}</code>\n\n"
+                    f"💸 <b>Рекомендуемые комиссии (sat/vB):</b>\n"
+                    f"  - 🚀 <b>Высокий приоритет:</b> <code>{fastest_fee}</code>\n"
+                    f"  - 🚶‍♂️ <b>Средний приоритет:</b> <code>{half_hour_fee}</code>\n"
+                    f"  - 🐢 <b>Низкий приоритет:</b> <code>{hour_fee}</code>")
+
+        except Exception as e:
+            logger.error(f"Ошибка получения статуса сети Bitcoin: {e}")
+            return "[❌ Не удалось получить данные о сети Bitcoin.]"
+
+
     def get_new_quiz_questions(self):
         try:
             url = f"https://opentdb.com/api.php?amount={Config.QUIZ_QUESTIONS_COUNT}&type=multiple"
@@ -262,7 +293,6 @@ class ApiHandler:
         except Exception as e: logger.error(f"Не удалось загрузить вопросы для викторины: {e}"); return None
 
 class GameLogic:
-    """Инкапсулирует всю логику, связанную с игрой 'симулятор майнинга'."""
     def __init__(self, data_file):
         self.data_file = data_file
         self.user_rigs = self.load_data()
@@ -349,7 +379,7 @@ class GameLogic:
 
     def upgrade_rig(self, user_id):
         rig = self.user_rigs.get(user_id)
-        if not rig: return "� У вас нет фермы. Начните с <code>/my_rig</code>."
+        if not rig: return "🤔 У вас нет фермы. Начните с <code>/my_rig</code>."
         
         next_level = rig['level'] + 1
         cost = Config.UPGRADE_COSTS.get(next_level)
@@ -387,7 +417,6 @@ class GameLogic:
             return f"\n\n🎁 За отличный результат вам начислено <b>{Config.QUIZ_REWARD:.4f} BTC!</b>"
         return f"\n\n🎁 Вы бы получили <b>{Config.QUIZ_REWARD:.4f} BTC</b>, если бы у вас была ферма! Начните с <code>/my_rig</code>."
 
-# --- Инициализация классов логики ---
 api = ApiHandler()
 game = GameLogic(Config.DATA_FILE)
 
@@ -396,7 +425,11 @@ game = GameLogic(Config.DATA_FILE)
 # ========================================================================================
 def get_main_keyboard():
     markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
-    buttons = ["💹 Курс", "⚙️ Топ-5 ASIC", "⛏️ Калькулятор", "📰 Новости", "😱 Индекс Страха", "⏳ Халвинг", "🧠 Викторина", "🎓 Слово дня", "🏆 Топ майнеров", "🛍️ Магазин"]
+    buttons = [
+        "💹 Курс", "⚙️ Топ-5 ASIC", "⛏️ Калькулятор", "📰 Новости", 
+        "😱 Индекс Страха", "⏳ Халвинг", "📡 Статус BTC", "🧠 Викторина", 
+        "🎓 Слово дня", "🏆 Топ майнеров", "🛍️ Магазин"
+    ]
     markup.add(*[types.KeyboardButton(text) for text in buttons])
     return markup
 
@@ -478,10 +511,15 @@ def handle_fear_and_greed(msg): bot.send_message(msg.chat.id, "⏳ Генери�
 @bot.message_handler(func=lambda msg: msg.text == "⏳ Халвинг", content_types=['text'])
 def handle_halving(msg): send_message_with_partner_button(msg.chat.id, api.get_halving_info())
 
+@bot.message_handler(func=lambda msg: msg.text == "📡 Статус BTC", content_types=['text'])
+def handle_btc_status(msg):
+    bot.send_message(msg.chat.id, "⏳ Получаю данные о сети Bitcoin...")
+    status_text = api.get_btc_network_status()
+    send_message_with_partner_button(msg.chat.id, status_text)
+
 @bot.message_handler(commands=['gas'])
 def handle_gas(msg): send_message_with_partner_button(msg.chat.id, api.get_eth_gas_price())
 
-# --- Обработчики игровых команд ---
 @bot.message_handler(commands=['my_rig'])
 def handle_my_rig(msg): send_message_with_partner_button(msg.chat.id, game.get_rig_info(msg.from_user.id, msg.from_user.first_name))
 
@@ -500,7 +538,6 @@ def handle_shop(msg): send_message_with_partner_button(msg.chat.id, f"🛍️ <b
 @bot.message_handler(commands=['buy_boost'])
 def handle_buy_boost(msg): send_message_with_partner_button(msg.chat.id, game.buy_boost(msg.from_user.id))
 
-# --- Обработчики развлекательных команд ---
 @bot.message_handler(func=lambda msg: msg.text == "🎓 Слово дня", content_types=['text'])
 def handle_word_of_the_day(msg):
     term = random.choice(Config.CRYPTO_TERMS)
@@ -553,7 +590,6 @@ def handle_quiz_answer(call):
     state['question_index'] += 1; time.sleep(1.5); send_quiz_question(call.message.chat.id, user_id)
     bot.answer_callback_query(call.id)
 
-# --- Обработчик для всех остальных текстовых сообщений ---
 @bot.message_handler(content_types=['text'])
 def handle_other_text(msg):
     try:
