@@ -159,39 +159,83 @@ class ApiHandler:
             except Exception: continue
         logger.error(f"Не удалось получить цену для {ticker}."); return (None, None)
 
-    def get_top_asics(self, force_update: bool = False):
-        if not force_update and self.asic_cache.get("data") and (datetime.now() - self.asic_cache.get("timestamp", datetime.min) < timedelta(hours=1)):
-            return self.asic_cache.get("data")
+    def _get_asics_from_api(self):
+        """Основной метод: получение данных с API minerstat."""
         try:
-            # ИСПРАВЛЕНО: Убран ненужный токен из запроса к публичному API
             url = "https://api.minerstat.com/v2/hardware"
             r = requests.get(url, timeout=15)
             r.raise_for_status()
             all_hardware = r.json()
             
-            sha256_asics = []
-            for device in all_hardware:
-                if device.get("type") == "asic" and "SHA-256" in device.get("algorithms", {}):
-                    algo_data = device["algorithms"]["SHA-256"]
-                    revenue_str = algo_data.get("revenue_in_usd", "0").replace("$","")
-                    if float(revenue_str) > 0:
-                        sha256_asics.append({
-                            'name': device.get("name", "N/A"),
-                            'hashrate': f"{float(algo_data.get('speed', 0)) / 1e12:.2f} TH/s",
-                            'power_watts': float(algo_data.get("power", 0)),
-                            'daily_revenue': float(revenue_str)
-                        })
-
+            sha256_asics = [
+                {
+                    'name': device.get("name", "N/A"),
+                    'hashrate': f"{float(device['algorithms']['SHA-256'].get('speed', 0)) / 1e12:.2f} TH/s",
+                    'power_watts': float(device['algorithms']['SHA-256'].get("power", 0)),
+                    'daily_revenue': float(device['algorithms']['SHA-256'].get("revenue_in_usd", "0").replace("$",""))
+                }
+                for device in all_hardware
+                if device.get("type") == "asic" and "SHA-256" in device.get("algorithms", {}) and float(device['algorithms']['SHA-256'].get("revenue_in_usd", "0").replace("$","")) > 0
+            ]
             if not sha256_asics: raise ValueError("Не найдено доходных SHA-256 ASIC в API.")
-            
-            sorted_asics = sorted(sha256_asics, key=lambda x: x['daily_revenue'], reverse=True)
-            self.asic_cache = {"data": sorted_asics[:5], "timestamp": datetime.now()}
-            logger.info(f"Успешно получено {len(self.asic_cache['data'])} ASIC из API minerstat.")
-            return self.asic_cache["data"]
+            return sorted(sha256_asics, key=lambda x: x['daily_revenue'], reverse=True)
         except Exception as e:
-            logger.error(f"Не удалось получить данные по ASIC из API: {e}", exc_info=True)
-            return []
+            logger.warning(f"Ошибка при получении ASIC с API minerstat: {e}")
+            return None
 
+    def _get_asics_from_scraping(self):
+        """Резервный метод: парсинг сайта asicminervalue.com."""
+        try:
+            r = requests.get("https://www.asicminervalue.com", timeout=15); r.raise_for_status()
+            soup = BeautifulSoup(r.text, "lxml")
+            
+            table = soup.find("table", id=re.compile(r'sha-256', re.I))
+            if not table:
+                header = soup.find('h2', string=re.compile(r'SHA-256', re.I))
+                if header: table = header.find_next('table')
+            if not table: return None
+            
+            parsed_asics = []
+            for row in table.select("tbody tr"):
+                cols = row.find_all("td")
+                if len(cols) < 5: continue
+                name_tag = cols[1].find('a')
+                if not name_tag: continue
+                
+                power_match = re.search(r'([\d,]+)', cols[3].get_text(strip=True))
+                revenue_match = re.search(r'([\d\.]+)', cols[4].get_text(strip=True).replace('$', ''))
+                if power_match and revenue_match:
+                    parsed_asics.append({
+                        'name': name_tag.get_text(strip=True), 
+                        'hashrate': cols[2].get_text(strip=True), 
+                        'power_watts': float(power_match.group(1).replace(',', '')), 
+                        'daily_revenue': float(revenue_match.group(1))
+                    })
+            if not parsed_asics: raise ValueError("Не удалось распарсить данные.")
+            return sorted(parsed_asics, key=lambda x: x['daily_revenue'], reverse=True)
+        except Exception as e:
+            logger.error(f"Ошибка при парсинге ASIC: {e}", exc_info=True)
+            return None
+
+    def get_top_asics(self, force_update: bool = False):
+        if not force_update and self.asic_cache.get("data") and (datetime.now() - self.asic_cache.get("timestamp", datetime.min) < timedelta(hours=1)):
+            return self.asic_cache.get("data")
+
+        logger.info("Пытаюсь получить данные об ASIC из API...")
+        asics = self._get_asics_from_api()
+        
+        if not asics:
+            logger.warning("API не вернул данные, переключаюсь на парсинг сайта...")
+            asics = self._get_asics_from_scraping()
+
+        if asics:
+            self.asic_cache = {"data": asics[:5], "timestamp": datetime.now()}
+            logger.info(f"Успешно получено {len(self.asic_cache['data'])} ASIC.")
+            return self.asic_cache["data"]
+        else:
+            logger.error("Не удалось получить данные об ASIC ни из одного источника.")
+            return []
+            
     def get_fear_and_greed_index(self):
         try:
             data = requests.get("https://api.alternative.me/fng/?limit=1", timeout=5).json()['data'][0]
