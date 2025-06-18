@@ -91,9 +91,11 @@ class Config:
     SPAM_KEYWORDS = ['p2p', 'арбитраж', 'обмен', 'сигналы', 'обучение', 'заработок', 'инвестиции']
     
     FALLBACK_ASICS = [
-        {'name': 'Antminer S19 Pro', 'hashrate': '110.00 TH/s', 'power_watts': 3250.0, 'daily_revenue': 10.50},
-        {'name': 'Whatsminer M30S++', 'hashrate': '112.00 TH/s', 'power_watts': 3472.0, 'daily_revenue': 10.70},
-        {'name': 'Canaan AvalonMade A1246', 'hashrate': '90.00 TH/s', 'power_watts': 3420.0, 'daily_revenue': 8.50}
+        {'name': 'Antminer S21', 'hashrate': '200.00 TH/s', 'power_watts': 3550.0, 'daily_revenue': 11.50},
+        {'name': 'Whatsminer M60S', 'hashrate': '186.00 TH/s', 'power_watts': 3441.0, 'daily_revenue': 10.80},
+        {'name': 'Antminer S19k Pro', 'hashrate': '120.00 TH/s', 'power_watts': 2760.0, 'daily_revenue': 6.50},
+        {'name': 'Antminer S19 Pro', 'hashrate': '110.00 TH/s', 'power_watts': 3250.0, 'daily_revenue': 5.80},
+        {'name': 'Whatsminer M50', 'hashrate': '120.00 TH/s', 'power_watts': 3240.0, 'daily_revenue': 6.40}
     ]
 
 # --- Инициализация клиентов ---
