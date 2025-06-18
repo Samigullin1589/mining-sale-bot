@@ -50,6 +50,7 @@ class Config:
     SHEET_NAME = os.getenv("SHEET_NAME", "Лист1")
     GAME_DATA_FILE = "game_data.json"
     PROFILES_DATA_FILE = "user_profiles.json"
+    ASIC_CACHE_FILE = "asic_data_cache.json" 
 
     if not BOT_TOKEN:
         logger.critical("Критическая ошибка: TG_BOT_TOKEN не установлен.")
@@ -68,7 +69,7 @@ class Config:
         "⛏️ Рассчитайте прибыль с помощью 'Калькулятора'", "📰 Хотите свежие крипто-новости?",
         "🤑 Попробуйте наш симулятор майнинга!", "😱 Проверьте Индекс Страха и Жадности",
         "🏆 Сравните себя с лучшими в таблице лидеров", "🎓 Что такое 'HODL'? Узнайте: `/word`",
-        "🧠 Проверьте знания и заработайте в `/quiz`", "🛍️ Загляните в магазин улучшений: `/shop`"
+        "🧠 Проверьте знания и заработайте в `/quiz`", "🛍️ Загляните в магазин улучшений"
     ]
     HALVING_INTERVAL = 210000
 
@@ -126,28 +127,44 @@ user_quiz_states = {}
 # ========================================================================================
 class ApiHandler:
     def __init__(self):
-        self.asic_cache = {"data": [], "timestamp": None}
+        self.asic_cache = self._load_asic_cache_from_file()
         self.currency_cache = {"rate": None, "timestamp": None}
-    
+        atexit.register(self._save_asic_cache_to_file)
+
+    def _load_asic_cache_from_file(self):
+        try:
+            if os.path.exists(Config.ASIC_CACHE_FILE):
+                with open(Config.ASIC_CACHE_FILE, 'r', encoding='utf-8') as f:
+                    cache = json.load(f)
+                    cache["timestamp"] = datetime.fromisoformat(cache["timestamp"])
+                    logger.info("Локальный кэш ASIC успешно загружен.")
+                    return cache
+        except Exception as e:
+            logger.error(f"Не удалось загрузить локальный кэш ASIC: {e}")
+        return {"data": [], "timestamp": None}
+
+    def _save_asic_cache_to_file(self):
+        try:
+            with open(Config.ASIC_CACHE_FILE, 'w', encoding='utf-8') as f:
+                cache_to_save = self.asic_cache.copy()
+                if cache_to_save.get("timestamp"):
+                    cache_to_save["timestamp"] = cache_to_save["timestamp"].isoformat()
+                json.dump(cache_to_save, f, indent=4)
+            logger.info("Локальный кэш ASIC успешно сохранен.")
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении локального кэша ASIC: {e}")
+
     def get_gsheet(self):
         try:
-            if not Config.GOOGLE_JSON_STR or not Config.GOOGLE_JSON_STR.strip():
-                logger.warning("Переменная GOOGLE_JSON не установлена или пуста. Работа с Google Sheets будет пропущена.")
-                return None
-            
+            if not Config.GOOGLE_JSON_STR or not Config.GOOGLE_JSON_STR.strip(): return None
             if not Config.GOOGLE_JSON_STR.strip().startswith('{'):
-                 logger.error("Переменная GOOGLE_JSON не является валидным JSON объектом. Она должна начинаться с '{'.")
+                 logger.error("Переменная GOOGLE_JSON не является валидным JSON объектом.")
                  return None
-
             creds_dict = json.loads(Config.GOOGLE_JSON_STR)
             creds = Credentials.from_service_account_info(creds_dict, scopes=['https://www.googleapis.com/auth/spreadsheets'])
             return gspread.authorize(creds).open_by_key(Config.SHEET_ID).worksheet(Config.SHEET_NAME)
-        except json.JSONDecodeError as e:
-            logger.error(f"Ошибка декодирования JSON из переменной GOOGLE_JSON: {e}. Убедитесь, что переменная содержит корректный JSON.")
-            return None
         except Exception as e:
-            logger.error(f"Общая ошибка подключения к Google Sheets: {e}", exc_info=True)
-            return None
+            logger.error(f"Ошибка подключения к Google Sheets: {e}", exc_info=True); return None
 
     def log_to_sheet(self, row_data: list):
         try:
@@ -188,8 +205,7 @@ class ApiHandler:
     def _get_asics_from_api(self):
         try:
             url = "https://api.minerstat.com/v2/hardware"
-            r = requests.get(url, timeout=15)
-            r.raise_for_status()
+            r = requests.get(url, timeout=15); r.raise_for_status()
             all_hardware = r.json()
             sha256_asics = [
                 {
@@ -205,8 +221,7 @@ class ApiHandler:
             if not profitable_asics: raise ValueError("Не найдено доходных SHA-256 ASIC в API.")
             return sorted(profitable_asics, key=lambda x: x['daily_revenue'], reverse=True)
         except Exception as e:
-            logger.warning(f"Ошибка при получении ASIC с API minerstat: {e}")
-            return None
+            logger.warning(f"Ошибка при получении ASIC с API minerstat: {e}"); return None
 
     def _get_asics_from_scraping(self):
         try:
@@ -217,28 +232,23 @@ class ApiHandler:
                 header = soup.find('h2', string=re.compile(r'SHA-256', re.I))
                 if header: table = header.find_next('table')
             if not table: return None
-            
             parsed_asics = []
             for row in table.select("tbody tr"):
                 cols = row.find_all("td")
-                if len(cols) < 5: continue
-                name_tag = cols[1].find('a')
-                if not name_tag: continue
-                
-                power_match = re.search(r'([\d,]+)', cols[3].get_text(strip=True))
-                revenue_match = re.search(r'([\d\.]+)', cols[4].get_text(strip=True).replace('$', ''))
-                if power_match and revenue_match:
+                if len(cols) < 5 or not cols[1].find('a'): continue
+                power = re.search(r'([\d,]+)', cols[3].get_text(strip=True))
+                revenue = re.search(r'([\d\.]+)', cols[4].get_text(strip=True).replace('$', ''))
+                if power and revenue:
                     parsed_asics.append({
-                        'name': name_tag.get_text(strip=True), 
+                        'name': cols[1].find('a').get_text(strip=True), 
                         'hashrate': cols[2].get_text(strip=True), 
-                        'power_watts': float(power_match.group(1).replace(',', '')), 
-                        'daily_revenue': float(revenue_match.group(1))
+                        'power_watts': float(power.group(1).replace(',', '')), 
+                        'daily_revenue': float(revenue.group(1))
                     })
             if not parsed_asics: raise ValueError("Не удалось распарсить данные.")
             return sorted(parsed_asics, key=lambda x: x['daily_revenue'], reverse=True)
         except Exception as e:
-            logger.error(f"Ошибка при парсинге ASIC: {e}", exc_info=True)
-            return None
+            logger.error(f"Ошибка при парсинге ASIC: {e}", exc_info=True); return None
 
     def get_top_asics(self, force_update: bool = False):
         if not force_update and self.asic_cache.get("data") and (datetime.now() - self.asic_cache.get("timestamp", datetime.min) < timedelta(hours=1)):
@@ -251,17 +261,17 @@ class ApiHandler:
             logger.warning("API не вернул данные, переключаюсь на парсинг сайта...")
             asics = self._get_asics_from_scraping()
 
-        if not asics:
-            logger.error("Все онлайн-источники недоступны, использую резервный список ASIC.")
-            asics = Config.FALLBACK_ASICS
-
         if asics:
             self.asic_cache = {"data": asics[:5], "timestamp": datetime.now()}
-            logger.info(f"Успешно получено {len(self.asic_cache['data'])} ASIC.")
+            logger.info(f"Успешно получено {len(self.asic_cache['data'])} ASIC из онлайн-источников.")
             return self.asic_cache["data"]
         
-        logger.error("Не удалось получить данные об ASIC ни из одного источника, включая резервный.")
-        return []
+        if self.asic_cache.get("data"):
+            logger.error("Все онлайн-источники недоступны, использую данные из локального кэша.")
+            return self.asic_cache.get("data")
+        
+        logger.error("Все онлайн-источники и кэш недоступны, использую аварийный список ASIC.")
+        return Config.FALLBACK_ASICS
             
     def get_fear_and_greed_index(self):
         try:
@@ -407,15 +417,14 @@ class GameLogic:
         if user_id in self.user_rigs:
             return "У вас уже есть ферма!"
         
+        btc_price, _ = api.get_crypto_price("BTC")
+        if not btc_price: btc_price = 60000 
+        
         self.user_rigs[user_id] = {
-            'last_collected': None, 
-            'balance': 0.0, 
-            'level': 1, 
-            'streak': 0, 
-            'name': user_name, 
-            'boost_active_until': None,
+            'last_collected': None, 'balance': 0.0, 'level': 1, 'streak': 0, 
+            'name': user_name, 'boost_active_until': None,
             'asic_model': asic_data['name'],
-            'base_rate': asic_data['daily_revenue'] / (api.get_crypto_price("BTC")[0] or 60000) # Примерный расчет
+            'base_rate': asic_data['daily_revenue'] / btc_price
         }
         return f"🎉 Поздравляем! Ваша ферма с <b>{asic_data['name']}</b> успешно создана!"
 
@@ -427,9 +436,10 @@ class GameLogic:
                 return "К сожалению, сейчас не удается получить список оборудования для старта. Попробуйте позже.", None
             
             markup = types.InlineKeyboardMarkup(row_width=1)
+            choices = random.sample(starter_asics, k=min(3, len(starter_asics)))
             buttons = [
                 types.InlineKeyboardButton(f"Выбрать {asic['name']}", callback_data=f"start_rig_{i}")
-                for i, asic in enumerate(starter_asics[:3])
+                for i, asic in enumerate(choices)
             ]
             markup.add(*buttons)
             return "Добро пожаловать! Давайте создадим вашу первую виртуальную ферму. Выберите, с какого ASIC вы хотите начать:", markup
@@ -810,24 +820,6 @@ def handle_game_callbacks(call):
     elif action == 'upgrade':
         response_text = game.upgrade_rig(user_id)
         bot.answer_callback_query(call.id, "Попытка улучшения...")
-    elif action == 'rig':
-        bot.answer_callback_query(call.id)
-    elif action == 'top':
-        edit_menu = False
-        response_text = game.get_top_miners()
-        bot.answer_callback_query(call.id)
-    elif action == 'shop':
-        edit_menu = False
-        response_text = (f"🛍️ <b>Магазин улучшений</b>\n\nЗдесь вы можете потратить заработанные BTC, чтобы ускорить свой прогресс!\n\n"
-                f"<b>1. Энергетический буст (x2)</b>\n"
-                f"<i>Удваивает всю вашу добычу на 24 часа.</i>\n"
-                f"<b>Стоимость:</b> <code>{Config.BOOST_COST}</code> BTC\n\n"
-                f"Для покупки используйте команду <code>/buy_boost</code>")
-        bot.answer_callback_query(call.id)
-    elif action == 'withdraw':
-        edit_menu = False
-        response_text = random.choice(Config.PARTNER_AD_TEXT_OPTIONS)
-        bot.answer_callback_query(call.id)
     
     if response_text and not edit_menu:
         send_message_with_partner_button(message.chat.id, response_text)
