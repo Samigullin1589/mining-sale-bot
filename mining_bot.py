@@ -82,8 +82,19 @@ class Config:
         {"question": "Какая криптовалюта является второй по рыночной капитализации после Bitcoin?", "options": ["Solana", "Ripple (XRP)", "Cardano", "Ethereum"], "correct_index": 3},
         {"question": "Что означает 'HODL' в крипто-сообществе?", "options": ["Продавать при падении", "Держать актив долгосрочно", "Быстрая спекуляция", "Обмен одной монеты на другую"], "correct_index": 1},
         {"question": "Как называется самая маленькая неделимая часть Bitcoin?", "options": ["Цент", "Гвей", "Сатоши", "Копейка"], "correct_index": 2},
+        {"question": "Что такое 'газ' в сети Ethereum?", "options": ["Топливо для серверов", "Комиссия за транзакцию/операцию", "Скрытый налог", "Название обновления сети"], "correct_index": 1},
+        {"question": "Какой алгоритм консенсуса использует Bitcoin?", "options": ["Proof-of-Stake (PoS)", "Proof-of-Authority (PoA)", "Proof-of-Work (PoW)", "Delegated Proof-of-Stake (DPoS)"], "correct_index": 2},
+        {"question": "Что такое NFT (Non-Fungible Token)?", "options": ["Новый вид криптовалюты", "Уникальный цифровой сертификат", "Протокол шифрования", "Финансовый дериватив"], "correct_index": 1},
+        {"question": "Какой из этих кошельков является 'холодным'?", "options": ["MetaMask", "Trust Wallet", "Ledger Nano S", "Exodus"], "correct_index": 2},
+        {"question": "Что такое 'смарт-контракт'?", "options": ["Юридический документ", "Программа, работающая в блокчейне", "Шаблон для создания токенов", "Тип биржевого ордера"], "correct_index": 1},
     ]
     SPAM_KEYWORDS = ['p2p', 'арбитраж', 'обмен', 'сигналы', 'обучение', 'заработок', 'инвестиции']
+    
+    FALLBACK_ASICS = [
+        {'name': 'Antminer S19 Pro', 'hashrate': '110.00 TH/s', 'power_watts': 3250.0, 'daily_revenue': 10.50},
+        {'name': 'Whatsminer M30S++', 'hashrate': '112.00 TH/s', 'power_watts': 3472.0, 'daily_revenue': 10.70},
+        {'name': 'Canaan AvalonMade A1246', 'hashrate': '90.00 TH/s', 'power_watts': 3420.0, 'daily_revenue': 8.50}
+    ]
 
 # --- Инициализация клиентов ---
 class ExceptionHandler(telebot.ExceptionHandler):
@@ -160,13 +171,11 @@ class ApiHandler:
         logger.error(f"Не удалось получить цену для {ticker}."); return (None, None)
 
     def _get_asics_from_api(self):
-        """Основной метод: получение данных с API minerstat."""
         try:
             url = "https://api.minerstat.com/v2/hardware"
             r = requests.get(url, timeout=15)
             r.raise_for_status()
             all_hardware = r.json()
-            
             sha256_asics = [
                 {
                     'name': device.get("name", "N/A"),
@@ -175,20 +184,19 @@ class ApiHandler:
                     'daily_revenue': float(device['algorithms']['SHA-256'].get("revenue_in_usd", "0").replace("$",""))
                 }
                 for device in all_hardware
-                if device.get("type") == "asic" and "SHA-256" in device.get("algorithms", {}) and float(device['algorithms']['SHA-256'].get("revenue_in_usd", "0").replace("$","")) > 0
+                if isinstance(device, dict) and device.get("type") == "asic" and "SHA-256" in device.get("algorithms", {})
             ]
-            if not sha256_asics: raise ValueError("Не найдено доходных SHA-256 ASIC в API.")
-            return sorted(sha256_asics, key=lambda x: x['daily_revenue'], reverse=True)
+            profitable_asics = [asic for asic in sha256_asics if asic['daily_revenue'] > 0]
+            if not profitable_asics: raise ValueError("Не найдено доходных SHA-256 ASIC в API.")
+            return sorted(profitable_asics, key=lambda x: x['daily_revenue'], reverse=True)
         except Exception as e:
             logger.warning(f"Ошибка при получении ASIC с API minerstat: {e}")
             return None
 
     def _get_asics_from_scraping(self):
-        """Резервный метод: парсинг сайта asicminervalue.com."""
         try:
             r = requests.get("https://www.asicminervalue.com", timeout=15); r.raise_for_status()
             soup = BeautifulSoup(r.text, "lxml")
-            
             table = soup.find("table", id=re.compile(r'sha-256', re.I))
             if not table:
                 header = soup.find('h2', string=re.compile(r'SHA-256', re.I))
@@ -228,13 +236,17 @@ class ApiHandler:
             logger.warning("API не вернул данные, переключаюсь на парсинг сайта...")
             asics = self._get_asics_from_scraping()
 
+        if not asics:
+            logger.error("Все онлайн-источники недоступны, использую резервный список ASIC.")
+            asics = Config.FALLBACK_ASICS
+
         if asics:
             self.asic_cache = {"data": asics[:5], "timestamp": datetime.now()}
             logger.info(f"Успешно получено {len(self.asic_cache['data'])} ASIC.")
             return self.asic_cache["data"]
-        else:
-            logger.error("Не удалось получить данные об ASIC ни из одного источника.")
-            return []
+        
+        logger.error("Не удалось получить данные об ASIC ни из одного источника, включая резервный.")
+        return []
             
     def get_fear_and_greed_index(self):
         try:
@@ -520,14 +532,19 @@ class SpamAnalyzer:
 
         spam_factor = (profile['spam_count'] / profile['msg_count'] * 100) if profile['msg_count'] > 0 else 0
         
-        return (f"Информация о пользователе:\n\n"
-                f"🔹 <code>user_id</code>: {profile['user_id']}\n"
-                f"🔸 <code>name</code>: {telebot.util.escape(profile.get('name', 'N/A'))}\n"
-                f"🔸 <code>username</code>: @{profile.get('username', 'N/A')}\n"
-                f"🔹 <code>first_msg</code>: {datetime.fromisoformat(profile['first_msg']).strftime('%d %b %Y, %H:%M')}\n"
-                f"🔸 <code>spam_count</code>: {profile['spam_count']} (фактор: {spam_factor:.2f}%)\n"
-                f"🔹 <code>lols_ban</code>: {'Да' if profile['lols_ban'] else 'Нет'}\n"
-                f"🔸 <code>cas_ban</code>: {'Да' if profile['cas_ban'] else 'Нет'}\n")
+        return (f"ℹ️ <b>Информация о пользователе</b>\n\n"
+                f"🔹 <b>user_id:</b> <code>{profile['user_id']}</code>\n"
+                f"<i>Уникальный номер, не меняется.</i>\n\n"
+                f"🔸 <b>name:</b> {telebot.util.escape(profile.get('name', 'N/A'))}\n"
+                f"🔸 <b>username:</b> @{profile.get('username', 'N/A')}\n"
+                f"<i>Имя и юзернейм, могут меняться.</i>\n\n"
+                f"🔹 <b>first_msg:</b> {datetime.fromisoformat(profile['first_msg']).strftime('%d %b %Y, %H:%M')}\n"
+                f"<i>Первое сообщение, увиденное ботом.</i>\n\n"
+                f"🔸 <b>spam_count:</b> {profile['spam_count']} (фактор: {spam_factor:.2f}%)\n"
+                f"<i>Количество сообщений, похожих на спам.</i>\n\n"
+                f"🔹 <b>lols_ban:</b> {'Да' if profile['lols_ban'] else 'Нет'}\n"
+                f"🔸 <b>cas_ban:</b> {'Да' if profile['cas_ban'] else 'Нет'}\n"
+                f"<i>Наличие в глобальных бан-листах.</i>")
 
 api = ApiHandler()
 game = GameLogic(Config.GAME_DATA_FILE)
