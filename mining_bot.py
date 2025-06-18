@@ -76,6 +76,13 @@ class Config:
     QUIZ_MIN_CORRECT_FOR_REWARD = 3
     QUIZ_QUESTIONS_COUNT = 5
     
+    QUIZ_QUESTIONS = [
+        {"question": "Кто является анонимным создателем Bitcoin?", "options": ["Виталик Бутерин", "Сатоши Накамото", "Чарли Ли", "Илон Маск"], "correct_index": 1},
+        {"question": "Как называется процесс уменьшения награды за блок в сети Bitcoin в два раза?", "options": ["Форк", "Аирдроп", "Халвинг", "Сжигание"], "correct_index": 2},
+        {"question": "Какая криптовалюта является второй по рыночной капитализации после Bitcoin?", "options": ["Solana", "Ripple (XRP)", "Cardano", "Ethereum"], "correct_index": 3},
+        {"question": "Что означает 'HODL' в крипто-сообществе?", "options": ["Продавать при падении", "Держать актив долгосрочно", "Быстрая спекуляция", "Обмен одной монеты на другую"], "correct_index": 1},
+        {"question": "Как называется самая маленькая неделимая часть Bitcoin?", "options": ["Цент", "Гвей", "Сатоши", "Копейка"], "correct_index": 2},
+    ]
     SPAM_KEYWORDS = ['p2p', 'арбитраж', 'обмен', 'сигналы', 'обучение', 'заработок', 'инвестиции']
     
     FALLBACK_ASICS = [
@@ -456,7 +463,7 @@ class GameLogic:
 
     def buy_boost(self, user_id):
         rig = self.user_rigs.get(user_id)
-        if not rig: return "� У вас нет фермы."
+        if not rig: return "🤔 У вас нет фермы."
         boost_until = rig.get('boost_active_until')
         boost_until_dt = datetime.fromisoformat(boost_until) if isinstance(boost_until, str) else boost_until
         if boost_until_dt and datetime.now() < boost_until_dt: return "У вас уже активен буст!"
@@ -809,4 +816,3 @@ if __name__ == '__main__':
         logger.info("Режим: long-polling.")
         bot.remove_webhook()
         bot.polling(none_stop=True)
-�
