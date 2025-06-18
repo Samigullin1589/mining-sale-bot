@@ -43,12 +43,14 @@ class Config:
     WEBHOOK_URL = os.getenv("WEBHOOK_URL")
     CRYPTO_API_KEY = os.getenv("CRYPTO_API_KEY")
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    MINERSTAT_API_KEY = os.getenv("MINERSTAT_API_KEY") # Добавлен ключ для Minerstat
     NEWS_CHAT_ID = os.getenv("NEWS_CHAT_ID")
     ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
     GOOGLE_JSON_STR = os.getenv("GOOGLE_JSON")
     SHEET_ID = os.getenv("SHEET_ID")
     SHEET_NAME = os.getenv("SHEET_NAME", "Лист1")
-    DATA_FILE = "user_data.json"
+    GAME_DATA_FILE = "game_data.json"
+    PROFILES_DATA_FILE = "user_profiles.json"
 
     if not BOT_TOKEN:
         logger.critical("Критическая ошибка: TG_BOT_TOKEN не установлен.")
@@ -74,6 +76,15 @@ class Config:
     QUIZ_REWARD = 0.0001
     QUIZ_MIN_CORRECT_FOR_REWARD = 3
     QUIZ_QUESTIONS_COUNT = 5
+    
+    QUIZ_QUESTIONS = [
+        {"question": "Кто является анонимным создателем Bitcoin?", "options": ["Виталик Бутерин", "Сатоши Накамото", "Чарли Ли", "Илон Маск"], "correct_index": 1},
+        {"question": "Как называется процесс уменьшения награды за блок в сети Bitcoin в два раза?", "options": ["Форк", "Аирдроп", "Халвинг", "Сжигание"], "correct_index": 2},
+        {"question": "Какая криптовалюта является второй по рыночной капитализации после Bitcoin?", "options": ["Solana", "Ripple (XRP)", "Cardano", "Ethereum"], "correct_index": 3},
+        {"question": "Что означает 'HODL' в крипто-сообществе?", "options": ["Продавать при падении", "Держать актив долгосрочно", "Быстрая спекуляция", "Обмен одной монеты на другую"], "correct_index": 1},
+        {"question": "Как называется самая маленькая неделимая часть Bitcoin?", "options": ["Цент", "Гвей", "Сатоши", "Копейка"], "correct_index": 2},
+    ]
+    SPAM_KEYWORDS = ['p2p', 'арбитраж', 'обмен', 'сигналы', 'обучение', 'заработок', 'инвестиции']
 
 # --- Инициализация клиентов ---
 class ExceptionHandler(telebot.ExceptionHandler):
@@ -97,7 +108,7 @@ except Exception as e:
 user_quiz_states = {}
 
 # ========================================================================================
-# 2. КЛАССЫ ЛОГИКИ (API, ИГРА)
+# 2. КЛАССЫ ЛОГИКИ (API, ИГРА, АНТИСПАМ)
 # ========================================================================================
 class ApiHandler:
     def __init__(self):
@@ -152,8 +163,14 @@ class ApiHandler:
     def get_top_asics(self, force_update: bool = False):
         if not force_update and self.asic_cache.get("data") and (datetime.now() - self.asic_cache.get("timestamp", datetime.min) < timedelta(hours=1)):
             return self.asic_cache.get("data")
+        
+        if not Config.MINERSTAT_API_KEY:
+            logger.error("Ключ MINERSTAT_API_KEY не установлен. Невозможно получить данные об ASIC.")
+            return []
+            
         try:
-            r = requests.get("https://api.minerstat.com/v2/hardware", timeout=15)
+            url = f"https://api.minerstat.com/v2/hardware?token={Config.MINERSTAT_API_KEY}"
+            r = requests.get(url, timeout=15)
             r.raise_for_status()
             all_hardware = r.json()
             
@@ -161,23 +178,23 @@ class ApiHandler:
             for device in all_hardware:
                 if device.get("type") == "asic" and "SHA-256" in device.get("algorithms", {}):
                     algo_data = device["algorithms"]["SHA-256"]
-                    revenue = float(algo_data.get("revenue_in_usd", "0").replace("$",""))
-                    if revenue > 0:
+                    revenue_str = algo_data.get("revenue_in_usd", "0").replace("$","")
+                    if float(revenue_str) > 0:
                         sha256_asics.append({
                             'name': device.get("name", "N/A"),
                             'hashrate': f"{float(algo_data.get('speed', 0)) / 1e12:.2f} TH/s",
                             'power_watts': float(algo_data.get("power", 0)),
-                            'daily_revenue': revenue
+                            'daily_revenue': float(revenue_str)
                         })
 
-            if not sha256_asics: raise ValueError("Не найдено ASIC с алгоритмом SHA-256 в API minerstat")
-
+            if not sha256_asics: raise ValueError("Не найдено доходных SHA-256 ASIC в API.")
+            
             sorted_asics = sorted(sha256_asics, key=lambda x: x['daily_revenue'], reverse=True)
             self.asic_cache = {"data": sorted_asics[:5], "timestamp": datetime.now()}
             logger.info(f"Успешно получено {len(self.asic_cache['data'])} ASIC из API minerstat.")
             return self.asic_cache["data"]
         except Exception as e:
-            logger.error(f"Не удалось получить данные по ASIC: {e}", exc_info=True)
+            logger.error(f"Не удалось получить данные по ASIC из API: {e}", exc_info=True)
             return []
 
     def get_fear_and_greed_index(self):
@@ -280,60 +297,12 @@ class ApiHandler:
             logger.error(f"Ошибка получения статуса сети Bitcoin: {e}")
             return "[❌ Не удалось получить данные о сети Bitcoin.]"
     
-    # ИЗМЕНЕНО: Функция получает вопросы с opentdb и переводит их с помощью GPT
     def get_new_quiz_questions(self):
         try:
-            # Категория 18 = Science: Computers. Она наиболее близка к крипте.
-            url = f"https://opentdb.com/api.php?amount={Config.QUIZ_QUESTIONS_COUNT}&category=18&type=multiple"
-            response = requests.get(url, timeout=10)
-            response.raise_for_status()
-            english_questions = response.json().get("results", [])
-
-            if not english_questions:
-                logger.error("API викторин не вернуло вопросов.")
-                return None
-
-            formatted_questions = []
-            for item in english_questions:
-                try:
-                    original_data = {
-                        "question": item['question'],
-                        "correct_answer": item['correct_answer'],
-                        "incorrect_answers": item['incorrect_answers']
-                    }
-                    
-                    prompt = f"""Переведи следующий JSON-объект с вопросом для викторины на русский язык. Твой ответ ДОЛЖЕН быть ТОЛЬКО валидным JSON-объектом с той же структурой и переведенными строками. Не добавляй никакого текста до или после JSON.
-
-Оригинальный JSON:
-{json.dumps(original_data, ensure_ascii=False)}
-
-Переведенный JSON:"""
-
-                    translated_json_str = self.ask_gpt(prompt, model="gpt-4o-mini")
-                    clean_json_str = re.sub(r'```(json)?|```', '', translated_json_str).strip()
-                    translated_data = json.loads(clean_json_str)
-
-                    question_text = BeautifulSoup(translated_data['question'], "html.parser").text
-                    correct_answer = BeautifulSoup(translated_data['correct_answer'], "html.parser").text
-                    options = [BeautifulSoup(o, "html.parser").text for o in translated_data['incorrect_answers']]
-                    
-                    options.append(correct_answer)
-                    random.shuffle(options)
-                    correct_index = options.index(correct_answer)
-
-                    formatted_questions.append({
-                        "question": question_text,
-                        "options": options,
-                        "correct_index": correct_index
-                    })
-                except (json.JSONDecodeError, KeyError) as e:
-                    logger.error(f"Не удалось обработать/перевести вопрос от GPT: {e}. Ответ GPT: '{translated_json_str}'")
-                    continue
-            
-            return formatted_questions if formatted_questions else None
-
+            count = min(Config.QUIZ_QUESTIONS_COUNT, len(Config.QUIZ_QUESTIONS))
+            return random.sample(Config.QUIZ_QUESTIONS, count)
         except Exception as e:
-            logger.error(f"Не удалось загрузить вопросы для викторины: {e}", exc_info=True)
+            logger.error(f"Не удалось выбрать вопросы для викторины: {e}")
             return None
 
 
@@ -462,8 +431,68 @@ class GameLogic:
             return f"\n\n🎁 За отличный результат вам начислено <b>{Config.QUIZ_REWARD:.4f} BTC!</b>"
         return f"\n\n🎁 Вы бы получили <b>{Config.QUIZ_REWARD:.4f} BTC</b>, если бы у вас была ферма! Начните с <code>/my_rig</code>."
 
+class SpamAnalyzer:
+    def __init__(self, data_file):
+        self.data_file = data_file
+        self.user_profiles = self.load_profiles()
+        atexit.register(self.save_profiles)
+
+    def load_profiles(self):
+        try:
+            if os.path.exists(self.data_file):
+                with open(self.data_file, 'r', encoding='utf-8') as f:
+                    return {int(k): v for k, v in json.load(f).items()}
+        except Exception as e:
+            logger.error(f"Не удалось загрузить профили пользователей: {e}")
+        return {}
+    
+    def save_profiles(self):
+        try:
+            with open(self.data_file, 'w', encoding='utf-8') as f:
+                json.dump(self.user_profiles, f, indent=4, ensure_ascii=False)
+            logger.info("Профили пользователей успешно сохранены.")
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении профилей пользователей: {e}")
+
+    def process_message(self, msg: types.Message):
+        user = msg.from_user
+        profile = self.user_profiles.setdefault(user.id, {
+            'user_id': user.id,
+            'name': user.full_name,
+            'username': user.username,
+            'first_msg': datetime.utcnow().isoformat(),
+            'msg_count': 0,
+            'spam_count': 0,
+            'lols_ban': False, 
+            'cas_ban': False, 
+        })
+        profile['msg_count'] += 1
+        profile['name'] = user.full_name
+        profile['username'] = user.username
+
+        text_lower = msg.text.lower() if msg.text else ''
+        if any(keyword in text_lower for keyword in Config.SPAM_KEYWORDS):
+            profile['spam_count'] += 1
+
+    def get_user_info_text(self, user_id: int) -> str:
+        profile = self.user_profiles.get(user_id)
+        if not profile:
+            return "🔹 Информация о пользователе не найдена. Возможно, он еще ничего не писал."
+
+        spam_factor = (profile['spam_count'] / profile['msg_count'] * 100) if profile['msg_count'] > 0 else 0
+        
+        return (f"Информация о пользователе:\n\n"
+                f"🔹 <code>user_id</code>: {profile['user_id']}\n"
+                f"🔸 <code>name</code>: {telebot.util.escape(profile.get('name', 'N/A'))}\n"
+                f"🔸 <code>username</code>: @{profile.get('username', 'N/A')}\n"
+                f"🔹 <code>first_msg</code>: {datetime.fromisoformat(profile['first_msg']).strftime('%d %b %Y, %H:%M')}\n"
+                f"🔸 <code>spam_count</code>: {profile['spam_count']} (фактор: {spam_factor:.2f}%)\n"
+                f"🔹 <code>lols_ban</code>: {'Да' if profile['lols_ban'] else 'Нет'}\n"
+                f"🔸 <code>cas_ban</code>: {'Да' if profile['cas_ban'] else 'Нет'}\n")
+
 api = ApiHandler()
-game = GameLogic(Config.DATA_FILE)
+game = GameLogic(Config.GAME_DATA_FILE)
+spam_analyzer = SpamAnalyzer(Config.PROFILES_DATA_FILE)
 
 # ========================================================================================
 # 4. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ БОТА
@@ -499,7 +528,24 @@ def send_photo_with_partner_button(chat_id, photo, caption):
 # ========================================================================================
 @bot.message_handler(commands=['start', 'help'])
 def handle_start_help(msg):
-    bot.send_message(msg.chat.id, "👋 Привет! Я ваш крипто-помощник.", reply_markup=get_main_keyboard())
+    bot.send_message(msg.chat.id, "👋 Привет! Я ваш крипто-помощник.\n\nДля проверки пользователя используйте команду <code>/userinfo</code>, ответив на его сообщение.", reply_markup=get_main_keyboard())
+
+@bot.message_handler(commands=['userinfo'])
+def handle_userinfo(msg):
+    target_id = None
+    if msg.reply_to_message:
+        target_id = msg.reply_to_message.from_user.id
+    else:
+        try:
+            target_id = int(msg.text.split()[1])
+        except (IndexError, ValueError):
+            bot.reply_to(msg, "Пожалуйста, ответьте на сообщение пользователя или укажите его ID после команды.")
+            return
+
+    if target_id:
+        info_text = spam_analyzer.get_user_info_text(target_id)
+        bot.send_message(msg.chat.id, info_text)
+
 
 @bot.message_handler(func=lambda msg: msg.text == "💹 Курс", content_types=['text'])
 def handle_price_request(msg):
@@ -592,11 +638,11 @@ def handle_word_of_the_day(msg):
 @bot.message_handler(func=lambda msg: msg.text == "🧠 Викторина", content_types=['text'])
 def handle_quiz(msg):
     bot.send_message(msg.chat.id, "⏳ Ищу интересные вопросы для викторины...")
-    questions = api.get_new_quiz_questions()
-    if not questions: return bot.send_message(msg.chat.id, "Не удалось загрузить вопросы. Попробуйте позже.", reply_markup=get_main_keyboard())
+    questions = Config.QUIZ_QUESTIONS
+    random.shuffle(questions)
     
-    user_quiz_states[msg.from_user.id] = {'score': 0, 'question_index': 0, 'questions': questions}
-    bot.send_message(msg.chat.id, f"🔥 <b>Начинаем крипто-викторину!</b>\nОтветьте на {len(questions)} вопросов.", reply_markup=types.ReplyKeyboardRemove())
+    user_quiz_states[msg.from_user.id] = {'score': 0, 'question_index': 0, 'questions': questions[:Config.QUIZ_QUESTIONS_COUNT]}
+    bot.send_message(msg.chat.id, f"🔥 <b>Начинаем крипто-викторину!</b>\nОтветьте на {Config.QUIZ_QUESTIONS_COUNT} вопросов.", reply_markup=types.ReplyKeyboardRemove())
     send_quiz_question(msg.chat.id, msg.from_user.id)
 
 def send_quiz_question(chat_id, user_id):
@@ -638,6 +684,7 @@ def handle_quiz_answer(call):
 @bot.message_handler(content_types=['text'])
 def handle_other_text(msg):
     try:
+        spam_analyzer.process_message(msg)
         text_lower = msg.text.lower()
         sale_words = ["продам", "купить", "в наличии"]; item_words = ["asic", "асик", "whatsminer", "antminer"]
         if any(w in text_lower for w in sale_words) and any(w in text_lower for w in item_words):
@@ -675,6 +722,7 @@ def run_scheduler():
     schedule.every(6).hours.do(auto_check_status)
     schedule.every(1).hours.do(api.get_top_asics, force_update=True)
     schedule.every(5).minutes.do(game.save_data)
+    schedule.every(5).minutes.do(spam_analyzer.save_profiles)
     
     logger.info("Планировщик запущен.")
     while True:
