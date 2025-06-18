@@ -75,7 +75,6 @@ class Config:
     QUIZ_MIN_CORRECT_FOR_REWARD = 3
     QUIZ_QUESTIONS_COUNT = 5
 
-
 # --- Инициализация клиентов ---
 class ExceptionHandler(telebot.ExceptionHandler):
     def handle(self, exception):
@@ -121,18 +120,14 @@ class ApiHandler:
         except Exception as e: logger.error(f"Ошибка записи в Google Sheets: {e}")
 
     def _sanitize_html(self, html_string: str) -> str:
-        # Улучшенная очистка HTML для Telegram
-        interim_html = re.sub(r'</?(div|p)[^>]*>', '\n', html_string, flags=re.I)
-        interim_html = re.sub(r'<br\s*/?>', '\n', interim_html, flags=re.I)
-        
-        soup = BeautifulSoup(interim_html, "html.parser")
-        allowed_tags = ['b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del', 'a', 'code', 'pre']
+        soup = BeautifulSoup(html_string, "html.parser")
+        allowed_tags = {'b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del', 'a', 'code', 'pre'}
         for tag in soup.find_all(True):
             if tag.name not in allowed_tags:
                 tag.unwrap()
-        
         clean_text = str(soup)
-        return re.sub(r'\n{3,}', '\n\n', clean_text).strip()
+        clean_text = re.sub(r'</?p>|<br\s*/?>', '\n', clean_text, flags=re.I)
+        return re.sub(r'\n{2,}', '\n\n', clean_text).strip()
 
     def ask_gpt(self, prompt: str, model: str = "gpt-4o"):
         if not openai_client: return "[❌ Ошибка: Клиент OpenAI не инициализирован.]"
@@ -155,50 +150,34 @@ class ApiHandler:
         logger.error(f"Не удалось получить цену для {ticker}."); return (None, None)
 
     def get_top_asics(self, force_update: bool = False):
-        if not force_update and self.asic_cache.get("data") and (datetime.now() - self.asic_cache.get("timestamp", datetime.min) < timedelta(hours=1)): return self.asic_cache.get("data")
+        if not force_update and self.asic_cache.get("data") and (datetime.now() - self.asic_cache.get("timestamp", datetime.min) < timedelta(hours=1)):
+            return self.asic_cache.get("data")
         try:
-            r = requests.get("https://www.asicminervalue.com", timeout=15); r.raise_for_status()
-            soup = BeautifulSoup(r.text, "lxml")
+            r = requests.get("https://api.minerstat.com/v2/hardware", timeout=15)
+            r.raise_for_status()
+            all_hardware = r.json()
             
-            table = soup.find("table", id=re.compile(r'sha-256', re.I))
-            if not table:
-                sha256_header = soup.find('h2', string=re.compile(r'SHA-256', re.I))
-                if sha256_header:
-                    table = sha256_header.find_next('table')
+            sha256_asics = []
+            for device in all_hardware:
+                if device.get("type") == "asic" and "SHA-256" in device.get("algorithms", {}):
+                    algo_data = device["algorithms"]["SHA-256"]
+                    revenue = float(algo_data.get("revenue_in_usd", "0").replace("$",""))
+                    if revenue > 0:
+                        sha256_asics.append({
+                            'name': device.get("name", "N/A"),
+                            'hashrate': f"{float(algo_data.get('speed', 0)) / 1e12:.2f} TH/s",
+                            'power_watts': float(algo_data.get("power", 0)),
+                            'daily_revenue': revenue
+                        })
 
-            if not table:
-                logger.error("Не удалось найти таблицу ASIC для SHA-256 на странице.")
-                return []
+            if not sha256_asics: raise ValueError("Не найдено ASIC с алгоритмом SHA-256 в API minerstat")
 
-            parsed_asics = []
-            for row in table.select("tbody tr"):
-                cols = row.find_all("td")
-                if len(cols) < 5: continue
-                name_tag = cols[1].find('a')
-                if not name_tag: continue
-                
-                name = name_tag.get_text(strip=True)
-                hashrate = cols[2].get_text(strip=True)
-                power_str = cols[3].get_text(strip=True)
-                revenue_str = cols[4].get_text(strip=True)
-                
-                power_match = re.search(r'([\d,]+)', power_str)
-                revenue_match = re.search(r'([\d\.]+)', revenue_str.replace('$', ''))
-
-                if power_match and revenue_match:
-                    power_watts = float(power_match.group(1).replace(',', ''))
-                    daily_revenue = float(revenue_match.group(1))
-                    if power_watts > 0:
-                        parsed_asics.append({'name': name, 'hashrate': hashrate, 'power_watts': power_watts, 'daily_revenue': daily_revenue})
-            
-            if not parsed_asics: raise ValueError("Не удалось распарсить данные ни одного ASIC.")
-            
-            sorted_asics = sorted(parsed_asics, key=lambda x: x['daily_revenue'], reverse=True)
+            sorted_asics = sorted(sha256_asics, key=lambda x: x['daily_revenue'], reverse=True)
             self.asic_cache = {"data": sorted_asics[:5], "timestamp": datetime.now()}
-            logger.info(f"Успешно получено {len(self.asic_cache['data'])} ASIC.")
+            logger.info(f"Успешно получено {len(self.asic_cache['data'])} ASIC из API minerstat.")
             return self.asic_cache["data"]
         except Exception as e:
-            logger.error(f"Критическая ошибка при парсинге ASIC: {e}", exc_info=True)
+            logger.error(f"Не удалось получить данные по ASIC: {e}", exc_info=True)
             return []
 
     def get_fear_and_greed_index(self):
@@ -300,21 +279,63 @@ class ApiHandler:
         except Exception as e:
             logger.error(f"Ошибка получения статуса сети Bitcoin: {e}")
             return "[❌ Не удалось получить данные о сети Bitcoin.]"
-
-
+    
+    # ИЗМЕНЕНО: Функция получает вопросы с opentdb и переводит их с помощью GPT
     def get_new_quiz_questions(self):
         try:
-            url = f"https://opentdb.com/api.php?amount={Config.QUIZ_QUESTIONS_COUNT}&type=multiple"
-            response = requests.get(url, timeout=7).json()
-            if response.get("response_code") != 0: logger.error(f"API викторин вернуло ошибку: {response}"); return None
+            # Категория 18 = Science: Computers. Она наиболее близка к крипте.
+            url = f"https://opentdb.com/api.php?amount={Config.QUIZ_QUESTIONS_COUNT}&category=18&type=multiple"
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            english_questions = response.json().get("results", [])
+
+            if not english_questions:
+                logger.error("API викторин не вернуло вопросов.")
+                return None
+
             formatted_questions = []
-            for item in response.get("results", []):
-                options = [BeautifulSoup(o, "html.parser").text for o in item['incorrect_answers']]
-                correct_answer = BeautifulSoup(item['correct_answer'], "html.parser").text
-                options.append(correct_answer); random.shuffle(options)
-                formatted_questions.append({"question": BeautifulSoup(item['question'], "html.parser").text, "options": options, "correct_index": options.index(correct_answer)})
-            return formatted_questions
-        except Exception as e: logger.error(f"Не удалось загрузить вопросы для викторины: {e}"); return None
+            for item in english_questions:
+                try:
+                    original_data = {
+                        "question": item['question'],
+                        "correct_answer": item['correct_answer'],
+                        "incorrect_answers": item['incorrect_answers']
+                    }
+                    
+                    prompt = f"""Переведи следующий JSON-объект с вопросом для викторины на русский язык. Твой ответ ДОЛЖЕН быть ТОЛЬКО валидным JSON-объектом с той же структурой и переведенными строками. Не добавляй никакого текста до или после JSON.
+
+Оригинальный JSON:
+{json.dumps(original_data, ensure_ascii=False)}
+
+Переведенный JSON:"""
+
+                    translated_json_str = self.ask_gpt(prompt, model="gpt-4o-mini")
+                    clean_json_str = re.sub(r'```(json)?|```', '', translated_json_str).strip()
+                    translated_data = json.loads(clean_json_str)
+
+                    question_text = BeautifulSoup(translated_data['question'], "html.parser").text
+                    correct_answer = BeautifulSoup(translated_data['correct_answer'], "html.parser").text
+                    options = [BeautifulSoup(o, "html.parser").text for o in translated_data['incorrect_answers']]
+                    
+                    options.append(correct_answer)
+                    random.shuffle(options)
+                    correct_index = options.index(correct_answer)
+
+                    formatted_questions.append({
+                        "question": question_text,
+                        "options": options,
+                        "correct_index": correct_index
+                    })
+                except (json.JSONDecodeError, KeyError) as e:
+                    logger.error(f"Не удалось обработать/перевести вопрос от GPT: {e}. Ответ GPT: '{translated_json_str}'")
+                    continue
+            
+            return formatted_questions if formatted_questions else None
+
+        except Exception as e:
+            logger.error(f"Не удалось загрузить вопросы для викторины: {e}", exc_info=True)
+            return None
+
 
 class GameLogic:
     def __init__(self, data_file):
