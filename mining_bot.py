@@ -131,9 +131,7 @@ class ApiHandler:
 
     def _sanitize_html(self, html_string: str) -> str:
         """Удаляет неподдерживаемые Telegram теги, оставляя только разрешенные."""
-        # Заменяем <p> и <br> на переносы строк
         sanitized = re.sub(r'</?p>|<br\s*/?>', '\n', html_string)
-        # Можно добавить другие правила очистки при необходимости
         return sanitized.strip()
 
     def ask_gpt(self, prompt: str, model: str = "gpt-4o"):
@@ -141,7 +139,7 @@ class ApiHandler:
         try:
             res = openai_client.chat.completions.create(model=model, messages=[{"role": "system", "content": "Ты — полезный ассистент, отвечающий на русском с HTML-тегами: <b>, <i>, <a>, <code>, <pre>."}, {"role": "user", "content": prompt}], timeout=20.0)
             raw_html = res.choices[0].message.content.strip()
-            return self._sanitize_html(raw_html) # Очищаем HTML перед возвратом
+            return self._sanitize_html(raw_html)
         except Exception as e:
             logger.error(f"Ошибка вызова OpenAI API: {e}"); return "[❌ Ошибка GPT.]"
 
@@ -162,7 +160,6 @@ class ApiHandler:
             r = requests.get("https://www.asicminervalue.com", timeout=15); r.raise_for_status()
             soup = BeautifulSoup(r.text, "lxml"); parsed_asics = []
             
-            # ИСПРАВЛЕНО: Добавлена проверка на случай изменения структуры сайта
             sha256_header = soup.find('h2', id='sha-256')
             if not sha256_header:
                 logger.warning("Не удалось найти заголовок 'sha-256' на странице asicminervalue.com.")
@@ -290,7 +287,6 @@ class GameLogic:
     def save_data(self):
         try:
             with open(self.data_file, 'w', encoding='utf-8') as f:
-                # Создаем копию для безопасной сериализации
                 data_to_save = json.loads(json.dumps(self.user_rigs, default=str))
                 json.dump(data_to_save, f, indent=4, ensure_ascii=False)
             logger.info("Данные пользователей успешно сохранены.")
@@ -353,7 +349,7 @@ class GameLogic:
 
     def upgrade_rig(self, user_id):
         rig = self.user_rigs.get(user_id)
-        if not rig: return "🤔 У вас нет фермы. Начните с <code>/my_rig</code>."
+        if not rig: return "� У вас нет фермы. Начните с <code>/my_rig</code>."
         
         next_level = rig['level'] + 1
         cost = Config.UPGRADE_COSTS.get(next_level)
@@ -404,17 +400,12 @@ def get_main_keyboard():
     markup.add(*[types.KeyboardButton(text) for text in buttons])
     return markup
 
-def _send_message(chat_id, text, reply_markup=None):
-    """Общая функция для отправки сообщений, чтобы избежать дублирования."""
+def send_message_with_partner_button(chat_id, text):
     try:
-        bot.send_message(chat_id, text, reply_markup=reply_markup, disable_web_page_preview=True)
+        markup = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton(random.choice(Config.PARTNER_BUTTON_TEXT_OPTIONS), url=Config.PARTNER_URL))
+        bot.send_message(chat_id, f"{text}\n\n---\n<i>{random.choice(Config.BOT_HINTS)}</i>", reply_markup=markup, disable_web_page_preview=True)
     except Exception as e:
         logger.error(f"Не удалось отправить сообщение в чат {chat_id}: {e}")
-
-def send_message_with_partner_button(chat_id, text):
-    """Отправляет сообщение с кнопкой партнера под ним."""
-    markup = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton(random.choice(Config.PARTNER_BUTTON_TEXT_OPTIONS), url=Config.PARTNER_URL))
-    _send_message(chat_id, f"{text}\n\n---\n<i>{random.choice(Config.BOT_HINTS)}</i>", reply_markup=markup)
 
 def send_photo_with_partner_button(chat_id, photo, caption):
     try:
@@ -573,7 +564,11 @@ def handle_other_text(msg):
             prompt = f"Пользователь прислал объявление в майнинг-чат. Кратко и неформально прокомментируй его, поддержи диалог. Текст: '{msg.text}'"
             response = api.ask_gpt(prompt)
         else:
-            bot.send_chat_action(msg.chat.id, 'typing'); response = api.ask_gpt(msg.text)
+            try:
+                bot.send_chat_action(msg.chat.id, 'typing')
+            except Exception as e:
+                logger.warning(f"Не удалось отправить 'typing' action: {e}")
+            response = api.ask_gpt(msg.text)
         
         send_message_with_partner_button(msg.chat.id, response)
     except Exception as e:
