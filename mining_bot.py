@@ -74,11 +74,6 @@ class Config:
 
     CRYPTO_TERMS = ["Блокчейн", "Газ (Gas)", "Халвинг", "ICO", "DeFi", "NFT", "Сатоши", "Кит (Whale)", "HODL", "DEX", "Смарт-контракт"]
     
-    STARTER_ASICS = {
-        's9': {'name': 'Старенький Antminer S9', 'rate': 0.00008},
-        'm30s': {'name': 'Надежный Whatsminer M30S', 'rate': 0.00010},
-        'a1246': {'name': 'Эффективный Avalon A1246', 'rate': 0.00012}
-    }
     LEVEL_MULTIPLIERS = {1: 1, 2: 1.5, 3: 2.2, 4: 3.5, 5: 5}
     UPGRADE_COSTS = {2: 0.001, 3: 0.005, 4: 0.02, 5: 0.1}
     STREAK_BONUS_MULTIPLIER = 0.05
@@ -103,8 +98,6 @@ class Config:
         {'name': 'Antminer S21', 'hashrate': '200.00 TH/s', 'power_watts': 3550.0, 'daily_revenue': 11.50},
         {'name': 'Whatsminer M60S', 'hashrate': '186.00 TH/s', 'power_watts': 3441.0, 'daily_revenue': 10.80},
         {'name': 'Antminer S19k Pro', 'hashrate': '120.00 TH/s', 'power_watts': 2760.0, 'daily_revenue': 6.50},
-        {'name': 'Antminer S19 Pro', 'hashrate': '110.00 TH/s', 'power_watts': 3250.0, 'daily_revenue': 5.80},
-        {'name': 'Whatsminer M50', 'hashrate': '120.00 TH/s', 'power_watts': 3240.0, 'daily_revenue': 6.40}
     ]
 
 # --- Инициализация клиентов ---
@@ -138,12 +131,23 @@ class ApiHandler:
     
     def get_gsheet(self):
         try:
-            if not Config.GOOGLE_JSON_STR or not Config.SHEET_ID: return None
+            if not Config.GOOGLE_JSON_STR or not Config.GOOGLE_JSON_STR.strip():
+                logger.warning("Переменная GOOGLE_JSON не установлена или пуста. Работа с Google Sheets будет пропущена.")
+                return None
+            
+            if not Config.GOOGLE_JSON_STR.strip().startswith('{'):
+                 logger.error("Переменная GOOGLE_JSON не является валидным JSON объектом. Она должна начинаться с '{'.")
+                 return None
+
             creds_dict = json.loads(Config.GOOGLE_JSON_STR)
             creds = Credentials.from_service_account_info(creds_dict, scopes=['https://www.googleapis.com/auth/spreadsheets'])
             return gspread.authorize(creds).open_by_key(Config.SHEET_ID).worksheet(Config.SHEET_NAME)
+        except json.JSONDecodeError as e:
+            logger.error(f"Ошибка декодирования JSON из переменной GOOGLE_JSON: {e}. Убедитесь, что переменная содержит корректный JSON.")
+            return None
         except Exception as e:
-            logger.error(f"Ошибка подключения к Google Sheets: {e}"); return None
+            logger.error(f"Общая ошибка подключения к Google Sheets: {e}", exc_info=True)
+            return None
 
     def log_to_sheet(self, row_data: list):
         try:
@@ -399,14 +403,10 @@ class GameLogic:
         except Exception as e:
             logger.error(f"Ошибка при сохранении данных пользователей: {e}", exc_info=True)
 
-    def create_rig(self, user_id, user_name, asic_key):
+    def create_rig(self, user_id, user_name, asic_data):
         if user_id in self.user_rigs:
             return "У вас уже есть ферма!"
         
-        starter_asic = Config.STARTER_ASICS.get(asic_key)
-        if not starter_asic:
-            return "Произошла ошибка при выборе ASIC."
-            
         self.user_rigs[user_id] = {
             'last_collected': None, 
             'balance': 0.0, 
@@ -414,19 +414,22 @@ class GameLogic:
             'streak': 0, 
             'name': user_name, 
             'boost_active_until': None,
-            'asic_model': starter_asic['name'],
-            'base_rate': starter_asic['rate']
+            'asic_model': asic_data['name'],
+            'base_rate': asic_data['daily_revenue'] / (api.get_crypto_price("BTC")[0] or 60000) # Примерный расчет
         }
-        return f"🎉 Поздравляем! Ваша ферма с <b>{starter_asic['name']}</b> успешно создана!"
+        return f"🎉 Поздравляем! Ваша ферма с <b>{asic_data['name']}</b> успешно создана!"
 
     def get_rig_info(self, user_id, user_name):
         rig = self.user_rigs.get(user_id)
         if not rig:
-            # Если фермы нет, предлагаем создать
+            starter_asics = api.get_top_asics()
+            if not starter_asics:
+                return "К сожалению, сейчас не удается получить список оборудования для старта. Попробуйте позже.", None
+            
             markup = types.InlineKeyboardMarkup(row_width=1)
             buttons = [
-                types.InlineKeyboardButton(f"Выбрать {asic['name']}", callback_data=f"start_rig_{key}")
-                for key, asic in Config.STARTER_ASICS.items()
+                types.InlineKeyboardButton(f"Выбрать {asic['name']}", callback_data=f"start_rig_{i}")
+                for i, asic in enumerate(starter_asics[:3])
             ]
             markup.add(*buttons)
             return "Добро пожаловать! Давайте создадим вашу первую виртуальную ферму. Выберите, с какого ASIC вы хотите начать:", markup
@@ -441,7 +444,7 @@ class GameLogic:
             h, rem = divmod(time_left.seconds, 3600); m, _ = divmod(rem, 60)
             boost_status = f"⚡️ <b>Буст x2 активен еще: {h}ч {m}м</b>\n"
         
-        base_rate = rig.get('base_rate', 0.0001) # Для совместимости со старыми данными
+        base_rate = rig.get('base_rate', 0.0001) 
         current_rate = base_rate * Config.LEVEL_MULTIPLIERS.get(rig['level'], 1)
 
         text = (f"🖥️ <b>Ферма {telebot.util.escape(rig['name'])}</b>\n"
@@ -451,7 +454,7 @@ class GameLogic:
                 f"<b>Баланс:</b> <code>{rig['balance']:.8f}</code> BTC\n"
                 f"<b>Дневная серия:</b> {rig['streak']} 🔥 (бонус <b>+{rig['streak'] * Config.STREAK_BONUS_MULTIPLIER:.0%}</b>)\n"
                 f"{boost_status}\n{upgrade_cost_text}")
-        return text, None # Возвращаем текст и None для разметки
+        return text, None 
 
     def collect_reward(self, user_id):
         rig = self.user_rigs.get(user_id)
@@ -512,7 +515,7 @@ class GameLogic:
 
     def buy_boost(self, user_id):
         rig = self.user_rigs.get(user_id)
-        if not rig: return "� У вас нет фермы."
+        if not rig: return "🤔 У вас нет фермы."
         boost_until = rig.get('boost_active_until')
         boost_until_dt = datetime.fromisoformat(boost_until) if isinstance(boost_until, str) else boost_until
         if boost_until_dt and datetime.now() < boost_until_dt: return "У вас уже активен буст!"
@@ -779,7 +782,6 @@ def get_game_menu(user_id, user_name):
     if rig_info_markup: # Если вернулась разметка для создания фермы
         return rig_info_text, rig_info_markup
     
-    # Если ферма уже есть, показываем игровое меню
     markup = types.InlineKeyboardMarkup(row_width=2)
     buttons = [
         types.InlineKeyboardButton("💰 Собрать", callback_data="game_collect"),
@@ -787,7 +789,7 @@ def get_game_menu(user_id, user_name):
         types.InlineKeyboardButton("🏆 Топ Майнеров", callback_data="game_top"),
         types.InlineKeyboardButton("🛍️ Магазин", callback_data="game_shop"),
         types.InlineKeyboardButton("💵 Вывести в реал", callback_data="game_withdraw"),
-        types.InlineKeyboardButton("🔄 Обновить", callback_data="game_rig") # Кнопка для обновления инфо
+        types.InlineKeyboardButton("🔄 Обновить", callback_data="game_rig") 
     ]
     markup.add(*buttons)
     return rig_info_text, markup
@@ -800,36 +802,65 @@ def handle_game_callbacks(call):
     message = call.message
     
     response_text = ""
+    edit_menu = True
+    
     if action == 'collect':
         response_text = game.collect_reward(user_id)
         bot.answer_callback_query(call.id, "✅ Награда собрана!")
     elif action == 'upgrade':
         response_text = game.upgrade_rig(user_id)
         bot.answer_callback_query(call.id, "Попытка улучшения...")
+    elif action == 'rig':
+        bot.answer_callback_query(call.id)
+    elif action == 'top':
+        edit_menu = False
+        response_text = game.get_top_miners()
+        bot.answer_callback_query(call.id)
+    elif action == 'shop':
+        edit_menu = False
+        response_text = (f"🛍️ <b>Магазин улучшений</b>\n\nЗдесь вы можете потратить заработанные BTC, чтобы ускорить свой прогресс!\n\n"
+                f"<b>1. Энергетический буст (x2)</b>\n"
+                f"<i>Удваивает всю вашу добычу на 24 часа.</i>\n"
+                f"<b>Стоимость:</b> <code>{Config.BOOST_COST}</code> BTC\n\n"
+                f"Для покупки используйте команду <code>/buy_boost</code>")
+        bot.answer_callback_query(call.id)
+    elif action == 'withdraw':
+        edit_menu = False
+        response_text = random.choice(Config.PARTNER_AD_TEXT_OPTIONS)
+        bot.answer_callback_query(call.id)
     
-    # После действия обновляем игровое меню
-    if response_text:
-        bot.send_message(message.chat.id, response_text)
-    
-    text, markup = get_game_menu(user_id, call.from_user.first_name)
-    bot.edit_message_text(text, message.chat.id, message.message_id, reply_markup=markup)
-
+    if response_text and not edit_menu:
+        send_message_with_partner_button(message.chat.id, response_text)
+    elif edit_menu:
+        text, markup = get_game_menu(user_id, call.from_user.first_name)
+        try:
+            bot.edit_message_text(text, message.chat.id, message.message_id, reply_markup=markup)
+        except telebot.apihelper.ApiTelegramException as e:
+            if "message is not modified" not in str(e):
+                logger.error(f"Ошибка при обновлении игрового меню: {e}")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('start_rig_'))
 def handle_start_rig_callback(call):
-    asic_key = call.data.split('_')[-1]
-    user_id = call.from_user.id
-    user_name = call.from_user.first_name
-    
-    creation_message = game.create_rig(user_id, user_name, asic_key)
-    bot.answer_callback_query(call.id, "Ферма создается...")
-    
-    # После создания показываем главное игровое меню
-    text, markup = get_game_menu(user_id, user_name)
-    # Редактируем сообщение, в котором был выбор асика
-    bot.edit_message_text(f"{creation_message}\n\n{text}", call.message.chat.id, call.message.message_id, reply_markup=markup)
+    try:
+        asic_index = int(call.data.split('_')[-1])
+        user_id = call.from_user.id
+        user_name = call.from_user.first_name
 
-# ======================= Конец игровых обработчиков ========================
+        starter_asics = api.get_top_asics()
+        if not starter_asics or asic_index >= len(starter_asics):
+            bot.answer_callback_query(call.id, "Ошибка: не удалось найти выбранный ASIC.", show_alert=True)
+            bot.edit_message_text("Произошла ошибка при выборе. Попробуйте снова.", call.message.chat.id, call.message.message_id)
+            return
+
+        selected_asic = starter_asics[asic_index]
+        creation_message = game.create_rig(user_id, user_name, selected_asic)
+        bot.answer_callback_query(call.id, "Ферма создается...")
+        
+        text, markup = get_game_menu(user_id, user_name)
+        bot.edit_message_text(f"{creation_message}\n\n{text}", call.message.chat.id, call.message.message_id, reply_markup=markup)
+    except Exception as e:
+        logger.error(f"Критическая ошибка при создании фермы: {e}", exc_info=True)
+        bot.answer_callback_query(call.id, "Произошла критическая ошибка.", show_alert=True)
 
 
 @bot.message_handler(content_types=['text'], func=lambda msg: not msg.text.startswith('/'))
@@ -837,10 +868,10 @@ def handle_non_command_text(msg):
     try:
         spam_analyzer.process_message(msg)
         
-        # В группе отвечаем только на прямое упоминание или ответ на сообщение бота
         if msg.chat.type in ('group', 'supergroup'):
+            bot_username = f"@{bot.get_me().username}"
             if not (msg.reply_to_message and msg.reply_to_message.from_user.id == bot.get_me().id) and \
-               f"@{bot.get_me().username}" not in msg.text:
+               bot_username not in msg.text:
                 return
 
         text_lower = msg.text.lower()
@@ -865,8 +896,6 @@ def handle_non_command_text(msg):
 def handle_technical_question(msg):
     try:
         bot.send_chat_action(msg.chat.id, 'typing')
-        # Для простоты и скорости, отправляем вопрос напрямую в GPT
-        # В будущем здесь можно добавить поиск по базе знаний или Google
         prompt = (
             "Ты — опытный и дружелюбный эксперт в чате по майнингу. "
             f"Пользователь задал технический вопрос: \"{msg.text}\"\n\n"
