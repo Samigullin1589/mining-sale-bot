@@ -76,18 +76,6 @@ class Config:
     QUIZ_MIN_CORRECT_FOR_REWARD = 3
     QUIZ_QUESTIONS_COUNT = 5
     
-    QUIZ_QUESTIONS = [
-        {"question": "Кто является анонимным создателем Bitcoin?", "options": ["Виталик Бутерин", "Сатоши Накамото", "Чарли Ли", "Илон Маск"], "correct_index": 1},
-        {"question": "Как называется процесс уменьшения награды за блок в сети Bitcoin в два раза?", "options": ["Форк", "Аирдроп", "Халвинг", "Сжигание"], "correct_index": 2},
-        {"question": "Какая криптовалюта является второй по рыночной капитализации после Bitcoin?", "options": ["Solana", "Ripple (XRP)", "Cardano", "Ethereum"], "correct_index": 3},
-        {"question": "Что означает 'HODL' в крипто-сообществе?", "options": ["Продавать при падении", "Держать актив долгосрочно", "Быстрая спекуляция", "Обмен одной монеты на другую"], "correct_index": 1},
-        {"question": "Как называется самая маленькая неделимая часть Bitcoin?", "options": ["Цент", "Гвей", "Сатоши", "Копейка"], "correct_index": 2},
-        {"question": "Что такое 'газ' в сети Ethereum?", "options": ["Топливо для серверов", "Комиссия за транзакцию/операцию", "Скрытый налог", "Название обновления сети"], "correct_index": 1},
-        {"question": "Какой алгоритм консенсуса использует Bitcoin?", "options": ["Proof-of-Stake (PoS)", "Proof-of-Authority (PoA)", "Proof-of-Work (PoW)", "Delegated Proof-of-Stake (DPoS)"], "correct_index": 2},
-        {"question": "Что такое NFT (Non-Fungible Token)?", "options": ["Новый вид криптовалюты", "Уникальный цифровой сертификат", "Протокол шифрования", "Финансовый дериватив"], "correct_index": 1},
-        {"question": "Какой из этих кошельков является 'холодным'?", "options": ["MetaMask", "Trust Wallet", "Ledger Nano S", "Exodus"], "correct_index": 2},
-        {"question": "Что такое 'смарт-контракт'?", "options": ["Юридический документ", "Программа, работающая в блокчейне", "Шаблон для создания токенов", "Тип биржевого ордера"], "correct_index": 1},
-    ]
     SPAM_KEYWORDS = ['p2p', 'арбитраж', 'обмен', 'сигналы', 'обучение', 'заработок', 'инвестиции']
     
     FALLBACK_ASICS = [
@@ -468,7 +456,7 @@ class GameLogic:
 
     def buy_boost(self, user_id):
         rig = self.user_rigs.get(user_id)
-        if not rig: return "🤔 У вас нет фермы."
+        if not rig: return "� У вас нет фермы."
         boost_until = rig.get('boost_active_until')
         boost_until_dt = datetime.fromisoformat(boost_until) if isinstance(boost_until, str) else boost_until
         if boost_until_dt and datetime.now() < boost_until_dt: return "У вас уже активен буст!"
@@ -743,6 +731,12 @@ def handle_quiz_answer(call):
 def handle_other_text(msg):
     try:
         spam_analyzer.process_message(msg)
+        
+        # Условие для ответа в группе: бот должен быть упомянут
+        if msg.chat.type in ('group', 'supergroup'):
+            if f"@{bot.get_me().username}" not in msg.text:
+                return
+
         text_lower = msg.text.lower()
         sale_words = ["продам", "купить", "в наличии"]; item_words = ["asic", "асик", "whatsminer", "antminer"]
         if any(w in text_lower for w in sale_words) and any(w in text_lower for w in item_words):
@@ -815,3 +809,4 @@ if __name__ == '__main__':
         logger.info("Режим: long-polling.")
         bot.remove_webhook()
         bot.polling(none_stop=True)
+�
