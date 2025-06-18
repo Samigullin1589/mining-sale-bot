@@ -121,12 +121,18 @@ class ApiHandler:
         except Exception as e: logger.error(f"Ошибка записи в Google Sheets: {e}")
 
     def _sanitize_html(self, html_string: str) -> str:
-        soup = BeautifulSoup(html_string, "html.parser")
+        # Улучшенная очистка HTML для Telegram
+        interim_html = re.sub(r'</?(div|p)[^>]*>', '\n', html_string, flags=re.I)
+        interim_html = re.sub(r'<br\s*/?>', '\n', interim_html, flags=re.I)
+        
+        soup = BeautifulSoup(interim_html, "html.parser")
         allowed_tags = ['b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del', 'a', 'code', 'pre']
         for tag in soup.find_all(True):
             if tag.name not in allowed_tags:
                 tag.unwrap()
-        return str(soup)
+        
+        clean_text = str(soup)
+        return re.sub(r'\n{3,}', '\n\n', clean_text).strip()
 
     def ask_gpt(self, prompt: str, model: str = "gpt-4o"):
         if not openai_client: return "[❌ Ошибка: Клиент OpenAI не инициализирован.]"
@@ -151,30 +157,48 @@ class ApiHandler:
     def get_top_asics(self, force_update: bool = False):
         if not force_update and self.asic_cache.get("data") and (datetime.now() - self.asic_cache.get("timestamp", datetime.min) < timedelta(hours=1)): return self.asic_cache.get("data")
         try:
-            r = requests.get("https://hashrate.no/api/v1/asics", timeout=15)
-            r.raise_for_status()
-            all_asics = r.json()
-            sha256_asics = [asic for asic in all_asics if asic.get('algorithm') == 'SHA-256' and asic.get('revenue24h') is not None]
+            r = requests.get("https://www.asicminervalue.com", timeout=15); r.raise_for_status()
+            soup = BeautifulSoup(r.text, "lxml")
             
-            if not sha256_asics:
-                raise ValueError("Не найдено ASIC с алгоритмом SHA-256 в API hashrate.no")
+            table = soup.find("table", id=re.compile(r'sha-256', re.I))
+            if not table:
+                sha256_header = soup.find('h2', string=re.compile(r'SHA-256', re.I))
+                if sha256_header:
+                    table = sha256_header.find_next('table')
 
-            sorted_asics = sorted(sha256_asics, key=lambda x: x['revenue24h'], reverse=True)
+            if not table:
+                logger.error("Не удалось найти таблицу ASIC для SHA-256 на странице.")
+                return []
+
+            parsed_asics = []
+            for row in table.select("tbody tr"):
+                cols = row.find_all("td")
+                if len(cols) < 5: continue
+                name_tag = cols[1].find('a')
+                if not name_tag: continue
+                
+                name = name_tag.get_text(strip=True)
+                hashrate = cols[2].get_text(strip=True)
+                power_str = cols[3].get_text(strip=True)
+                revenue_str = cols[4].get_text(strip=True)
+                
+                power_match = re.search(r'([\d,]+)', power_str)
+                revenue_match = re.search(r'([\d\.]+)', revenue_str.replace('$', ''))
+
+                if power_match and revenue_match:
+                    power_watts = float(power_match.group(1).replace(',', ''))
+                    daily_revenue = float(revenue_match.group(1))
+                    if power_watts > 0:
+                        parsed_asics.append({'name': name, 'hashrate': hashrate, 'power_watts': power_watts, 'daily_revenue': daily_revenue})
             
-            top_asics = []
-            for a in sorted_asics[:5]:
-                top_asics.append({
-                    'name': a.get('name', 'N/A'),
-                    'hashrate': f"{a.get('hashrate', 0) / 1e12:.2f} TH/s", # Конвертируем в TH/s
-                    'power_watts': a.get('power', 0),
-                    'daily_revenue': a.get('revenue24h', 0)
-                })
-
-            self.asic_cache = {"data": top_asics, "timestamp": datetime.now()}
-            logger.info(f"Успешно получено {len(top_asics)} ASIC из API hashrate.no.")
+            if not parsed_asics: raise ValueError("Не удалось распарсить данные ни одного ASIC.")
+            
+            sorted_asics = sorted(parsed_asics, key=lambda x: x['daily_revenue'], reverse=True)
+            self.asic_cache = {"data": sorted_asics[:5], "timestamp": datetime.now()}
+            logger.info(f"Успешно получено {len(self.asic_cache['data'])} ASIC.")
             return self.asic_cache["data"]
         except Exception as e:
-            logger.error(f"Не удалось получить данные по ASIC из нового API: {e}", exc_info=True)
+            logger.error(f"Критическая ошибка при парсинге ASIC: {e}", exc_info=True)
             return []
 
     def get_fear_and_greed_index(self):
