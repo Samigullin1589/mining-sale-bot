@@ -566,11 +566,12 @@ class SpamAnalyzer:
 
     def process_message(self, msg: types.Message):
         user = msg.from_user
+        now_iso = datetime.utcnow().isoformat()
         profile = self.user_profiles.setdefault(user.id, {
             'user_id': user.id,
             'name': user.full_name,
             'username': user.username,
-            'first_msg': datetime.utcnow().isoformat(),
+            'first_msg': now_iso,
             'msg_count': 0,
             'spam_count': 0,
             'lols_ban': False, 
@@ -579,6 +580,7 @@ class SpamAnalyzer:
         profile['msg_count'] += 1
         profile['name'] = user.full_name
         profile['username'] = user.username
+        profile['last_seen'] = now_iso
 
         text_lower = msg.text.lower() if msg.text else ''
         if any(keyword in text_lower for keyword in Config.SPAM_KEYWORDS):
@@ -588,7 +590,6 @@ class SpamAnalyzer:
         profile = self.user_profiles.get(user_id)
         if profile:
             profile['spam_count'] += 1
-
 
     def get_user_info_text(self, user_id: int) -> str:
         profile = self.user_profiles.get(user_id)
@@ -610,6 +611,34 @@ class SpamAnalyzer:
                 f"🔹 <b>lols_ban:</b> {'Да' if profile['lols_ban'] else 'Нет'}\n"
                 f"🔸 <b>cas_ban:</b> {'Да' if profile['cas_ban'] else 'Нет'}\n"
                 f"<i>Наличие в глобальных бан-листах.</i>")
+
+    def get_chat_statistics(self, days=7):
+        now = datetime.utcnow()
+        week_ago = now - timedelta(days=days)
+        total_users = len(self.user_profiles)
+        total_messages = sum(p.get('msg_count', 0) for p in self.user_profiles.values())
+
+        active_users = 0
+        new_users = 0
+        
+        for profile in self.user_profiles.values():
+            if profile.get('last_seen') and datetime.fromisoformat(profile['last_seen']) > week_ago:
+                active_users += 1
+            if profile.get('first_msg') and datetime.fromisoformat(profile['first_msg']) > week_ago:
+                new_users += 1
+        
+        first_message_date_str = min(p['first_msg'] for p in self.user_profiles.values() if p.get('first_msg'))
+        days_since_first_msg = (now - datetime.fromisoformat(first_message_date_str)).days if first_message_date_str else 1
+        avg_messages_per_day = total_messages / days_since_first_msg if days_since_first_msg > 0 else total_messages
+
+        return (
+            f"📊 <b>Статистика чата:</b>\n\n"
+            f"👥 <b>Всего пользователей:</b> {total_users}\n"
+            f"🔥 <b>Активных за неделю:</b> {active_users}\n"
+            f"🌱 <b>Новых за неделю:</b> {new_users}\n"
+            f"💬 <b>Всего сообщений:</b> {total_messages}\n"
+            f"📈 <b>Сообщений в день (в среднем):</b> {avg_messages_per_day:.2f}"
+        )
 
 api = ApiHandler()
 game = GameLogic(Config.GAME_DATA_FILE)
@@ -644,71 +673,65 @@ def send_photo_with_partner_button(chat_id, photo, caption):
         logger.error(f"Не удалось отправить фото: {e}. Отправляю текстом."); 
         send_message_with_partner_button(chat_id, caption)
 
-def is_admin(msg):
-    return msg.from_user.id in [admin.user.id for admin in bot.get_chat_administrators(msg.chat.id)]
+def is_admin(chat_id, user_id):
+    try:
+        return user_id in [admin.user.id for admin in bot.get_chat_administrators(chat_id)]
+    except Exception as e:
+        logger.error(f"Не удалось проверить права администратора: {e}")
+        return False
 
 # ========================================================================================
 # 5. ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ
 # ========================================================================================
 @bot.message_handler(commands=['start', 'help'])
 def handle_start_help(msg):
-    bot.send_message(msg.chat.id, "👋 Привет! Я ваш крипто-помощник.\n\n<b>Команды модерации:</b>\n<code>/userinfo</code> - информация о пользователе\n<code>/spam</code> - пометить сообщение как спам\n<code>/ban</code> - забанить пользователя\n<code>/unban</code> - разбанить пользователя", reply_markup=get_main_keyboard())
+    bot.send_message(msg.chat.id, "👋 Привет! Я ваш крипто-помощник.\n\n<b>Команды модерации (только для админов):</b>\n<code>/userinfo</code> - информация о пользователе\n<code>/spam</code> - пометить сообщение как спам\n<code>/ban</code> - забанить пользователя\n<code>/unban</code> - разбанить пользователя\n<code>/chatstats</code> - статистика по чату", reply_markup=get_main_keyboard())
 
-@bot.message_handler(commands=['userinfo'])
-def handle_userinfo(msg):
-    target_id = None
-    if msg.reply_to_message:
-        target_id = msg.reply_to_message.from_user.id
-    else:
-        try:
-            target_id = int(msg.text.split()[1])
-        except (IndexError, ValueError):
-            bot.reply_to(msg, "Пожалуйста, ответьте на сообщение пользователя или укажите его ID после команды.")
-            return
-
-    if target_id:
-        info_text = spam_analyzer.get_user_info_text(target_id)
-        bot.send_message(msg.chat.id, info_text)
-
-# --- Команды модерации ---
-@bot.message_handler(commands=['ban', 'spam', 'unban'])
-def handle_moderation(msg):
-    if not is_admin(msg):
-        return bot.reply_to(msg, "Эта команда доступна только администраторам.")
-        
+@bot.message_handler(commands=['userinfo', 'chatstats', 'ban', 'spam', 'unban'])
+def handle_admin_commands(msg):
+    is_user_admin = is_admin(msg.chat.id, msg.from_user.id)
     command = msg.text.split('@')[0].split(' ')[0]
+    
+    if not is_user_admin:
+        if command in ['/ban', '/spam', '/unban', '/chatstats']:
+            bot.reply_to(msg, "Эта команда предназначена для администраторов чата, чтобы поддерживать порядок. Они могут удалять спам и блокировать нарушителей.")
+        return
 
-    if command == '/unban':
+    if command == '/userinfo':
+        target_id = None
+        if msg.reply_to_message:
+            target_id = msg.reply_to_message.from_user.id
+        else:
+            try: target_id = int(msg.text.split()[1])
+            except (IndexError, ValueError): return bot.reply_to(msg, "Пожалуйста, ответьте на сообщение пользователя или укажите его ID после команды.")
+        if target_id: bot.send_message(msg.chat.id, spam_analyzer.get_user_info_text(target_id))
+            
+    elif command == '/chatstats':
+        stats_text = spam_analyzer.get_chat_statistics()
+        bot.send_message(msg.chat.id, stats_text)
+
+    elif command == '/unban':
         try:
             user_id_to_unban = int(msg.text.split()[1])
             bot.unban_chat_member(msg.chat.id, user_id_to_unban)
             bot.reply_to(msg, f"Пользователь <code>{user_id_to_unban}</code> разбанен.")
-        except Exception as e:
-            bot.reply_to(msg, "Ошибка. Используйте формат: <code>/unban ID_пользователя</code>")
+        except Exception: bot.reply_to(msg, "Ошибка. Используйте формат: <code>/unban ID_пользователя</code>")
         return
 
-    if not msg.reply_to_message:
-        return bot.reply_to(msg, "Пожалуйста, используйте эту команду в ответ на сообщение пользователя.")
-
-    user_to_act = msg.reply_to_message.from_user
-    
-    if command == '/ban':
+    elif command in ['/ban', '/spam']:
+        if not msg.reply_to_message: return bot.reply_to(msg, "Пожалуйста, используйте эту команду в ответ на сообщение пользователя.")
+        user_to_act = msg.reply_to_message.from_user
         try:
-            bot.ban_chat_member(msg.chat.id, user_to_act.id)
-            bot.delete_message(msg.chat.id, msg.reply_to_message.message_id)
-            bot.reply_to(msg, f"Пользователь {user_to_act.full_name} забанен.")
+            if command == '/ban':
+                bot.ban_chat_member(msg.chat.id, user_to_act.id)
+                bot.delete_message(msg.chat.id, msg.reply_to_message.message_id)
+                bot.reply_to(msg, f"Пользователь {user_to_act.full_name} забанен.")
+            elif command == '/spam':
+                spam_analyzer.manual_spam_increment(user_to_act.id)
+                bot.delete_message(msg.chat.id, msg.reply_to_message.message_id)
+                bot.reply_to(msg, f"Сообщение от {user_to_act.full_name} помечено как спам.")
         except Exception as e:
-            logger.error(f"Не удалось забанить пользователя: {e}")
-            bot.reply_to(msg, "Не удалось забанить пользователя. Проверьте мои права.")
-            
-    elif command == '/spam':
-        try:
-            spam_analyzer.manual_spam_increment(user_to_act.id)
-            bot.delete_message(msg.chat.id, msg.reply_to_message.message_id)
-            bot.reply_to(msg, f"Сообщение от {user_to_act.full_name} помечено как спам.")
-        except Exception as e:
-            logger.error(f"Не удалось удалить спам-сообщение: {e}")
-
+            logger.error(f"Не удалось выполнить модерацию: {e}"); bot.reply_to(msg, "Не удалось выполнить действие. Проверьте мои права.")
 
 @bot.message_handler(func=lambda msg: msg.text == "💹 Курс", content_types=['text'])
 def handle_price_request(msg):
