@@ -57,11 +57,17 @@ class Config:
 
     PARTNER_URL = "https://app.leadteh.ru/w/dTeKr"
     PARTNER_BUTTON_TEXT_OPTIONS = ["🎁 Узнать спеццены", "🔥 Эксклюзивное предложение", "💡 Получить консультацию", "💎 Прайс от экспертов"]
+    PARTNER_AD_TEXT_OPTIONS = [
+        "Хотите превратить виртуальные BTC в реальные? Для этого нужно настоящее оборудование! Наши партнеры предлагают лучшие условия для старта.",
+        "Виртуальный майнинг - это только начало. Готовы к реальной добыче? Ознакомьтесь с предложениями от проверенных поставщиков.",
+        "Ваша виртуальная ферма показывает отличные результаты! Пора задуматься о настоящей. Эксклюзивные цены на оборудование от наших экспертов.",
+        "Заработанное здесь можно реинвестировать в знания или в реальное железо. Что выберете вы? Надежные поставщики уже ждут."
+    ]
     BOT_HINTS = [
         "💡 Узнайте курс любой монеты командой `/price`", "⚙️ Посмотрите на самые доходные ASIC",
         "⛏️ Рассчитайте прибыль с помощью 'Калькулятора'", "📰 Хотите свежие крипто-новости?",
-        "🤑 Улучшайте свою ферму командой `/upgrade_rig`", "😱 Проверьте Индекс Страха и Жадности",
-        "🏆 Сравните себя с лучшими в `/top_miners`", "🎓 Что такое 'HODL'? Узнайте: `/word`",
+        "🤑 Попробуйте наш симулятор майнинга!", "😱 Проверьте Индекс Страха и Жадности",
+        "🏆 Сравните себя с лучшими в таблице лидеров", "🎓 Что такое 'HODL'? Узнайте: `/word`",
         "🧠 Проверьте знания и заработайте в `/quiz`", "🛍️ Загляните в магазин улучшений: `/shop`"
     ]
     HALVING_INTERVAL = 210000
@@ -84,6 +90,8 @@ class Config:
         {"question": "Как называется самая маленькая неделимая часть Bitcoin?", "options": ["Цент", "Гвей", "Сатоши", "Копейка"], "correct_index": 2},
     ]
     SPAM_KEYWORDS = ['p2p', 'арбитраж', 'обмен', 'сигналы', 'обучение', 'заработок', 'инвестиции']
+    TECH_QUESTION_KEYWORDS = ['почему', 'как', 'что делать', 'проблема', 'ошибка', 'не работает', 'отваливается', 'перегревается', 'настроить']
+    TECH_SUBJECT_KEYWORDS = ['asic', 'асик', 'майнер', 'блок питания', 'прошивка', 'хешрейт', 'плата', 'пул']
     
     FALLBACK_ASICS = [
         {'name': 'Antminer S21', 'hashrate': '200.00 TH/s', 'power_watts': 3550.0, 'daily_revenue': 11.50},
@@ -405,8 +413,7 @@ class GameLogic:
                 f"<b>Уровень:</b> {rig['level']}\n"
                 f"<b>Баланс:</b> <code>{rig['balance']:.8f}</code> BTC\n"
                 f"<b>Дневная серия:</b> {rig['streak']} 🔥 (бонус <b>+{rig['streak'] * Config.STREAK_BONUS_MULTIPLIER:.0%}</b>)\n"
-                f"{boost_status}\n{upgrade_cost_text}\n\n"
-                "<code>/collect</code>, <code>/upgrade_rig</code>, <code>/shop</code>")
+                f"{boost_status}\n{upgrade_cost_text}")
 
     def collect_reward(self, user_id):
         rig = self.user_rigs.get(user_id)
@@ -555,7 +562,7 @@ def get_main_keyboard():
     buttons = [
         "💹 Курс", "⚙️ Топ-5 ASIC", "⛏️ Калькулятор", "📰 Новости", 
         "😱 Индекс Страха", "⏳ Халвинг", "📡 Статус BTC", "🧠 Викторина", 
-        "🎓 Слово дня", "🏆 Топ майнеров", "🛍️ Магазин"
+        "🎓 Слово дня", "🕹️ Виртуальный Майнинг"
     ]
     markup.add(*[types.KeyboardButton(text) for text in buttons])
     return markup
@@ -664,24 +671,6 @@ def handle_btc_status(msg):
 @bot.message_handler(commands=['gas'])
 def handle_gas(msg): send_message_with_partner_button(msg.chat.id, api.get_eth_gas_price())
 
-@bot.message_handler(commands=['my_rig'])
-def handle_my_rig(msg): send_message_with_partner_button(msg.chat.id, game.get_rig_info(msg.from_user.id, msg.from_user.first_name))
-
-@bot.message_handler(commands=['collect'])
-def handle_collect(msg): send_message_with_partner_button(msg.chat.id, game.collect_reward(msg.from_user.id))
-
-@bot.message_handler(commands=['upgrade_rig'])
-def handle_upgrade_rig(msg): send_message_with_partner_button(msg.chat.id, game.upgrade_rig(msg.from_user.id))
-
-@bot.message_handler(func=lambda msg: msg.text == "🏆 Топ майнеров", content_types=['text'])
-def handle_top_miners(msg): send_message_with_partner_button(msg.chat.id, game.get_top_miners())
-
-@bot.message_handler(func=lambda msg: msg.text == "🛍️ Магазин", content_types=['text'])
-def handle_shop(msg): send_message_with_partner_button(msg.chat.id, f"🛍️ <b>Магазин улучшений</b>\n\n<b>1. Энергетический буст (x2)</b>\n<i>Удваивает добычу на 24 часа.</i>\n<b>Стоимость:</b> <code>{Config.BOOST_COST}</code> BTC\n\nДля покупки: <code>/buy_boost</code>")
-
-@bot.message_handler(commands=['buy_boost'])
-def handle_buy_boost(msg): send_message_with_partner_button(msg.chat.id, game.buy_boost(msg.from_user.id))
-
 @bot.message_handler(func=lambda msg: msg.text == "🎓 Слово дня", content_types=['text'])
 def handle_word_of_the_day(msg):
     term = random.choice(Config.CRYPTO_TERMS)
@@ -734,33 +723,92 @@ def handle_quiz_answer(call):
     state['question_index'] += 1; time.sleep(1.5); send_quiz_question(call.message.chat.id, user_id)
     bot.answer_callback_query(call.id)
 
+@bot.message_handler(func=lambda msg: msg.text == "🕹️ Виртуальный Майнинг", content_types=['text'])
+def handle_game_hub(msg):
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    buttons = [
+        types.InlineKeyboardButton("🖥️ Моя Ферма", callback_data="game_rig"),
+        types.InlineKeyboardButton("🚀 Улучшить", callback_data="game_upgrade"),
+        types.InlineKeyboardButton("💰 Собрать", callback_data="game_collect"),
+        types.InlineKeyboardButton("🏆 Топ Майнеров", callback_data="game_top"),
+        types.InlineKeyboardButton("🛍️ Магазин", callback_data="game_shop"),
+        types.InlineKeyboardButton("💵 Вывести в реал", callback_data="game_withdraw")
+    ]
+    markup.add(*buttons)
+    bot.send_message(msg.chat.id, "Добро пожаловать в симулятор майнинга! Выберите действие:", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('game_'))
+def handle_game_callbacks(call):
+    action = call.data.split('_')[1]
+    user_id = call.from_user.id
+    user_name = call.from_user.first_name
+    
+    text = ""
+    if action == 'rig':
+        text = game.get_rig_info(user_id, user_name)
+    elif action == 'collect':
+        text = game.collect_reward(user_id)
+    elif action == 'upgrade':
+        text = game.upgrade_rig(user_id)
+    elif action == 'top':
+        text = game.get_top_miners()
+    elif action == 'shop':
+        text = (f"🛍️ <b>Магазин улучшений</b>\n\nЗдесь вы можете потратить заработанные BTC, чтобы ускорить свой прогресс!\n\n"
+                f"<b>1. Энергетический буст (x2)</b>\n"
+                f"<i>Удваивает всю вашу добычу на 24 часа.</i>\n"
+                f"<b>Стоимость:</b> <code>{Config.BOOST_COST}</code> BTC\n\n"
+                f"Для покупки используйте команду <code>/buy_boost</code>")
+    elif action == 'withdraw':
+        text = random.choice(Config.PARTNER_AD_TEXT_OPTIONS)
+
+    try:
+        bot.answer_callback_query(call.id)
+        if text:
+            send_message_with_partner_button(call.message.chat.id, text)
+    except Exception as e:
+        logger.error(f"Ошибка в игровом колбэке: {e}")
+
 @bot.message_handler(content_types=['text'])
 def handle_other_text(msg):
-    try:
-        spam_analyzer.process_message(msg)
-        
-        # Условие для ответа в группе: бот должен быть упомянут
-        if msg.chat.type in ('group', 'supergroup'):
-            if f"@{bot.get_me().username}" not in msg.text:
-                return
+    spam_analyzer.process_message(msg)
+    
+    if msg.chat.type in ('group', 'supergroup'):
+        if not (msg.reply_to_message and msg.reply_to_message.from_user.id == bot.get_me().id) and \
+           f"@{bot.get_me().username}" not in msg.text:
+            return
 
-        text_lower = msg.text.lower()
-        sale_words = ["продам", "купить", "в наличии"]; item_words = ["asic", "асик", "whatsminer", "antminer"]
-        if any(w in text_lower for w in sale_words) and any(w in text_lower for w in item_words):
-            api.log_to_sheet([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg.from_user.username or "N/A", msg.text])
-            prompt = f"Пользователь прислал объявление в майнинг-чат. Кратко и неформально прокомментируй его, поддержи диалог. Текст: '{msg.text}'"
-            response = api.ask_gpt(prompt)
-        else:
-            try:
-                bot.send_chat_action(msg.chat.id, 'typing')
-            except Exception as e:
-                logger.warning(f"Не удалось отправить 'typing' action: {e}")
-            response = api.ask_gpt(msg.text)
-        
+    text_lower = msg.text.lower()
+    if any(kw in text_lower for kw in Config.TECH_QUESTION_KEYWORDS) and any(kw in text_lower for kw in Config.TECH_SUBJECT_KEYWORDS) and '?' in msg.text:
+        handle_technical_question(msg)
+    elif any(w in text_lower for w in ["продам", "купить", "в наличии"]) and any(w in text_lower for w in ["asic", "асик", "whatsminer", "antminer"]):
+        api.log_to_sheet([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg.from_user.username or "N/A", msg.text])
+        prompt = f"Пользователь прислал объявление в майнинг-чат. Кратко и неформально прокомментируй его, поддержи диалог. Текст: '{msg.text}'"
+        response = api.ask_gpt(prompt)
         send_message_with_partner_button(msg.chat.id, response)
+    else:
+        try:
+            bot.send_chat_action(msg.chat.id, 'typing')
+        except Exception as e:
+            logger.warning(f"Не удалось отправить 'typing' action: {e}")
+        response = api.ask_gpt(msg.text)
+        send_message_with_partner_button(msg.chat.id, response)
+
+def handle_technical_question(msg):
+    try:
+        bot.send_chat_action(msg.chat.id, 'typing')
+        # В реальном приложении здесь был бы поиск по базе знаний или Google
+        prompt = (
+            "Ты — опытный и дружелюбный эксперт в чате по майнингу. "
+            f"Пользователь задал технический вопрос: \"{msg.text}\"\n\n"
+            "Твоя задача — дать полезный, структурированный совет. "
+            "Если точного ответа нет, предложи возможные направления для диагностики проблемы (например, 'проверь блок питания', 'обнови прошивку', 'проверь температуру'). "
+            "Отвечай развернуто, но по делу. Твой ответ должен быть максимально полезным."
+        )
+        response = api.ask_gpt(prompt, "gpt-4o")
+        bot.reply_to(msg, response)
     except Exception as e:
-        logger.error("Критическая ошибка в handle_other_text!", exc_info=e)
-        bot.send_message(msg.chat.id, "😵 Ой, что-то пошло не так. Мы уже разбираемся!")
+        logger.error(f"Ошибка при обработке технического вопроса: {e}")
+
 
 # ========================================================================================
 # 6. ЗАПУСК БОТА И ПЛАНИРОВЩИКА
