@@ -43,7 +43,6 @@ class Config:
     WEBHOOK_URL = os.getenv("WEBHOOK_URL")
     CRYPTO_API_KEY = os.getenv("CRYPTO_API_KEY")
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-    MINERSTAT_API_KEY = os.getenv("MINERSTAT_API_KEY") # Добавлен ключ для Minerstat
     NEWS_CHAT_ID = os.getenv("NEWS_CHAT_ID")
     ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
     GOOGLE_JSON_STR = os.getenv("GOOGLE_JSON")
@@ -163,13 +162,9 @@ class ApiHandler:
     def get_top_asics(self, force_update: bool = False):
         if not force_update and self.asic_cache.get("data") and (datetime.now() - self.asic_cache.get("timestamp", datetime.min) < timedelta(hours=1)):
             return self.asic_cache.get("data")
-        
-        if not Config.MINERSTAT_API_KEY:
-            logger.error("Ключ MINERSTAT_API_KEY не установлен. Невозможно получить данные об ASIC.")
-            return []
-            
         try:
-            url = f"https://api.minerstat.com/v2/hardware?token={Config.MINERSTAT_API_KEY}"
+            # ИСПРАВЛЕНО: Убран ненужный токен из запроса к публичному API
+            url = "https://api.minerstat.com/v2/hardware"
             r = requests.get(url, timeout=15)
             r.raise_for_status()
             all_hardware = r.json()
