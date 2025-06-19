@@ -61,7 +61,7 @@ class Config:
         raise ValueError("Критическая ошибка: TG_BOT_TOKEN не установлен")
 
     PARTNER_URL = os.getenv("PARTNER_URL", "https://app.leadteh.ru/w/dTeKr")
-    PARTNER_BUTTON_TEXT_OPTIONS = ["🎁 Узнать спеццены", "🔥 Эксклюзивное предложение", "💡 Получить консультацию", "💎 Прайс от экспертов"]
+    PARTNER_BUTTON_TEXT_OPTIONS = ["� Узнать спеццены", "🔥 Эксклюзивное предложение", "💡 Получить консультацию", "💎 Прайс от экспертов"]
     PARTNER_AD_TEXT_OPTIONS = [
         "Хотите превратить виртуальные BTC в реальные? Для этого нужно настоящее оборудование! Наши партнеры предлагают лучшие условия для старта.",
         "Виртуальный майнинг - это только начало. Готовы к реальной добыче? Ознакомьтесь с предложениями от проверенных поставщиков.",
@@ -123,7 +123,12 @@ class Config:
         'DOGE': 'dogecoin', 'KAS': 'kaspa', 'SOL': 'solana'
     }
     POPULAR_TICKERS = ['BTC', 'ETH', 'LTC', 'DOGE', 'KAS']
-    NEWS_RSS_FEEDS = ["https://forklog.com/feed", "https://bits.media/rss/", "https://www.rbc.ru/crypto/feed"]
+    NEWS_RSS_FEEDS = [
+        "https://forklog.com/feed",
+        "https://cointelegraph.com/rss", # Новый надежный источник
+        "https://bits.media/rss/",
+        "https://www.rbc.ru/crypto/feed"
+    ]
     
     WARN_LIMIT = 3
     MUTE_DURATION_HOURS = 24
@@ -176,7 +181,6 @@ class ApiHandler:
                     cache = json.load(f)
                     if "timestamp" in cache and cache["timestamp"]:
                         cache["timestamp"] = datetime.fromisoformat(cache["timestamp"])
-                        # Если кэш слишком старый, считаем его невалидным
                         if datetime.now() - cache["timestamp"] > timedelta(hours=24):
                             logger.warning("Кэш ASIC старше 24 часов, будет проигнорирован.")
                             return {"data": [], "timestamp": None}
@@ -285,7 +289,6 @@ class ApiHandler:
         except Exception as e:
             logger.warning(f"Ошибка при обработке данных ASIC с API minerstat: {e}"); return None
 
-    # --- УЛУЧШЕННЫЙ ПАРСЕР ASIC ---
     def _get_asics_from_scraping(self):
         response = self._make_request("https://www.asicminervalue.com", is_json=False)
         if not response: return None
@@ -295,7 +298,6 @@ class ApiHandler:
             tables = soup.find_all("table")
             target_table = None
             
-            # Ищем наиболее подходящую таблицу по содержимому заголовков
             best_score = 0
             for table in tables:
                 headers = [th.get_text(strip=True).lower() for th in table.select("thead th")]
@@ -309,7 +311,7 @@ class ApiHandler:
                     target_table = table
             
             if not target_table or best_score < 3:
-                logger.error("Парсинг: не найдена таблица с достаточным количеством релевантных заголовков.")
+                logger.error("Парсинг: не найдена таблица с нужными заголовками (Miner, Hashrate, Profit).")
                 return None
 
             parsed_asics = []
@@ -325,7 +327,8 @@ class ApiHandler:
                     power_val = float(re.search(r'([\d,]+)', power_text).group(1).replace(',', ''))
                     revenue_val = float(revenue_text)
 
-                    if revenue_val > 0 and 'sha-256' in hashrate_text.lower():
+                    # Улучшенная проверка на SHA-256
+                    if revenue_val > 0 and ('th/s' in hashrate_text.lower() or 'ph/s' in hashrate_text.lower()):
                         parsed_asics.append({'name': name, 'hashrate': hashrate_text, 'power_watts': power_val, 'daily_revenue': revenue_val})
                 except Exception as e:
                     logger.warning(f"Парсинг: пропущена строка из-за ошибки: {e}.")
@@ -452,12 +455,14 @@ class ApiHandler:
 
     def get_crypto_news(self):
         all_news = []
-        logger.info("Запрашиваю новости с CryptoPanic...")
-        all_news.extend(self._get_news_from_cryptopanic())
         
+        logger.info("Запрашиваю новости из RSS-лент...")
         for url in Config.NEWS_RSS_FEEDS:
-            logger.info(f"Запрашиваю новости из RSS: {url}")
             all_news.extend(self._get_news_from_rss(url))
+
+        if len(all_news) < 3 and Config.CRYPTO_API_KEY:
+            logger.info("Из RSS получено мало новостей, пробую CryptoPanic...")
+            all_news.extend(self._get_news_from_cryptopanic())
 
         if not all_news:
             return "[🧐 Не удалось загрузить новости ни из одного источника.]"
