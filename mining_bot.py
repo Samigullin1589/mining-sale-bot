@@ -1,325 +1,326 @@
-# -*- coding: utf-8 -*-
-# ==============================================================================
-# Раздел 1: Импорты и начальная настройка
-# ==============================================================================
-import asyncio
-import json
-import logging
 import os
-import random
-import re
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from typing import List, Optional, Dict
+import logging
+import asyncio
+import httpx # Для выполнения асинхронных HTTP запросов
+from cachetools import cached, TTLCache # Для кэширования данных
 
-import aiofiles
-import aiohttp
-import bleach
-import feedparser
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart, Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery, User
-from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from bs4 import BeautifulSoup
-from cachetools import TTLCache
-from openai import AsyncOpenAI
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.enums import ParseMode
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.fsm.storage.memory import MemoryStorage # Для хранения состояний, если понадобится в будущем
 
-# ==============================================================================
-# Раздел 2: Конфигурация и константы
-# ==============================================================================
-class Config:
-    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-    ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
-    GAME_DATA_FILE = "game_data.json"
-    PROFILES_DATA_FILE = "user_profiles.json"
-    ASIC_SOURCE_URL = 'https://www.asicminervalue.com/'
-    CBR_API_URL = "https://www.cbr-xml-daily.ru/daily_json.js"
-    COINGECKO_API_URL = "https://api.coingecko.com/api/v3"
-    LEVEL_MULTIPLIERS = {1: 1, 2: 1.5, 3: 2.2, 4: 3.5, 5: 5}
-    UPGRADE_COSTS = {2: 0.001, 3: 0.005, 4: 0.02, 5: 0.1}
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', handlers=[logging.StreamHandler()])
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-bot = Bot(token=Config.TELEGRAM_BOT_TOKEN)
-dp = Dispatcher()
-scheduler = AsyncIOScheduler(timezone="UTC")
-asic_cache = TTLCache(maxsize=1, ttl=3600)
+# --- Конфигурация бота ---
+# Получаем токен бота из переменной окружения.
+# Это безопаснее, чем хардкодить его в коде.
+# Убедитесь, что вы установили переменную окружения `BOT_TOKEN`
+# Например: export BOT_TOKEN='ВАШ_ТОКЕН_БОТА'
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    logger.error("BOT_TOKEN не установлен в переменных окружения. Бот не сможет запуститься.")
+    exit("Ошибка: BOT_TOKEN не найден.")
 
-# ==============================================================================
-# Раздел 3: Модели данных и состояния
-# ==============================================================================
-class Form(StatesGroup):
-    waiting_for_calculator_cost = State()
-    waiting_for_ticker = State()
+# Инициализация хранилища состояний
+# MemoryStorage подходит для небольших ботов и тестирования.
+# Для продакшена рассмотрите RedisStorage или другую персистентную СУБД.
+storage = MemoryStorage()
 
-@dataclass
-class AsicMiner:
-    name: str; algorithm: str; hashrate: str; power: int; profitability: float
+# Инициализация бота и диспетчера
+bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+dp = Dispatcher(storage=storage)
 
-@dataclass
-class GameRig:
-    name: str; asic_model: str; base_rate: float
-    level: int = 1; balance: float = 0.0
-    last_collected: Optional[datetime] = None
+# --- Кэширование для "Топ ASIC" ---
+# asic_cache - это экземпляр TTLCache, который будет использоваться для хранения кэшированных данных.
+# maxsize=100: Максимальное количество элементов в кэше.
+# ttl=3600: Время жизни кэша в секундах (3600 секунд = 1 час).
+# Если данные старше 1 часа, они будут перезапрошены.
+asic_cache = TTLCache(maxsize=100, ttl=3600)
 
-@dataclass
-class UserProfile:
-    user_id: int; name: str; username: Optional[str]
-    msg_count: int = 0; spam_count: int = 0
-    first_msg: datetime = field(default_factory=datetime.utcnow)
-    last_seen: datetime = field(default_factory=datetime.utcnow)
+# --- Создание клавиатуры главного меню ---
+# ReplyKeyboardMarkup - это клавиатура, которая отображается под полем ввода текста.
+# Она более подходит для основного меню, как на вашем скриншоте.
+main_menu_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [
+            KeyboardButton(text="💰 Курс"), # Иконка для курса
+            KeyboardButton(text="⚙️ Топ ASIC"), # Иконка для ASIC
+        ],
+        [
+            KeyboardButton(text="🧮 Калькулятор"), # Иконка для калькулятора
+            KeyboardButton(text="📰 Новости"), # Иконка для новостей
+        ],
+        [
+            KeyboardButton(text="😱 Индекс Страха"), # Иконка для индекса страха
+            KeyboardButton(text="⏳ Халвинг"), # Иконка для халвинга
+        ],
+        [
+            KeyboardButton(text="📊 Статус ВТС"), # Иконка для статуса BTC
+            KeyboardButton(text="🧠 Викторина"), # Иконка для викторины
+        ],
+        [
+            KeyboardButton(text="🗓️ Слово дня"), # Иконка для слова дня
+            KeyboardButton(text="⛏️ Виртуальный Майнинг"), # Иконка для виртуального майнинга
+        ],
+    ],
+    resize_keyboard=True, # Клавиатура будет автоматически изменять размер под контент
+    input_field_placeholder="Выберите функцию...", # Текст в поле ввода при открытой клавиатуре
+)
 
-# ==============================================================================
-# Раздел 4: Вспомогательные функции и файловый I/O
-# ==============================================================================
-async def read_json_file(filepath: str) -> Dict:
-    if not os.path.exists(filepath): return {}
+# --- Обработчики команд и сообщений ---
+
+@dp.message(F.text == "/start")
+async def command_start_handler(message: types.Message) -> None:
+    """
+    Обрабатывает команду /start.
+    Отправляет приветственное сообщение и отображает главное меню.
+    """
+    logger.info(f"Получена команда /start от пользователя {message.from_user.id}")
+    await message.answer(
+        "Привет! Я твой бот для майнинга и криптовалют. Выбери интересующую функцию из меню:",
+        reply_markup=main_menu_keyboard # Показываем клавиатуру главного меню
+    )
+
+@dp.message(F.text == "💰 Курс")
+async def show_rates(message: types.Message) -> None:
+    """
+    Обрабатывает нажатие кнопки "Курс".
+    Здесь должна быть логика получения и отображения курсов криптовалют.
+    """
+    logger.info(f"Пользователь {message.from_user.id} запросил Курс.")
+    await message.answer("Загружаю актуальные курсы криптовалют...")
     try:
-        async with aiofiles.open(filepath, 'r', encoding='utf-8') as f:
-            return json.loads(await f.read())
+        # Пример заглушки для получения курса BTC/USD
+        # В реальном приложении вы бы использовали API, например, CoinGecko.
+        async with httpx.AsyncClient() as client:
+            # Пример запроса к публичному API CoinGecko для цены Bitcoin
+            response = await client.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd")
+            response.raise_for_status() # Вызывает исключение для ошибок HTTP (4xx/5xx)
+            data = response.json()
+            btc_price = data.get('bitcoin', {}).get('usd', 'N/A')
+
+        await message.answer(f"Текущий курс Bitcoin (BTC): <b>{btc_price}$</b>\n"
+                             "<i>(Данные предоставлены CoinGecko)</i>")
+    except httpx.RequestError as e:
+        logger.error(f"Ошибка при запросе курсов: {e}")
+        await message.answer("Не удалось получить курсы криптовалют. Попробуйте позже.")
     except Exception as e:
-        logger.error(f"Ошибка чтения {filepath}: {e}"); return {}
+        logger.error(f"Неизвестная ошибка при обработке курсов: {e}")
+        await message.answer("Произошла ошибка при получении курсов.")
 
-async def write_json_file(filepath: str, data: Dict):
+
+@dp.message(F.text == "⚙️ Топ ASIC")
+@cached(cache=asic_cache, key=lambda: 'top_asics') # Используем декоратор @cached с нашим asic_cache
+async def get_top_asics(message: types.Message) -> None:
+    """
+    Обрабатывает нажатие кнопки "Топ ASIC".
+    Функция кэшируется на 1 час (ttl=3600), чтобы не запрашивать данные слишком часто.
+    """
+    logger.info(f"Пользователь {message.from_user.id} запросил Топ ASIC.")
+    await message.answer("Ищу информацию о топовых ASIC майнерах...")
     try:
-        async with aiofiles.open(filepath, 'w', encoding='utf-8') as f:
-            await f.write(json.dumps(data, indent=4, ensure_ascii=False, default=str))
+        # Здесь должна быть логика получения данных о топ ASIC майнерах.
+        # Например, парсинг сайта или запрос к специализированному API.
+        # В этом примере это просто заглушка.
+        top_asics_data = (
+            "<b>Топ ASIC майнеры (примерные данные):</b>\n"
+            "1. Bitmain Antminer S19 Pro (110 TH/s)\n"
+            "2. Whatsminer M30S++ (112 TH/s)\n"
+            "3. Canaan AvalonMiner 1246 (90 TH/s)\n"
+            "\n<i>(Данные могут быть устаревшими, для актуальной информации обращайтесь к специализированным ресурсам.)</i>"
+        )
+        await message.answer(top_asics_data)
     except Exception as e:
-        logger.error(f"Ошибка записи {filepath}: {e}")
+        logger.error(f"Ошибка при получении Топ ASIC: {e}")
+        await message.answer("Не удалось получить информацию о топ ASIC майнерах. Попробуйте позже.")
 
-# ==============================================================================
-# Раздел 5: Основные модули (API, Калькулятор, Игра, Антиспам)
-# ==============================================================================
-@asic_cache.cached(key=lambda: 'top_asics')
-async def get_profitable_asics() -> List[AsicMiner]:
-    logger.info("Обновление кэша ASIC-майнеров...")
-    miners: List[AsicMiner] = []
+
+@dp.message(F.text == "🧮 Калькулятор")
+async def show_calculator(message: types.Message) -> None:
+    """
+    Обрабатывает нажатие кнопки "Калькулятор".
+    Это пример простого калькулятора. В реальном приложении можно реализовать
+    более сложную логику, например, калькулятор прибыльности майнинга.
+    """
+    logger.info(f"Пользователь {message.from_user.id} запросил Калькулятор.")
+    await message.answer(
+        "Я могу помочь с базовыми расчетами. Отправьте мне выражение, например '2+2' или '10*5'.\n"
+        "<i>(Функционал ограничен, для сложных вычислений используйте другие инструменты.)</i>"
+    )
+
+    # Примечание: Для полноценного калькулятора вам понадобится FSM (Finite State Machine),
+    # чтобы отслеживать состояние пользователя и ждать от него математическое выражение.
+    # Сейчас бот просто ответит на любое сообщение, но не будет ожидать конкретного ввода.
+
+
+@dp.message(F.text == "📰 Новости")
+async def show_news(message: types.Message) -> None:
+    """
+    Обрабатывает нажатие кнопки "Новости".
+    Здесь должна быть логика получения и отображения последних новостей.
+    """
+    logger.info(f"Пользователь {message.from_user.id} запросил Новости.")
+    await message.answer("Загружаю последние новости из мира криптовалют и майнинга...")
     try:
-        async with aiohttp.ClientSession() as session, session.get(Config.ASIC_SOURCE_URL, timeout=20) as response:
-            html = await response.text()
-        soup = BeautifulSoup(html, 'lxml')
-        table = soup.find('table', {'class': 'table-hover'})
-        if table:
-            for row in table.find('tbody').find_all('tr'):
-                try:
-                    cols = row.find_all('td')
-                    if len(cols) > 6:
-                        name, hashrate, power, algo, prof = cols[0].text, cols[2].text, cols[3].text, cols[5].text, cols[6].text
-                        profitability = float(re.sub(r'[^\d.]', '', prof)) if prof else 0.0
-                        if profitability > 0:
-                            miners.append(AsicMiner(name.strip(), algo.strip(), hashrate.strip(), int(re.sub(r'\D', '', power) or 0), profitability))
-                except (ValueError, IndexError) as e:
-                    logger.warning(f"Пропущена строка при парсинге ASIC: {e} | Строка: {[c.text for c in cols]}")
-                    continue
+        # Заглушка для новостей. В реальном приложении интегрируйте новостной API.
+        news_articles = [
+            "<b>Заголовок новости 1:</b> Ethereum переходит на PoS, что это значит для майнеров?",
+            "<b>Заголовок новости 2:</b> Bitcoin достигает нового исторического максимума!",
+            "<b>Заголовок новости 3:</b> Новые регуляции в области DeFi.",
+        ]
+        response_text = "<b>Последние новости:</b>\n\n" + "\n\n".join(news_articles)
+        await message.answer(response_text)
     except Exception as e:
-        logger.error(f"Ошибка скрапинга AsicMinerValue: {e}", exc_info=True)
-    
-    sorted_miners = sorted(miners, key=lambda m: m.profitability, reverse=True)
-    logger.info(f"Кэш ASIC обновлен. Найдено {len(sorted_miners)} устройств.")
-    return sorted_miners
+        logger.error(f"Ошибка при получении новостей: {e}")
+        await message.answer("Не удалось получить новости. Попробуйте позже.")
 
-@cached(TTLCache(maxsize=1, ttl=300))
-async def get_usd_rub_rate() -> float:
+
+@dp.message(F.text == "😱 Индекс Страха")
+async def show_fear_index(message: types.Message) -> None:
+    """
+    Обрабатывает нажатие кнопки "Индекс Страха".
+    Здесь должна быть логика получения и отображения индекса страха и жадности.
+    """
+    logger.info(f"Пользователь {message.from_user.id} запросил Индекс Страха.")
+    await message.answer("Загружаю текущий индекс страха и жадности...")
     try:
-        async with aiohttp.ClientSession() as session, session.get(Config.CBR_API_URL) as response:
-            data = await response.json()
-            return float(data.get('Valute', {}).get('USD', {}).get('Value', 90.0))
-    except Exception:
-        return 90.0
+        # Пример заглушки. В реальном приложении вы бы запросили данные с
+        # API, например, Crypto Fear & Greed Index API.
+        fear_index_value = "55 (Нейтрально)"
+        fear_index_description = (
+            f"Текущий индекс страха и жадности: <b>{fear_index_value}</b>.\n"
+            "<i>(Индекс измеряет общее настроение на рынке криптовалют. "
+            "0-24: Экстремальный страх, 25-49: Страх, 50-74: Нейтрально, 75-100: Жадность.)</i>"
+        )
+        await message.answer(fear_index_description)
+    except Exception as e:
+        logger.error(f"Ошибка при получении Индекса Страха: {e}")
+        await message.answer("Не удалось получить индекс страха. Попробуйте позже.")
 
-class Calculator:
-    @staticmethod
-    async def calculate(electricity_cost_rub: float) -> str:
-        asics = await get_profitable_asics()
-        if not asics: return "😕 Не удалось получить данные о майнерах для расчета."
-        rate = await get_usd_rub_rate()
-        cost_usd = electricity_cost_rub / rate
-        result = [f"💰 **Расчет профита (розетка {electricity_cost_rub:.2f} ₽/кВтч)**\n"]
-        for asic in asics[:12]:
-            daily_cost = (asic.power / 1000) * 24 * cost_usd
-            profit = asic.profitability - daily_cost
-            result.append(f"**{bleach.clean(asic.name)}**\n   Профит: **${profit:.2f}/день**")
-        return "\n\n".join(result)
 
-class Game:
-    def __init__(self, file_path: str):
-        self.file_path = file_path; self.user_rigs: Dict[str, GameRig] = {}
-    async def load(self):
-        data = await read_json_file(self.file_path)
-        for uid, d in data.items():
-            d['last_collected'] = datetime.fromisoformat(d['last_collected']) if d.get('last_collected') else None
-            self.user_rigs[uid] = GameRig(**d)
-        logger.info(f"Игровые данные загружены: {len(self.user_rigs)} игроков.")
-    async def save(self): await write_json_file(self.file_path, {u: r.__dict__ for u, r in self.user_rigs.items()})
-    async def create_rig(self, user: User) -> str:
-        uid = str(user.id)
-        if uid in self.user_rigs: return "У вас уже есть ферма! /my_rig"
-        asics = await get_profitable_asics()
-        if not asics: return "😕 Не удалось создать ферму, нет данных об оборудовании."
-        starter_asic = asics[random.randint(5, min(15, len(asics)-1))]
-        async with aiohttp.ClientSession() as s, s.get(f"{Config.COINGECKO_API_URL}/simple/price?ids=bitcoin&vs_currencies=usd") as r:
-            btc_price = (await r.json()).get("bitcoin", {}).get("usd", 65000)
-        base_rate = starter_asic.profitability / btc_price
-        self.user_rigs[uid] = GameRig(name=user.full_name, asic_model=starter_asic.name, base_rate=base_rate)
-        return f"🎉 Поздравляем! Ваша ферма с **{starter_asic.name}** создана!"
-    def get_rig_info(self, uid: str) -> Optional[str]:
-        rig = self.user_rigs.get(uid)
-        if not rig: return None
-        rate = rig.base_rate * Config.LEVEL_MULTIPLIERS.get(rig.level, 1)
-        cost = Config.UPGRADE_COSTS.get(rig.level + 1)
-        up_txt = f"Улучшение до {rig.level + 1} ур: `{cost}` BTC." if cost else "Максимальный уровень!"
-        return (f"🖥️ **Ферма «{bleach.clean(rig.name)}»** | Ур. {rig.level}\n"
-                f"Оборудование: *{rig.asic_model}*\n"
-                f"Добыча: `{rate:.8f} BTC/день`\n"
-                f"Баланс: `{rig.balance:.8f}` BTC\n\n{up_txt}")
-    def collect_reward(self, uid: str) -> str:
-        rig = self.user_rigs.get(uid)
-        if not rig: return "У вас нет фермы. /my_rig"
-        if rig.last_collected and (datetime.now() - rig.last_collected) < timedelta(hours=23, minutes=55):
-            h, m = divmod((timedelta(hours=24) - (datetime.now() - rig.last_collected)).seconds, 3600)
-            return f"Еще рано! Попробуйте через **{h}ч {m//60}м**."
-        mined = rig.base_rate * Config.LEVEL_MULTIPLIERS.get(rig.level, 1)
-        rig.balance += mined; rig.last_collected = datetime.now()
-        return f"✅ Собрано **{mined:.8f}** BTC! Ваш баланс: `{rig.balance:.8f}` BTC."
-    def upgrade_rig(self, uid: str) -> str:
-        rig = self.user_rigs.get(uid)
-        if not rig: return "У вас нет фермы."
-        cost = Config.UPGRADE_COSTS.get(rig.level + 1)
-        if not cost: return "🎉 У вас максимальный уровень!"
-        if rig.balance < cost: return f"❌ Нужно {cost} BTC."
-        rig.balance -= cost; rig.level += 1
-        return f"🚀 **Улучшение завершено!** Ваша ферма достигла **{rig.level}** уровня!"
-    def get_top_miners(self) -> str:
-        if not self.user_rigs: return "Пока нет ни одного майнера."
-        s_rigs = sorted(self.user_rigs.values(), key=lambda r: r.balance, reverse=True)
-        top = [f"**{i+1}.** {bleach.clean(r.name)} - `{r.balance:.6f}` BTC (Ур. {r.level})" for i, r in enumerate(s_rigs[:5])]
-        return "🏆 **Топ-5 Виртуальных Майнеров:**\n" + "\n".join(top)
-
-class AntiSpam:
-    def __init__(self, file_path: str):
-        self.file_path = file_path; self.user_profiles: Dict[str, UserProfile] = {}
-        self.spam_keywords = ['p2p', 'арбитраж', 'обмен', 'сигналы']
-    async def load(self):
-        data = await read_json_file(self.file_path)
-        for uid, pd in data.items():
-            pd['first_msg'] = datetime.fromisoformat(pd['first_msg']); pd['last_seen'] = datetime.fromisoformat(pd['last_seen'])
-            self.user_profiles[uid] = UserProfile(**pd)
-        logger.info(f"Профили загружены: {len(self.user_profiles)} записей.")
-    async def save(self): await write_json_file(self.file_path, {u: p.__dict__ for u, p in self.user_profiles.items()})
-    def process_message(self, message: Message):
-        user, uid = message.from_user, str(message.from_user.id)
-        if uid not in self.user_profiles:
-            self.user_profiles[uid] = UserProfile(user.id, user.full_name, user.username)
-        p = self.user_profiles[uid]; p.msg_count += 1; p.last_seen = datetime.utcnow()
-        text = (message.text or message.caption or "").lower()
-        if any(k in text for k in self.spam_keywords): p.spam_count += 1; logger.warning(f"Спам от {p.name}: {p.spam_count}")
-
-game = Game(Config.GAME_DATA_FILE); antispam = AntiSpam(Config.PROFILES_DATA_FILE)
-
-# ==============================================================================
-# Раздел 6: Обработчики команд
-# ==============================================================================
-@dp.message(CommandStart())
-async def send_welcome(message: Message):
-    builder = ReplyKeyboardBuilder()
-    keys = ["💰 Топ ASIC", "📈 Курс", "⛏️ Калькулятор", "📰 Новости", "⏳ Халвинг", "🕹️ Моя ферма"]
-    for k in keys: builder.add(types.KeyboardButton(text=k))
-    builder.adjust(2)
-    await message.answer("👋 Привет! Я твой крипто-помощник.", reply_markup=builder.as_markup(resize_keyboard=True))
-
-async def show_news(message: Message): await message.answer("📰 Функция новостей временно отключена.")
-async def show_halving(message: Message): await message.answer(await get_halving_info(), parse_mode="Markdown")
-
-# --- Обработчики калькулятора ---
-@dp.message(F.text.lower().contains("калькулятор"))
-async def calculator_start(message: Message, state: FSMContext):
-    await state.set_state(Form.waiting_for_calculator_cost)
-    await message.answer("💡 Введите стоимость электроэнергии в **рублях** за кВт/ч (например: `4.5`):", parse_mode="Markdown")
-
-@dp.message(Form.waiting_for_calculator_cost)
-async def calculator_process(message: Message, state: FSMContext):
+@dp.message(F.text == "⏳ Халвинг")
+async def show_halving_info(message: types.Message) -> None:
+    """
+    Обрабатывает нажатие кнопки "Халвинг".
+    Предоставляет информацию о халвинге Bitcoin.
+    """
+    logger.info(f"Пользователь {message.from_user.id} запросил Халвинг.")
+    await message.answer("Предоставляю информацию о халвинге Bitcoin...")
     try:
-        cost = float(message.text.replace(',', '.')); await state.clear()
-        await message.answer(await Calculator.calculate(cost), parse_mode="Markdown")
-    except ValueError: await message.answer("❌ Неверный формат. Введите число (например: `4.5`).")
+        # Заглушка для информации о халвинге.
+        # Можно сделать динамическое получение следующей даты халвинга.
+        halving_info = (
+            "<b>Что такое халвинг Bitcoin?</b>\n"
+            "Халвинг — это событие, которое происходит примерно каждые четыре года "
+            "или после добычи каждых 210 000 блоков. В результате халвинга "
+            "награда майнерам за добычу нового блока сокращается вдвое.\n\n"
+            "Последний халвинг произошел в мае 2024 года, сократив награду до 3.125 BTC.\n"
+            "Следующий халвинг ожидается примерно в <b>2028 году</b>."
+        )
+        await message.answer(halving_info)
+    except Exception as e:
+        logger.error(f"Ошибка при получении информации о Халвинге: {e}")
+        await message.answer("Произошла ошибка при получении информации о халвинге.")
 
-# --- Обработчики игры ---
-@dp.message(F.text.lower().contains("моя ферма"))
-async def my_rig_handler(message: Message):
-    uid = str(message.from_user.id)
-    info = game.get_rig_info(uid)
-    if info:
-        builder = InlineKeyboardBuilder()
-        builder.button(text="💰 Собрать", callback_data="game_collect")
-        builder.button(text="🚀 Улучшить", callback_data="game_upgrade")
-        builder.button(text="🏆 Топ-5", callback_data="game_top")
-        builder.adjust(2)
-        await message.answer(info, parse_mode="Markdown", reply_markup=builder.as_markup())
-    else:
-        creation_msg = await game.create_rig(message.from_user)
-        await message.answer(creation_msg, parse_mode="Markdown")
-        if "Поздравляем" in creation_msg: await my_rig_handler(message)
 
-@dp.callback_query(F.data.startswith("game_"))
-async def game_callbacks(cb: CallbackQuery):
-    action, uid = cb.data.split("_")[1], str(cb.from_user.id)
-    text = ""
-    if action == "collect": text = game.collect_reward(uid)
-    elif action == "upgrade": text = game.upgrade_rig(uid)
-    elif action == "top": text = game.get_top_miners()
-    await cb.answer(text, show_alert=action != "top")
-    if action == "top": await cb.message.answer(text, parse_mode="Markdown")
-    
-    info = game.get_rig_info(uid)
-    if info:
-        try: await cb.message.edit_text(info, parse_mode="Markdown", reply_markup=cb.message.reply_markup)
-        except: pass # Сообщение не изменилось
+@dp.message(F.text == "📊 Статус ВТС")
+async def show_btc_status(message: types.Message) -> None:
+    """
+    Обрабатывает нажатие кнопки "Статус ВТС".
+    Предоставляет информацию о текущем статусе сети Bitcoin.
+    """
+    logger.info(f"Пользователь {message.from_user.id} запросил Статус ВТС.")
+    await message.answer("Загружаю текущий статус сети Bitcoin...")
+    try:
+        # Заглушка. В реальном приложении вы бы запросили данные с API
+        # (например, Blockchair, Blockchain.com)
+        btc_status_info = (
+            "<b>Статус сети Bitcoin (примерные данные):</b>\n"
+            "Текущий блок: <b>850,123</b>\n"
+            "Хешрейт сети: <b>~550 EH/s</b>\n"
+            "Примерное время следующего блока: <b>~10 минут</b>\n"
+            "Сложность: <b>~100.2 T</b>\n"
+            "\n<i>(Данные могут быть устаревшими. Для актуальной информации обращайтесь к обозревателям блоков.)</i>"
+        )
+        await message.answer(btc_status_info)
+    except Exception as e:
+        logger.error(f"Ошибка при получении Статуса ВТС: {e}")
+        await message.answer("Не удалось получить статус сети Bitcoin. Попробуйте позже.")
 
-# --- Обработчики курса ---
-@dp.message(F.text.lower().contains("курс"))
-async def price_start(message: Message, state: FSMContext):
-    await state.set_state(Form.waiting_for_ticker)
-    await message.answer("Введите тикер криптовалюты:")
 
-@dp.message(Form.waiting_for_ticker)
-async def process_ticker(message: Message, state: FSMContext):
-    await state.clear()
-    coin = await get_crypto_price(message.text)
-    if not coin: return await message.answer(f"😕 Не удалось найти информацию по запросу '{message.text}'.")
-    await message.answer(f"**{coin.name} ({coin.symbol})**: `${coin.price:,.4f}`", parse_mode="Markdown")
+@dp.message(F.text == "🧠 Викторина")
+async def start_quiz(message: types.Message) -> None:
+    """
+    Обрабатывает нажатие кнопки "Викторина".
+    Начинает простую викторину. Для полноценной викторины
+    потребуется управление состоянием пользователя (FSM).
+    """
+    logger.info(f"Пользователь {message.from_user.id} запросил Викторину.")
+    await message.answer(
+        "Добро пожаловать в крипто-викторину! Я задам тебе вопрос. "
+        "Какой год считается годом создания Bitcoin?"
+    )
+    # В реальной викторине здесь вы бы сохраняли состояние, чтобы ожидать ответ.
+    # Например: await state.set_state(QuizStates.waiting_for_answer)
 
-# --- Маршрутизатор остальных текстовых команд ---
-@dp.message(F.text)
-async def text_command_router(message: Message, state: FSMContext):
-    text = message.text.lower()
-    if "топ asic" in text: await show_asics(message)
-    elif "новости" in text: await show_news(message)
-    elif "халвинг" in text: await show_halving(message)
-    else: # Если ничего не подошло, считаем спамом
-        antispam.process_message(message)
 
-# ==============================================================================
-# Раздел 7: Основная функция запуска бота
-# ==============================================================================
-async def main():
-    if not Config.TELEGRAM_BOT_TOKEN:
-        return logger.critical("Токен Telegram-бота не найден!")
-    
-    await game.load(); await antispam.load()
-    scheduler.add_job(game.save, 'interval', minutes=5)
-    scheduler.add_job(antispam.save, 'interval', minutes=5)
-    scheduler.start()
-    logger.info("Планировщик сохранения данных запущен.")
-    
-    await bot.delete_webhook(drop_pending_updates=True)
+@dp.message(F.text == "🗓️ Слово дня")
+async def get_word_of_the_day(message: types.Message) -> None:
+    """
+    Обрабатывает нажатие кнопки "Слово дня".
+    Предоставляет случайное крипто-слово и его определение.
+    """
+    logger.info(f"Пользователь {message.from_user.id} запросил Слово дня.")
+    await message.answer("Загружаю слово дня...")
+    try:
+        # Можно создать список слов и выбирать случайное.
+        words_of_the_day = {
+            "HODL": "Популярный мем и стратегия в криптосообществе, означающая 'держать' "
+                    "криптовалюту, не продавая ее, несмотря на падения цен.",
+            "DeFi": "Сокращение от 'децентрализованные финансы' — это экосистема "
+                    "финансовых приложений, построенных на блокчейне.",
+            "NFT": "Сокращение от 'невзаимозаменяемый токен' — уникальный цифровой "
+                   "актив, который может представлять собой что угодно, "
+                   "от произведений искусства до коллекционных предметов."
+        }
+        import random
+        word, definition = random.choice(list(words_of_the_day.items()))
+        await message.answer(f"<b>Слово дня: {word}</b>\n\n{definition}")
+    except Exception as e:
+        logger.error(f"Ошибка при получении Слова дня: {e}")
+        await message.answer("Не удалось получить слово дня. Попробуйте позже.")
+
+
+@dp.message(F.text == "⛏️ Виртуальный Майнинг")
+async def start_virtual_mining(message: types.Message) -> None:
+    """
+    Обрабатывает нажатие кнопки "Виртуальный Майнинг".
+    Это может быть заглушка для будущей игры или симуляции.
+    """
+    logger.info(f"Пользователь {message.from_user.id} запросил Виртуальный Майнинг.")
+    await message.answer(
+        "Добро пожаловать в симулятор виртуального майнинга! "
+        "Здесь вы сможете попробовать себя в роли майнера без реального оборудования. "
+        "<i>(Функционал в разработке!)</i>"
+    )
+
+# --- Главная функция запуска бота ---
+async def main() -> None:
+    """
+    Основная асинхронная функция для запуска бота.
+    """
     logger.info("Запуск бота...")
+    # Запускаем все зарегистрированные обработчики
     await dp.start_polling(bot)
 
-if __name__ == '__main__':
-    try: asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit): logger.info("Бот остановлен.")
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен вручную.")
+    except Exception as e:
+        logger.error(f"Произошла непредвиденная ошибка при запуске бота: {e}")
+
 
