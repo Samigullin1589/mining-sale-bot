@@ -17,7 +17,7 @@ import aiohttp
 import bleach
 import feedparser
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart, Command, Text
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, User
@@ -139,7 +139,7 @@ async def get_profitable_asics() -> List[AsicMiner]:
                     name, hashrate, power, algo, prof = cols[0].text, cols[2].text, cols[3].text, cols[5].text, cols[6].text
                     profitability = float(re.sub(r'[^\d.]', '', prof)) if prof else 0.0
                     if profitability > 0:
-                        miners.append(AsicMiner(name.strip(), algo.strip(), hashrate.strip(), int(re.sub(r'\D', '', power)), profitability, 'AsicMinerValue'))
+                        miners.append(AsicMiner(name.strip(), algo.strip(), hashrate.strip(), int(re.sub(r'\D', '', power) or 0), profitability, 'AsicMinerValue'))
     except Exception as e:
         logger.error(f"Ошибка скрапинга AsicMinerValue: {e}", exc_info=True)
     
@@ -198,8 +198,9 @@ class Game:
         if not top_asics: return "😕 Не удалось создать ферму, нет данных об оборудовании."
         
         starter_asic = top_asics[random.randint(5, 15)] # Берем не самый топовый для старта
-        btc_price_data = await get_crypto_price("BTC")
-        btc_price = btc_price_data.price if btc_price_data else 65000
+        async with aiohttp.ClientSession() as session: # Получаем цену BTC для расчета
+            resp = await session.get(f"{Config.COINGECKO_API_URL}/simple/price?ids=bitcoin&vs_currencies=usd")
+            btc_price = (await resp.json()).get("bitcoin", {}).get("usd", 65000)
         
         base_rate = starter_asic.profitability / btc_price
         
@@ -267,6 +268,9 @@ class AntiSpam:
     async def load(self):
         data = await read_json_file(self.file_path)
         for uid, profile_data in data.items():
+            # Преобразование строковых дат обратно в datetime объекты
+            profile_data['first_msg'] = datetime.fromisoformat(profile_data['first_msg'])
+            profile_data['last_seen'] = datetime.fromisoformat(profile_data['last_seen'])
             self.user_profiles[uid] = UserProfile(**profile_data)
         logger.info(f"Профили пользователей загружены. {len(self.user_profiles)} записей.")
 
@@ -286,9 +290,6 @@ class AntiSpam:
         text = (message.text or message.caption or "").lower()
         if any(keyword in text for keyword in self.spam_keywords):
             profile.spam_count += 1
-            # Здесь можно добавить логику для удаления сообщения и выдачи предупреждения
-            # asyncio.create_task(bot.delete_message(...))
-            # asyncio.create_task(bot.send_message(...))
             logger.warning(f"Обнаружен спам от {user.full_name} ({uid}). Счетчик: {profile.spam_count}")
 
 # Инициализация модулей
@@ -299,33 +300,21 @@ antispam = AntiSpam(Config.PROFILES_DATA_FILE)
 # Раздел 6: Функции отображения и обработчики
 # ==============================================================================
 
-# --- Функции отображения (вызываются из обработчиков) ---
-async def show_main_menu(message: Message, text: str = "👋 Привет! Я твой крипто-помощник."):
-    builder = ReplyKeyboardBuilder()
-    builder.row(types.KeyboardButton(text="💰 Топ ASIC"), types.KeyboardButton(text="📈 Курс"))
-    builder.row(types.KeyboardButton(text="⛏️ Калькулятор"), types.KeyboardButton(text="📰 Новости"))
-    builder.row(types.KeyboardButton(text="⏳ Халвинг"), types.KeyboardButton(text="🕹️ Моя ферма"))
-    await message.answer(text, reply_markup=builder.as_markup(resize_keyboard=True))
+async def get_crypto_price(query: str) -> Optional[CryptoCoin]:
+    query = query.lower().strip()
+    if not query: return None
+    async with aiohttp.ClientSession() as session:
+        resp = await session.get(f"{Config.COINGECKO_API_URL}/search", params={'query': query})
+        search_data = await resp.json()
+        if not (search_data and search_data.get('coins')): return None
+        coin_id = search_data['coins'][0].get('id')
+        if not coin_id: return None
+        resp = await session.get(f"{Config.COINGECKO_API_URL}/coins/markets", params={'vs_currency': 'usd', 'ids': coin_id})
+        market_data_list = await resp.json()
+        if not market_data_list: return None
+        md = market_data_list[0]
+        return CryptoCoin(md.get('id'), md.get('symbol', '').upper(), md.get('name'), md.get('current_price', 0.0), market_cap=md.get('market_cap', 0))
 
-async def show_asics(message: Message):
-    await message.answer("🔍 Ищу самые доходные ASIC-майнеры...")
-    asics = await get_profitable_asics()
-    if not asics: return await message.answer("😕 Не удалось получить данные о майнерах.")
-    response_text = "🏆 **Топ-10 самых доходных ASIC-майнеров на сегодня:**\n\n"
-    for i, miner in enumerate(asics[:10]):
-        response_text += (f"**{i+1}. {bleach.clean(miner.name)}**\n"
-                          f"   - Алгоритм: `{miner.algorithm}`\n"
-                          f"   - Доход в день: `${miner.profitability:.2f}`\n")
-    await message.answer(response_text, parse_mode="Markdown")
-
-async def show_news(message: Message):
-    # Логика получения и отображения новостей (упрощена)
-    await message.answer("📰 Функция новостей в разработке.")
-
-async def show_halving_info(message: Message):
-    await message.answer("⏳ Рассчитываю время до халвинга...")
-    text = await get_halving_info()
-    await message.answer(text, parse_mode="Markdown")
 
 async def process_crypto_query(message: Message, state: FSMContext):
     await state.clear()
@@ -334,13 +323,17 @@ async def process_crypto_query(message: Message, state: FSMContext):
     coin = await get_crypto_price(query)
     if not coin: return await message.answer(f"😕 Не удалось найти информацию по запросу '{query}'.")
     response_text = f"**{coin.name} ({coin.symbol.upper()})**\n\n💰 **Цена:** ${coin.price:,.4f}\n"
-    if coin.algorithm: response_text += f"⚙️ **Алгоритм:** `{coin.algorithm}`\n"
+    if coin.market_cap: response_text += f"📊 **Капитализация:** ${coin.market_cap:,.0f}\n"
     await message.answer(response_text, parse_mode="Markdown")
 
 # --- Основные обработчики команд ---
 @dp.message(CommandStart())
 async def send_welcome(message: Message):
-    await show_main_menu(message)
+    builder = ReplyKeyboardBuilder()
+    builder.row(types.KeyboardButton(text="💰 Топ ASIC"), types.KeyboardButton(text="📈 Курс"))
+    builder.row(types.KeyboardButton(text="⛏️ Калькулятор"), types.KeyboardButton(text="📰 Новости"))
+    builder.row(types.KeyboardButton(text="⏳ Халвинг"), types.KeyboardButton(text="🕹️ Моя ферма"))
+    await message.answer("👋 Привет! Я твой крипто-помощник.", reply_markup=builder.as_markup(resize_keyboard=True))
 
 @dp.message(F.text.lower().contains("топ asic"))
 async def text_asics_handler(message: Message): await show_asics(message)
@@ -348,24 +341,14 @@ async def text_asics_handler(message: Message): await show_asics(message)
 async def text_news_handler(message: Message): await show_news(message)
 @dp.message(F.text.lower().contains("халвинг"))
 async def text_halving_handler(message: Message): await show_halving_info(message)
-
-# --- Обработчики калькулятора (с состояниями) ---
 @dp.message(F.text.lower().contains("калькулятор"))
 async def calculator_start(message: Message, state: FSMContext):
     await state.set_state(Form.waiting_for_calculator_cost)
     await message.answer("💡 Введите стоимость электроэнергии в **рублях** за кВт/ч (например: `4.5`):", parse_mode="Markdown")
-
-@dp.message(Form.waiting_for_calculator_cost)
-async def calculator_process(message: Message, state: FSMContext):
-    try:
-        cost = float(message.text.replace(',', '.'))
-        await state.clear()
-        calculation_result = await Calculator.calculate(cost)
-        await message.answer(calculation_result, parse_mode="Markdown")
-    except ValueError:
-        await message.answer("❌ Неверный формат. Введите число (например: `4.5`).")
-
-# --- Обработчики игры ---
+@dp.message(F.text.lower().contains("курс"))
+async def price_start(message: Message, state: FSMContext):
+    await state.set_state(Form.waiting_for_ticker)
+    await message.answer("Введите тикер или название криптовалюты:")
 @dp.message(F.text.lower().contains("моя ферма"))
 async def my_rig_handler(message: Message):
     uid = str(message.from_user.id)
@@ -378,11 +361,29 @@ async def my_rig_handler(message: Message):
         builder.adjust(2)
         await message.answer(info, parse_mode="Markdown", reply_markup=builder.as_markup())
     else:
-        await game.create_rig(message.from_user)
-        # Повторно вызываем, чтобы показать созданную ферму
-        await my_rig_handler(message)
+        creation_message = await game.create_rig(message.from_user)
+        await message.answer(creation_message, parse_mode="Markdown")
+        # Повторно вызываем, чтобы показать созданную ферму, если она была создана
+        if "Поздравляем" in creation_message:
+            await my_rig_handler(message)
 
-@dp.callback_query(Text(startswith="game_"))
+# --- Обработчики состояний ---
+@dp.message(Form.waiting_for_calculator_cost)
+async def calculator_process(message: Message, state: FSMContext):
+    try:
+        cost = float(message.text.replace(',', '.'))
+        await state.clear()
+        calculation_result = await Calculator.calculate(cost)
+        await message.answer(calculation_result, parse_mode="Markdown")
+    except ValueError:
+        await message.answer("❌ Неверный формат. Введите число (например: `4.5`).")
+
+@dp.message(Form.waiting_for_ticker)
+async def process_ticker(message: Message, state: FSMContext):
+    await process_crypto_query(message, state)
+
+# --- Обработчики колбэков ---
+@dp.callback_query(F.data.startswith("game_"))
 async def game_callbacks(cb: CallbackQuery):
     action = cb.data.split("_")[1]
     uid = str(cb.from_user.id)
@@ -393,42 +394,34 @@ async def game_callbacks(cb: CallbackQuery):
     
     await cb.answer(response_text, show_alert=True)
     
-    # Обновляем сообщение с информацией о ферме
     info = game.get_rig_info(uid)
-    if info: await cb.message.edit_text(info, parse_mode="Markdown", reply_markup=cb.message.reply_markup)
+    if info:
+        try:
+            await cb.message.edit_text(info, parse_mode="Markdown", reply_markup=cb.message.reply_markup)
+        except Exception as e:
+            logger.info(f"Не удалось обновить игровое сообщение (возможно, не изменилось): {e}")
 
-
-# --- Обработчики курса (с состояниями) ---
-@dp.message(F.text.lower().contains("курс"))
-async def price_start(message: Message, state: FSMContext):
-    await state.set_state(Form.waiting_for_ticker)
-    await message.answer("Введите тикер или название криптовалюты:")
-
-@dp.message(Form.waiting_for_ticker)
-async def process_ticker(message: Message, state: FSMContext):
-    await process_crypto_query(message, state)
-
-# --- Общий обработчик текста для антиспама (должен быть последним) ---
+# --- Общий обработчик ---
 @dp.message()
-async def any_text_handler(message: Message):
+async def any_text_handler(message: Message, state: FSMContext):
     antispam.process_message(message)
-    # Можно добавить ответ-заглушку, если бот не понял команду
-    # await message.answer("Не совсем понял вас. Воспользуйтесь кнопками меню.")
+    # Если мы не в каком-либо состоянии, то считаем, что это запрос курса
+    current_state = await state.get_state()
+    if current_state is None:
+        await process_crypto_query(message, state)
 
 # ==============================================================================
-# Раздел 8: Основная функция запуска бота
+# Раздел 7: Основная функция запуска бота
 # ==============================================================================
 async def main():
     if not Config.TELEGRAM_BOT_TOKEN:
         return logger.critical("Токен Telegram-бота не найден!")
     
-    # Загрузка данных при старте
     await game.load()
     await antispam.load()
 
-    # Настройка и запуск планировщика
-    scheduler.add_job(game.save, 'interval', minutes=5, id='save_game')
-    scheduler.add_job(antispam.save, 'interval', minutes=5, id='save_profiles')
+    scheduler.add_job(game.save, 'interval', minutes=5, id='save_game_data')
+    scheduler.add_job(antispam.save, 'interval', minutes=5, id='save_profiles_data')
     scheduler.start()
     logger.info("Планировщик для сохранения данных запущен.")
 
