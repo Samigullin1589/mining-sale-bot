@@ -9,7 +9,6 @@ import time
 import threading
 import schedule
 import json
-import atexit
 import httpx
 import gspread
 import io
@@ -44,13 +43,9 @@ class Config:
     """Класс для хранения всех настроек и констант."""
     BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
     WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-    CRYPTO_API_KEY = os.getenv("CRYPTO_API_KEY") # Для CryptoPanic
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
     NEWS_CHAT_ID = os.getenv("NEWS_CHAT_ID")
     ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
-    GOOGLE_JSON_STR = os.getenv("GOOGLE_JSON")
-    SHEET_ID = os.getenv("SHEET_ID")
-    SHEET_NAME = os.getenv("SHEET_NAME", "Лист1")
     
     GAME_DATA_FILE = "game_data.json"
     PROFILES_DATA_FILE = "user_profiles.json"
@@ -122,7 +117,7 @@ except Exception as e: openai_client = None; logger.critical(f"Не удалос
 user_quiz_states = {}
 
 # ========================================================================================
-# 3. КЛАССЫ ЛОГИКИ (API, ИГРА, АНТИСПАМ) - ВЕРСИЯ 9.0
+# 3. КЛАССЫ ЛОГИКИ (API, ИГРА, АНТИСПАМ) - ВЕРСИЯ 9.1
 # ========================================================================================
 class ApiHandler:
     def __init__(self):
@@ -140,7 +135,7 @@ class ApiHandler:
                     response = client.get(url); response.raise_for_status()
                     return response.json() if is_json else response
             except httpx.HTTPStatusError as e:
-                if e.response.status_code == 429: # Too Many Requests
+                if e.response.status_code == 429:
                     wait_time = backoff_factor * (2 ** i)
                     logger.warning(f"Слишком много запросов к {url}. Попытка {i+1}/{retries}. Жду {wait_time:.2f} секунд.")
                     time.sleep(wait_time)
@@ -625,7 +620,6 @@ def handle_admin_commands(msg):
             bot.delete_message(msg.chat.id, msg.message_id)
     except Exception as e: logger.error(f"Ошибка выполнения команды {command}: {e}"); bot.reply_to(msg, "Не удалось выполнить действие.")
 
-# ... (Остальные обработчики)
 @bot.message_handler(func=lambda msg: msg.text in ["💹 Курс", "⚙️ Топ ASIC", "📰 Новости", "😱 Индекс Страха", "⏳ Халвинг", "📡 Статус BTC", "🎓 Слово дня", "🧠 Викторина", "🕹️ Виртуальный Майнинг", "⛏️ Калькулятор"])
 def handle_main_menu_buttons(msg):
     bot.send_chat_action(msg.chat.id, 'typing')
@@ -724,10 +718,12 @@ def process_calculator_step(msg):
     send_message_with_partner_button(msg.chat.id, "\n\n".join(result))
     bot.send_message(msg.chat.id, "Выберите действие:", reply_markup=get_main_keyboard())
 
-
 def handle_quiz(msg):
     questions = api.generate_quiz_questions_with_gpt()
-    if not questions: questions = Config.QUIZ_QUESTIONS # Fallback to static if GPT fails
+    if not questions: 
+        logger.warning("Не удалось сгенерировать вопросы через GPT, использую статические.")
+        questions = random.sample(Config.QUIZ_QUESTIONS, k=Config.QUIZ_QUESTIONS_COUNT)
+        
     user_quiz_states[msg.from_user.id] = {'score': 0, 'question_index': 0, 'questions': questions}
     bot.send_message(msg.chat.id, f"🔥 <b>Начинаем крипто-викторину!</b>\nОтветьте на {len(questions)} вопросов.", reply_markup=types.ReplyKeyboardRemove())
     send_quiz_question(msg.chat.id, msg.from_user.id)
@@ -771,7 +767,7 @@ def get_game_menu(user_id, user_name):
     rig_info_text, rig_info_markup = game.get_rig_info(user_id, user_name)
     if rig_info_markup: return rig_info_text, rig_info_markup
     markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(types.InlineKeyboardButton("💰 Собрать", callback_data="game_collect"), types.InlineKeyboardButton("🚀 Улучшить", callback_data="game_upgrade"))
+    markup.add(types.InlineKeyboardButton("💰 Собрать", callback_data="game_collect"), types.InlineKeyboardButton("� Улучшить", callback_data="game_upgrade"))
     markup.add(types.InlineKeyboardButton("🏆 Топ Майнеров", callback_data="game_top"), types.InlineKeyboardButton("🛍️ Магазин", callback_data="game_shop"))
     markup.add(types.InlineKeyboardButton("💵 Вывести в реал", callback_data="game_withdraw"), types.InlineKeyboardButton("🔄 Обновить", callback_data="game_rig"))
     return rig_info_text, markup
