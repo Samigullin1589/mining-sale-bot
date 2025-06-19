@@ -630,8 +630,12 @@ async def main():
     else:
         logger.warning("NEWS_CHAT_ID не указан, автоматическая отправка новостей отключена.")
 
+    # Удаляем старый вебхук перед запуском
+    logger.info("Удаление старого вебхука...")
+    await bot.delete_webhook(drop_pending_updates=True)
+
     # Запуск бота
-    logger.info("Запуск бота...")
+    logger.info("Запуск бота в режиме long-polling...")
     try:
         await dp.start_polling(bot)
     finally:
@@ -644,4 +648,3 @@ if __name__ == '__main__':
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Бот остановлен.")
-
