@@ -60,7 +60,7 @@ class Config:
         logger.critical("Критическая ошибка: TG_BOT_TOKEN не установлен.") 
         raise ValueError("Критическая ошибка: TG_BOT_TOKEN не установлен") 
 
-    PARTNER_URL = os.getenv("PARTNER_URL", "https://app.leadteh.ru/w/dTeKr") 
+    PARTNER_URL = os.getenv("PARTNER_URL", "https://cutt.ly/5rWGcgYL") 
     PARTNER_BUTTON_TEXT_OPTIONS = ["🎁 Узнать спеццены", "🔥 Эксклюзивное предложение", "💡 Получить консультацию", "💎 Прайс от экспертов"] 
     PARTNER_AD_TEXT_OPTIONS = [ 
         "Хотите превратить виртуальные BTC в реальные? Для этого нужно настоящее оборудование! Наши партнеры предлагают лучшие условия для старта.", 
@@ -269,7 +269,7 @@ class ApiHandler:
         return (None, None) 
 
     # ========================================================================================
-    # БЛОК ПОЛУЧЕНИЯ ДАННЫХ ОБ ASIC. ВЕРСИЯ 2.0
+    # БЛОК ПОЛУЧЕНИЯ ДАННЫХ ОБ ASIC. ВЕРСИЯ 2.1
     # ========================================================================================
 
     def _get_asics_from_api(self): 
@@ -909,28 +909,51 @@ class SpamAnalyzer:
         if any(keyword in text_lower for keyword in all_keywords): 
             self.handle_spam_detection(msg) 
 
-    def handle_spam_detection(self, msg: types.Message): 
-        user = msg.from_user 
-        profile = self.user_profiles.get(user.id) 
-        if not profile: return 
-        
-        profile['spam_count'] = profile.get('spam_count', 0) + 1 
-        logger.warning(f"Обнаружено спам-сообщение от {user.full_name} ({user.id}). Счетчик спама: {profile['spam_count']}") 
-        
-        try: bot.delete_message(msg.chat.id, msg.message_id) 
-        except Exception as e: logger.error(f"Не удалось удалить спам-сообщение: {e}") 
+    def handle_spam_detection(self, msg: types.Message):
+        user = msg.from_user
+        profile = self.user_profiles.get(user.id)
+        if not profile: return
 
-        if profile['spam_count'] >= Config.WARN_LIMIT: 
-            try: 
-                mute_until = datetime.now() + timedelta(hours=Config.MUTE_DURATION_HOURS) 
-                bot.restrict_chat_member(msg.chat.id, user.id, until_date=int(mute_until.timestamp())) 
-                bot.send_message(msg.chat.id, f"❗️ Пользователь {telebot.util.escape(user.full_name)} получил слишком много предупреждений и временно ограничен в отправке сообщений на {Config.MUTE_DURATION_HOURS} часов.") 
-                profile['spam_count'] = 0 
-            except Exception as e: 
-                logger.error(f"Не удалось выдать мьют пользователю {user.id}: {e}") 
-        else: 
-            remaining_warns = Config.WARN_LIMIT - profile['spam_count'] 
-            bot.send_message(msg.chat.id, f"⚠️ Предупреждение для {telebot.util.escape(user.full_name)}! Ваше сообщение похоже на спам. Осталось предупреждений до временного мьюта: <b>{remaining_warns}</b>.") 
+        original_text = msg.text or msg.caption or "[Сообщение без текста]"
+
+        profile['spam_count'] = profile.get('spam_count', 0) + 1
+        logger.warning(f"Обнаружено спам-сообщение от {user.full_name} ({user.id}). Счетчик спама: {profile['spam_count']}")
+
+        try:
+            bot.delete_message(msg.chat.id, msg.message_id)
+        except Exception as e:
+            logger.error(f"Не удалось удалить спам-сообщение: {e}")
+
+        # Создаем кнопку для отмены действия
+        markup = types.InlineKeyboardMarkup()
+        callback_data = f"not_spam_{user.id}_{msg.chat.id}"
+        markup.add(types.InlineKeyboardButton("✅ Не спам", callback_data=callback_data))
+
+        # Отправляем лог администратору с кнопкой отмены
+        if Config.ADMIN_CHAT_ID:
+            try:
+                admin_text = (f"❗️<b>Обнаружен возможный спам</b>\n\n"
+                              f"<b>Пользователь:</b> {telebot.util.escape(user.full_name)} (<code>{user.id}</code>)\n"
+                              f"<b>Чат ID:</b> <code>{msg.chat.id}</code>\n"
+                              f"<b>Сообщение удалено.</b>\n\n"
+                              f"<b>Текст:</b>\n<blockquote>{telebot.util.escape(original_text)}</blockquote>\n\n"
+                              f"<i>Если это ошибка, нажмите кнопку ниже, чтобы восстановить сообщение и снять предупреждение.</i>")
+                bot.send_message(Config.ADMIN_CHAT_ID, admin_text, reply_markup=markup)
+            except Exception as e:
+                logger.error(f"Не удалось отправить лог администратору: {e}")
+
+        # Применяем наказание (мьют) или выводим предупреждение в чат
+        if profile['spam_count'] >= Config.WARN_LIMIT:
+            try:
+                mute_until = datetime.now() + timedelta(hours=Config.MUTE_DURATION_HOURS)
+                bot.restrict_chat_member(msg.chat.id, user.id, until_date=int(mute_until.timestamp()))
+                bot.send_message(msg.chat.id, f"❗️ Пользователь {telebot.util.escape(user.full_name)} получил слишком много предупреждений и временно ограничен в отправке сообщений на {Config.MUTE_DURATION_HOURS} часов.")
+                profile['spam_count'] = 0  # Сбрасываем счетчик после мьюта
+            except Exception as e:
+                logger.error(f"Не удалось выдать мьют пользователю {user.id}: {e}")
+        else:
+            remaining_warns = Config.WARN_LIMIT - profile['spam_count']
+            bot.send_message(msg.chat.id, f"⚠️ Предупреждение для {telebot.util.escape(user.full_name)}! Ваше сообщение похоже на спам. Осталось предупреждений до мьюта: <b>{remaining_warns}</b>.\n\n<i>Если это ошибка, обратитесь к администратору.</i>")
 
     def get_user_info_text(self, user_id: int) -> str: 
         profile = self.user_profiles.get(user_id) 
@@ -1019,7 +1042,7 @@ def is_admin(chat_id, user_id):
     try: 
         return user_id in [admin.user.id for admin in bot.get_chat_administrators(chat_id)] 
     except Exception as e: 
-        logger.error(f"Не удалось проверить права администратора: {e}") 
+        logger.error(f"Не удалось проверить права администратора для чата {chat_id}: {e}") 
         return False 
 
  # ======================================================================================== 
@@ -1315,6 +1338,51 @@ def handle_start_rig_callback(call):
     except Exception as e: 
         logger.error(f"Критическая ошибка при создании фермы: {e}", exc_info=True) 
         bot.answer_callback_query(call.id, "Произошла критическая ошибка.", show_alert=True) 
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('not_spam_'))
+def handle_not_spam_callback(call):
+    try:
+        _, user_id_str, chat_id_str = call.data.split('_')
+        user_id = int(user_id_str)
+        original_chat_id = int(chat_id_str)
+    except Exception as e:
+        logger.error(f"Ошибка парсинга callback_data для not_spam: {e}")
+        return bot.answer_callback_query(call.id, "Ошибка данных.", show_alert=True)
+    
+    # Проверяем, является ли нажавший администратором оригинального чата
+    if not is_admin(original_chat_id, call.from_user.id):
+        return bot.answer_callback_query(call.id, "Это действие только для администраторов чата.", show_alert=True)
+
+    # Уменьшаем счетчик спама для пользователя
+    profile = spam_analyzer.user_profiles.get(user_id)
+    if profile:
+        profile['spam_count'] = max(0, profile.get('spam_count', 0) - 1)
+        logger.info(f"Администратор {call.from_user.full_name} отменил спам-предупреждение для пользователя {user_id}. Новый счетчик: {profile['spam_count']}")
+    
+    # Извлекаем оригинальный текст из сообщения в логе
+    try:
+        original_text = call.message.html_text.split("Текст:\n")[1].split("\n\n<i>Если это ошибка")[0]
+        original_text = original_text.replace("<blockquote>", "").replace("</blockquote>", "").strip()
+    except IndexError:
+        original_text = "[Не удалось восстановить текст]"
+        logger.error("Не удалось извлечь текст из сообщения лога для восстановления.")
+
+    # Пересылаем восстановленное сообщение в оригинальный чат
+    try:
+        user_info = spam_analyzer.user_profiles.get(user_id, {'name': 'Неизвестный пользователь'})
+        repost_text = f"✅ Сообщение от <b>{telebot.util.escape(user_info['name'])}</b> было восстановлено администратором:\n\n<blockquote>{telebot.util.escape(original_text)}</blockquote>"
+        bot.send_message(original_chat_id, repost_text)
+    except Exception as e:
+        logger.error(f"Не удалось переслать восстановленное сообщение в чат {original_chat_id}: {e}")
+
+    # Обновляем сообщение в логе администратора
+    try:
+        updated_admin_text = call.message.html_text + f"\n\n<b>✅ Восстановлено администратором:</b> {call.from_user.full_name}"
+        bot.edit_message_text(updated_admin_text, call.message.chat.id, call.message.message_id, reply_markup=None)
+    except Exception as e:
+        logger.error(f"Не удалось обновить сообщение в логе администратора: {e}")
+    
+    bot.answer_callback_query(call.id, "Сообщение восстановлено, предупреждение снято.")
 
 @bot.message_handler(content_types=['text'], func=lambda msg: not msg.text.startswith('/')) 
 def handle_non_command_text(msg): 
