@@ -182,8 +182,8 @@ class ApiHandler:
             response = requests.get(url, headers=headers, timeout=timeout) 
             response.raise_for_status() 
             return response.json() if is_json else response 
-        except requests.exceptions.RequestException as e: 
-            logger.warning(f"Сетевой запрос не удался для {url}: {e}") 
+        except (requests.exceptions.RequestException, json.JSONDecodeError) as e: 
+            logger.warning(f"Сетевой запрос или декодирование JSON не удалось для {url}: {e}") 
             return None 
 
     def _load_asic_cache_from_file(self): 
@@ -533,29 +533,43 @@ class ApiHandler:
             logger.error(f"Ошибка при создании графика индекса страха: {e}", exc_info=True) 
             return None, "[❌ Ошибка при получении индекса]" 
 
-    def get_usd_rub_rate(self): 
-        if self.currency_cache.get("rate") and (datetime.now() - self.currency_cache.get("timestamp", datetime.min) < timedelta(minutes=30)): 
-            return self.currency_cache["rate"] 
+    def get_usd_rub_rate(self):
+        if self.currency_cache.get("rate") and (datetime.now() - self.currency_cache.get("timestamp", datetime.min) < timedelta(minutes=30)):
+            return self.currency_cache["rate"], False
+
+        sources = [
+            "https://api.exchangerate.host/latest?base=USD&symbols=RUB",
+            "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json",
+            "https://open.er-api.com/v6/latest/USD",
+            "https://api.frankfurter.app/latest?from=USD&to=RUB",
+            "https://api.exchangerate-api.com/v4/latest/USD"
+        ]
         
-        # Источник #1
-        data = self._make_request("https://api.exchangerate.host/latest?base=USD&symbols=RUB") 
-        if data and data.get('rates', {}).get('RUB'): 
-            rate = data['rates']['RUB'] 
-            self.currency_cache = {"rate": rate, "timestamp": datetime.now()} 
-            logger.info(f"Курс USD/RUB получен с exchangerate.host: {rate}")
-            return rate
+        for i, url in enumerate(sources):
+            try:
+                data = self._make_request(url)
+                if not data:
+                    logger.warning(f"Источник курса #{i+1} ({url}) не вернул данные.")
+                    continue
+                
+                rate = None
+                if 'rates' in data and 'RUB' in data['rates']: rate = data['rates']['RUB']
+                elif 'usd' in data and 'rub' in data['usd']: rate = data['usd']['rub']
+                elif 'conversion_rates' in data and 'RUB' in data['conversion_rates']: rate = data['conversion_rates']['RUB']
 
-        # Источник #2 (резервный)
-        logger.warning("Первый источник курса валют недоступен, пробую резервный...")
-        data = self._make_request("https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json")
-        if data and data.get('usd', {}).get('rub'):
-            rate = data['usd']['rub']
-            self.currency_cache = {"rate": rate, "timestamp": datetime.now()}
-            logger.info(f"Курс USD/RUB получен с jsdelivr: {rate}")
-            return rate
+                if rate:
+                    logger.info(f"Курс USD/RUB получен с источника #{i+1}: {rate}")
+                    self.currency_cache = {"rate": float(rate), "timestamp": datetime.now()}
+                    return float(rate), False
+                else:
+                    logger.warning(f"Источник курса #{i+1} ({url}) не содержит нужных данных.")
 
-        logger.error("Все источники курса валют недоступны.")
-        return None 
+            except Exception as e:
+                logger.error(f"Ошибка при обработке источника курса #{i+1} ({url}): {e}")
+                continue
+
+        logger.error("Все онлайн-источники курса валют недоступны. Использую аварийный курс.")
+        return 85.0, True # Аварийный курс и флаг, что он аварийный
 
     def get_halving_info(self): 
         response = self._make_request("https://blockchain.info/q/getblockcount", is_json=False) 
@@ -1076,6 +1090,9 @@ def send_photo_with_partner_button(chat_id, photo, caption):
 
 def is_admin(chat_id, user_id): 
     try: 
+        # Администратор бота в личном чате всегда админ
+        if str(chat_id) == Config.ADMIN_CHAT_ID:
+            return True
         return user_id in [admin.user.id for admin in bot.get_chat_administrators(chat_id)] 
     except Exception as e: 
         logger.error(f"Не удалось проверить права администратора для чата {chat_id}: {e}") 
@@ -1227,13 +1244,8 @@ def process_calculator_step(msg):
         bot.send_message(msg.chat.id, "Выберите действие:", reply_markup=get_main_keyboard())
         return
 
-    rate = api.get_usd_rub_rate()
-    if not rate:
-        text = "❌ Не удалось получить актуальный курс USD/RUB. Попробуйте позже."
-        send_message_with_partner_button(msg.chat.id, text)
-        bot.send_message(msg.chat.id, "Выберите действие:", reply_markup=get_main_keyboard())
-        return
-
+    rate, is_fallback = api.get_usd_rub_rate()
+    
     asics_data = api.get_top_asics()
     if not asics_data:
         text = "❌ Не удалось получить данные о доходности ASIC. Попробуйте позже."
@@ -1242,7 +1254,11 @@ def process_calculator_step(msg):
         return
 
     cost_usd = cost_rub / rate
-    result = [f"💰 <b>Расчет профита (розетка {cost_rub:.2f} ₽/кВтч)</b>\n"]
+    result = [f"💰 <b>Расчет профита (розетка {cost_rub:.2f} ₽/кВтч)</b>"]
+    if is_fallback:
+        result.append(f"<i>(Внимание! Используется резервный курс: 1 USD ≈ {rate:.2f} RUB)</i>")
+    result.append("") # Пустая строка для отступа
+
     for asic in asics_data:
         daily_cost = (asic['power_watts'] / 1000) * 24 * cost_usd
         profit = asic['daily_revenue'] - daily_cost
