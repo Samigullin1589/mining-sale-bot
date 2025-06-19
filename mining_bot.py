@@ -270,13 +270,6 @@ class ApiHandler:
 
     # ========================================================================================
     # БЛОК ПОЛУЧЕНИЯ ДАННЫХ ОБ ASIC. ВЕРСИЯ 2.0
-    # Для повышения надежности и избавления от ConnectionError, логика полностью 
-    # переработана. Теперь используется каскадный метод с несколькими источниками.
-    # 1. API Minerstat - быстрый и надежный JSON API.
-    # 2. API WhatToMine - еще один стабильный JSON API, используется как основной запасной.
-    # 3. Парсинг ASICMinerValue - запасной вариант, если API недоступны.
-    # 4. Парсинг ViaBTC - дополнительный запасной вариант.
-    # Также убран фильтр по SHA-256 по просьбе пользователя.
     # ========================================================================================
 
     def _get_asics_from_api(self): 
@@ -290,7 +283,6 @@ class ApiHandler:
             for device in all_hardware:
                 if not isinstance(device, dict) or device.get("type") != "asic":
                     continue
-                # Ищем самый прибыльный алгоритм для данного ASIC
                 best_algo = None
                 max_revenue = -1
                 for algo_name, algo_data in device.get("algorithms", {}).items():
@@ -331,7 +323,6 @@ class ApiHandler:
         parsed_asics = []
         try:
             for name, asic_data in data['asics'].items():
-                # Используем доходность до вычета расходов на электричество
                 revenue_str = asic_data.get('revenue')
                 if not revenue_str: continue
 
@@ -427,7 +418,7 @@ class ApiHandler:
                         parsed_asics.append({
                             'name': name,
                             'hashrate': hashrate,
-                            'power_watts': power * 1000, # Конвертируем кВт в Вт
+                            'power_watts': power * 1000, 
                             'daily_revenue': revenue
                         })
                 except Exception as e:
@@ -446,7 +437,6 @@ class ApiHandler:
             logger.info("Использую свежие данные из кэша.")
             return self.asic_cache.get("data") 
 
-        # Каскадный вызов источников
         asics = None
         source_functions = [
             self._get_asics_from_api,
@@ -468,7 +458,7 @@ class ApiHandler:
                 continue
 
         if asics: 
-            self.asic_cache = {"data": asics[:10], "timestamp": datetime.now()} # Берем топ-10
+            self.asic_cache = {"data": asics[:10], "timestamp": datetime.now()} 
             logger.info(f"Успешно получено и закэшировано {len(self.asic_cache['data'])} ASIC.") 
             self._save_asic_cache_to_file() 
             return self.asic_cache["data"] 
@@ -508,13 +498,27 @@ class ApiHandler:
             return None, "[❌ Ошибка при получении индекса]" 
 
     def get_usd_rub_rate(self): 
-        if self.currency_cache.get("rate") and (datetime.now() - self.currency_cache.get("timestamp", datetime.min) < timedelta(minutes=30)): return self.currency_cache["rate"] 
+        if self.currency_cache.get("rate") and (datetime.now() - self.currency_cache.get("timestamp", datetime.min) < timedelta(minutes=30)): 
+            return self.currency_cache["rate"] 
         
+        # Источник #1
         data = self._make_request("https://api.exchangerate.host/latest?base=USD&symbols=RUB") 
         if data and data.get('rates', {}).get('RUB'): 
             rate = data['rates']['RUB'] 
             self.currency_cache = {"rate": rate, "timestamp": datetime.now()} 
-            return rate 
+            logger.info(f"Курс USD/RUB получен с exchangerate.host: {rate}")
+            return rate
+
+        # Источник #2 (резервный)
+        logger.warning("Первый источник курса валют недоступен, пробую резервный...")
+        data = self._make_request("https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json")
+        if data and data.get('usd', {}).get('rub'):
+            rate = data['usd']['rub']
+            self.currency_cache = {"rate": rate, "timestamp": datetime.now()}
+            logger.info(f"Курс USD/RUB получен с jsdelivr: {rate}")
+            return rate
+
+        logger.error("Все источники курса валют недоступны.")
         return None 
 
     def get_halving_info(self): 
@@ -1142,22 +1146,39 @@ def handle_calculator_request(msg):
     sent = bot.send_message(msg.chat.id, "💡 Введите стоимость электроэнергии в <b>рублях</b> за кВт/ч:", reply_markup=types.ReplyKeyboardRemove()) 
     bot.register_next_step_handler(sent, process_calculator_step) 
 
-def process_calculator_step(msg): 
-    try: 
-        cost = float(msg.text.replace(',', '.')) 
-        rate = api.get_usd_rub_rate(); asics_data = api.get_top_asics() 
-        if not rate or not asics_data: text = "Не удалось получить данные для расчета." 
-        else: 
-            cost_usd = cost / rate 
-            result = [f"💰 <b>Расчет профита (розетка {cost:.2f} ₽/кВтч)</b>\n"] 
-            for asic in asics_data: 
-                daily_cost = (asic['power_watts'] / 1000) * 24 * cost_usd; profit = asic['daily_revenue'] - daily_cost 
-                result.append(f"<b>{telebot.util.escape(asic['name'])}</b>\n  Профит: <b>${profit:.2f}/день</b>") 
-            text = "\n\n".join(result) 
-    except ValueError: 
-        text = "❌ Неверный формат. Пожалуйста, введите число (например: 4.5 или 5)." 
-    send_message_with_partner_button(msg.chat.id, text) 
-    bot.send_message(msg.chat.id, "Выберите действие:", reply_markup=get_main_keyboard()) 
+def process_calculator_step(msg):
+    try:
+        cost_rub = float(msg.text.replace(',', '.'))
+    except ValueError:
+        text = "❌ Неверный формат. Пожалуйста, введите число (например: 4.5 или 5)."
+        send_message_with_partner_button(msg.chat.id, text)
+        bot.send_message(msg.chat.id, "Выберите действие:", reply_markup=get_main_keyboard())
+        return
+
+    rate = api.get_usd_rub_rate()
+    if not rate:
+        text = "❌ Не удалось получить актуальный курс USD/RUB. Попробуйте позже."
+        send_message_with_partner_button(msg.chat.id, text)
+        bot.send_message(msg.chat.id, "Выберите действие:", reply_markup=get_main_keyboard())
+        return
+
+    asics_data = api.get_top_asics()
+    if not asics_data:
+        text = "❌ Не удалось получить данные о доходности ASIC. Попробуйте позже."
+        send_message_with_partner_button(msg.chat.id, text)
+        bot.send_message(msg.chat.id, "Выберите действие:", reply_markup=get_main_keyboard())
+        return
+
+    cost_usd = cost_rub / rate
+    result = [f"💰 <b>Расчет профита (розетка {cost_rub:.2f} ₽/кВтч)</b>\n"]
+    for asic in asics_data:
+        daily_cost = (asic['power_watts'] / 1000) * 24 * cost_usd
+        profit = asic['daily_revenue'] - daily_cost
+        result.append(f"<b>{telebot.util.escape(asic['name'])}</b>\n  Профит: <b>${profit:.2f}/день</b>")
+    
+    text = "\n\n".join(result)
+    send_message_with_partner_button(msg.chat.id, text)
+    bot.send_message(msg.chat.id, "Выберите действие:", reply_markup=get_main_keyboard())
 
 @bot.message_handler(func=lambda msg: msg.text == "📰 Новости", content_types=['text']) 
 def handle_news(msg): bot.send_chat_action(msg.chat.id, 'typing'); send_message_with_partner_button(msg.chat.id, api.get_crypto_news()) 
