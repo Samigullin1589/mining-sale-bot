@@ -232,10 +232,11 @@ class ApiHandler:
     def get_crypto_price(self, ticker="BTC"):
         ticker = ticker.upper()
         
+        # Источники с URL и лямбда-функциями для извлечения цены. Binance перенесен в конец из-за частых блокировок.
         sources = [
-            {"name": "Binance", "url": f"https://api.binance.com/api/v3/ticker/price?symbol={ticker}USDT", "parser": lambda data: data.get('price')},
+            {"name": "Bybit", "url": f"https://api.bybit.com/v5/market/tickers?category=spot&symbol={ticker}USDT", "parser": lambda data: data.get('result', {}).get('list', [{}])[0].get('lastPrice')},
             {"name": "KuCoin", "url": f"https://api.kucoin.com/api/v1/market/orderbook/level1?symbol={ticker}-USDT", "parser": lambda data: data.get('data', {}).get('price')},
-            {"name": "Bybit", "url": f"https://api.bybit.com/v5/market/tickers?category=spot&symbol={ticker}USDT", "parser": lambda data: data.get('result', {}).get('list', [{}])[0].get('lastPrice')}
+            {"name": "Binance", "url": f"https://api.binance.com/api/v3/ticker/price?symbol={ticker}USDT", "parser": lambda data: data.get('price')}
         ]
 
         for source in sources:
@@ -243,8 +244,12 @@ class ApiHandler:
             if data:
                 price_str = source['parser'](data)
                 if price_str:
-                    try: return (float(price_str), source['name'])
-                    except (ValueError, TypeError): continue
+                    try:
+                        logger.info(f"Цена для {ticker} успешно получена с {source['name']}.")
+                        return (float(price_str), source['name'])
+                    except (ValueError, TypeError): 
+                        logger.warning(f"Не удалось преобразовать цену от {source['name']}: {price_str}")
+                        continue
         
         logger.error(f"Не удалось получить цену для {ticker} из всех источников.")
         return (None, None)
@@ -276,11 +281,9 @@ class ApiHandler:
         
         try:
             soup = BeautifulSoup(response.text, "lxml")
-            # Новый, более надежный метод поиска: ищем div с id, содержащим 'sha-256'
             container = soup.find('div', id=lambda x: x and 'sha-256' in x)
             if not container:
                 logger.error("Парсинг: не найден контейнер для SHA-256. Ищем по заголовку.")
-                # Запасной вариант: ищем по заголовку
                 header = soup.find(lambda tag: tag.name in ['h2', 'h3'] and 'sha-256' in tag.get_text(strip=True).lower())
                 if header: container = header.find_parent()
                 else:
@@ -364,7 +367,6 @@ class ApiHandler:
             fig.text(0.5, 0.35, classification, ha='center', va='center', fontsize=20, color='white')
             buf = io.BytesIO(); plt.savefig(buf, format='png', dpi=150, transparent=True); buf.seek(0); plt.close(fig)
             
-            # Обновленный промпт с ограничением
             prompt = f"Кратко объясни для майнера, как 'Индекс страха и жадности' со значением '{value} ({classification})' влияет на рынок. Не более 2-3 предложений."
             explanation = self.ask_gpt(prompt)
             text = f"😱 <b>Индекс страха и жадности: {value} - {classification}</b>\n\n{explanation}"
@@ -397,7 +399,6 @@ class ApiHandler:
 
     def _get_news_from_cryptopanic(self):
         if not Config.CRYPTO_API_KEY: return []
-        # Исправленный URL
         url = f"https://cryptopanic.com/api/v1/posts/?auth_token={Config.CRYPTO_API_KEY}&public=true"
         data = self._make_request(url)
         if not data or 'results' not in data: return []
@@ -657,7 +658,7 @@ class GameLogic:
 
     def buy_item(self, user_id, item_key):
         rig = self.user_rigs.get(user_id)
-        if not rig: return "� У вас нет фермы."
+        if not rig: return "🤔 У вас нет фермы."
         
         item = Config.SHOP_ITEMS.get(item_key)
         if not item: return "❌ Такого товара нет."
@@ -859,12 +860,10 @@ def send_message_with_partner_button(chat_id, text, reply_markup=None):
     except Exception as e:
         logger.error(f"Не удалось отправить сообщение в чат {chat_id}: {e}")
 
-# --- ИСПРАВЛЕННАЯ ФУНКЦИЯ ОТПРАВКИ ФОТО С ОБРЕЗКОЙ ТЕКСТА ---
 def send_photo_with_partner_button(chat_id, photo, caption):
     try:
         if not photo: raise ValueError("Объект фото пустой")
         
-        # Обрезаем подпись, если она слишком длинная (лимит Telegram 1024)
         hint = f"\n\n---\n<i>{random.choice(Config.BOT_HINTS)}</i>"
         max_caption_len = 1024 - len(hint)
         if len(caption) > max_caption_len:
