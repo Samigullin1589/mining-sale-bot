@@ -72,7 +72,7 @@ class Config:
         "💡 Узнайте курс любой монеты командой `/price`", "⚙️ Посмотрите на самые доходные ASIC",
         "⛏️ Рассчитайте прибыль с помощью 'Калькулятора'", "📰 Хотите свежие крипто-новости?",
         "🤑 Попробуйте наш симулятор майнинга!", "😱 Проверьте Индекс Страха и Жадности",
-        "🏆 Сравните себя с лучшими в таблице лидеров", "🎓 Что такое 'HODL'? Узнайте: `/word`",
+        "� Сравните себя с лучшими в таблице лидеров", "🎓 Что такое 'HODL'? Узнайте: `/word`",
         "🧠 Проверьте знания и заработайте в `/quiz`", "🛍️ Загляните в магазин улучшений"
     ]
     HALVING_INTERVAL = 210000
@@ -154,6 +154,17 @@ class ApiHandler:
         self.currency_cache = {"rate": None, "timestamp": None}
         atexit.register(self._save_asic_cache_to_file)
 
+    def _make_request(self, url, timeout=10, is_json=True):
+        """Централизованный и надежный метод для выполнения GET-запросов."""
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        try:
+            response = requests.get(url, headers=headers, timeout=timeout)
+            response.raise_for_status()
+            return response.json() if is_json else response
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"Сетевой запрос не удался для {url}: {e}")
+            return None
+
     def _load_asic_cache_from_file(self):
         try:
             if os.path.exists(Config.ASIC_CACHE_FILE):
@@ -218,46 +229,32 @@ class ApiHandler:
         except Exception as e:
             logger.error(f"Ошибка вызова OpenAI API: {e}"); return "[❌ Ошибка GPT.]"
 
-    # --- УЛУЧШЕННАЯ ФУНКЦИЯ ПОЛУЧЕНИЯ ЦЕНЫ ---
     def get_crypto_price(self, ticker="BTC"):
         ticker = ticker.upper()
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
         
-        # Источник 1: Binance
-        try:
-            url = f"https://api.binance.com/api/v3/ticker/price?symbol={ticker}USDT"
-            res = requests.get(url, headers=headers, timeout=4).json()
-            if 'price' in res: return (float(res['price']), "Binance")
-        except Exception as e:
-            logger.warning(f"Источник 1 (Binance) не ответил для {ticker}: {e}")
+        # Источники с URL и лямбда-функциями для извлечения цены
+        sources = [
+            {"name": "Binance", "url": f"https://api.binance.com/api/v3/ticker/price?symbol={ticker}USDT", "parser": lambda data: data.get('price')},
+            {"name": "KuCoin", "url": f"https://api.kucoin.com/api/v1/market/orderbook/level1?symbol={ticker}-USDT", "parser": lambda data: data.get('data', {}).get('price')},
+            {"name": "Bybit", "url": f"https://api.bybit.com/v5/market/tickers?category=spot&symbol={ticker}USDT", "parser": lambda data: data.get('result', {}).get('list', [{}])[0].get('lastPrice')}
+        ]
 
-        # Источник 2: KuCoin
-        try:
-            url = f"https://api.kucoin.com/api/v1/market/orderbook/level1?symbol={ticker}-USDT"
-            res = requests.get(url, headers=headers, timeout=4).json()
-            if res.get('data', {}).get('price'): return (float(res['data']['price']), "KuCoin")
-        except Exception as e:
-            logger.warning(f"Источник 2 (KuCoin) не ответил для {ticker}: {e}")
+        for source in sources:
+            data = self._make_request(source['url'], timeout=4)
+            if data:
+                price_str = source['parser'](data)
+                if price_str:
+                    try: return (float(price_str), source['name'])
+                    except (ValueError, TypeError): continue
         
-        # Источник 3: Bybit (запасной)
-        try:
-            url = f"https://api.bybit.com/v5/market/tickers?category=spot&symbol={ticker}USDT"
-            res = requests.get(url, headers=headers, timeout=4).json()
-            if res.get('result', {}).get('list', [])[0].get('lastPrice'):
-                return (float(res['result']['list'][0]['lastPrice']), "Bybit")
-        except Exception as e:
-            logger.warning(f"Источник 3 (Bybit) не ответил для {ticker}: {e}")
-
         logger.error(f"Не удалось получить цену для {ticker} из всех источников.")
         return (None, None)
 
-    # --- УЛУЧШЕННАЯ ФУНКЦИЯ ПОЛУЧЕНИЯ ASIC ---
     def _get_asics_from_api(self):
+        url = "https://api.minerstat.com/v2/hardware"
+        all_hardware = self._make_request(url, timeout=15)
+        if not all_hardware: return None
         try:
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-            url = "https://api.minerstat.com/v2/hardware"
-            r = requests.get(url, headers=headers, timeout=15); r.raise_for_status()
-            all_hardware = r.json()
             sha256_asics = [
                 {
                     'name': device.get("name", "N/A"),
@@ -272,18 +269,17 @@ class ApiHandler:
             if not profitable_asics: raise ValueError("Не найдено доходных SHA-256 ASIC в API.")
             return sorted(profitable_asics, key=lambda x: x['daily_revenue'], reverse=True)
         except Exception as e:
-            logger.warning(f"Ошибка при получении ASIC с API minerstat: {e}"); return None
+            logger.warning(f"Ошибка при обработке данных ASIC с API minerstat: {e}"); return None
 
     def _get_asics_from_scraping(self):
+        response = self._make_request("https://www.asicminervalue.com", is_json=False)
+        if not response: return None
+        
         try:
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-            r = requests.get("https://www.asicminervalue.com", headers=headers, timeout=15)
-            r.raise_for_status()
-            soup = BeautifulSoup(r.text, "lxml")
-            
+            soup = BeautifulSoup(response.text, "lxml")
             header = soup.find(lambda tag: tag.name in ['h2', 'h3'] and 'sha-256' in tag.get_text(strip=True).lower())
             if not header:
-                logger.error("Парсинг: не найден заголовок 'SHA-256'. Структура сайта изменилась.")
+                logger.error("Парсинг: не найден заголовок 'SHA-256'.")
                 return None
             
             table = header.find_next_sibling("table")
@@ -297,36 +293,25 @@ class ApiHandler:
                 if len(cols) < 5: continue
                 
                 try:
-                    name_tag = cols[1].find('a')
-                    name = name_tag.get_text(strip=True) if name_tag else 'N/A'
-                    
+                    name = cols[1].find('a').get_text(strip=True) if cols[1].find('a') else 'N/A'
                     hashrate_text = cols[2].get_text(strip=True)
                     power_text = cols[3].get_text(strip=True)
                     revenue_text = cols[4].find(text=True, recursive=False).strip().replace('$', '')
-
                     power_val = float(re.search(r'([\d,]+)', power_text).group(1).replace(',', ''))
                     revenue_val = float(revenue_text)
 
                     if revenue_val > 0:
-                        parsed_asics.append({
-                            'name': name,
-                            'hashrate': hashrate_text,
-                            'power_watts': power_val,
-                            'daily_revenue': revenue_val
-                        })
-                except (AttributeError, ValueError, IndexError) as e:
-                    logger.warning(f"Парсинг: пропущена строка из-за ошибки: {e}. Содержимое: {row.get_text(strip=True, separator='|')}")
+                        parsed_asics.append({'name': name, 'hashrate': hashrate_text, 'power_watts': power_val, 'daily_revenue': revenue_val})
+                except Exception as e:
+                    logger.warning(f"Парсинг: пропущена строка из-за ошибки: {e}.")
                     continue
 
             if not parsed_asics:
-                logger.error("Парсинг: не удалось извлечь данные ни из одной строки таблицы.")
+                logger.error("Парсинг: не удалось извлечь данные из строк таблицы.")
                 return None
-                
+            
             logger.info(f"Парсинг: успешно извлечено {len(parsed_asics)} ASIC.")
             return sorted(parsed_asics, key=lambda x: x['daily_revenue'], reverse=True)
-        except requests.RequestException as e:
-            logger.error(f"Ошибка сети при парсинге ASIC: {e}")
-            return None
         except Exception as e:
             logger.error(f"Непредвиденная ошибка при парсинге ASIC: {e}", exc_info=True)
             return None
@@ -356,9 +341,14 @@ class ApiHandler:
         return Config.FALLBACK_ASICS
             
     def get_fear_and_greed_index(self):
+        data = self._make_request("https://api.alternative.me/fng/?limit=1")
+        if not data or 'data' not in data or not data['data']:
+            return None, "[❌ Ошибка при получении индекса]"
+        
         try:
-            data = requests.get("https://api.alternative.me/fng/?limit=1", timeout=5).json()['data'][0]
-            value, classification = int(data['value']), data['value_classification']
+            value_data = data['data'][0]
+            value, classification = int(value_data['value']), value_data['value_classification']
+            
             plt.style.use('dark_background'); fig, ax = plt.subplots(figsize=(8, 4.5), subplot_kw={'projection': 'polar'})
             ax.set_yticklabels([]); ax.set_xticklabels([]); ax.grid(False); ax.spines['polar'].set_visible(False); ax.set_ylim(0, 1)
             colors = ['#d94b4b', '#e88452', '#ece36a', '#b7d968', '#73c269']
@@ -368,6 +358,7 @@ class ApiHandler:
             fig.text(0.5, 0.5, f"{value}", ha='center', va='center', fontsize=48, color='white', weight='bold')
             fig.text(0.5, 0.35, classification, ha='center', va='center', fontsize=20, color='white')
             buf = io.BytesIO(); plt.savefig(buf, format='png', dpi=150, transparent=True); buf.seek(0); plt.close(fig)
+            
             prompt = f"Кратко объясни для майнера, как 'Индекс страха и жадности' со значением '{value} ({classification})' влияет на рынок."
             explanation = self.ask_gpt(prompt)
             text = f"😱 <b>Индекс страха и жадности: {value} - {classification}</b>\n\n{explanation}"
@@ -378,61 +369,57 @@ class ApiHandler:
 
     def get_usd_rub_rate(self):
         if self.currency_cache.get("rate") and (datetime.now() - self.currency_cache.get("timestamp", datetime.min) < timedelta(minutes=30)): return self.currency_cache["rate"]
-        sources = ["https://api.exchangerate.host/latest?base=USD&symbols=RUB", "https://api.exchangerate-api.com/v4/latest/USD"]
-        for url in sources:
-            try:
-                response = requests.get(url, timeout=4); response.raise_for_status()
-                rate = response.json().get('rates', {}).get('RUB')
-                if rate: self.currency_cache = {"rate": rate, "timestamp": datetime.now()}; return rate
-            except Exception: continue
+        
+        data = self._make_request("https://api.exchangerate.host/latest?base=USD&symbols=RUB")
+        if data and data.get('rates', {}).get('RUB'):
+            rate = data['rates']['RUB']
+            self.currency_cache = {"rate": rate, "timestamp": datetime.now()}
+            return rate
         return None
 
     def get_halving_info(self):
+        response = self._make_request("https://blockchain.info/q/getblockcount", is_json=False)
+        if not response: return "[❌ Не удалось получить данные о халвинге]"
         try:
-            current_block = int(requests.get("https://blockchain.info/q/getblockcount", timeout=5).text)
+            current_block = int(response.text)
             blocks_left = ((current_block // Config.HALVING_INTERVAL) + 1) * Config.HALVING_INTERVAL - current_block
             if blocks_left <= 0: return "🎉 <b>Халвинг уже произошел!</b>"
             days, rem_min = divmod(blocks_left * 10, 1440); hours, _ = divmod(rem_min, 60)
             return f"⏳ <b>До халвинга Bitcoin осталось:</b>\n\n🗓 <b>Дней:</b> <code>{days}</code> | ⏰ <b>Часов:</b> <code>{hours}</code>\n🧱 <b>Блоков до халвинга:</b> <code>{blocks_left:,}</code>"
-        except Exception as e: logger.error(f"Ошибка получения данных для халвинга: {e}"); return "[❌ Не удалось получить данные о халвинге]"
+        except Exception as e:
+            logger.error(f"Ошибка обработки данных для халвинга: {e}"); return "[❌ Не удалось получить данные о халвинге]"
 
     def _get_news_from_cryptopanic(self):
-        if not Config.CRYPTO_API_KEY:
-            return []
-        try:
-            params = {"auth_token": Config.CRYPTO_API_KEY, "public": "true"}
-            response = requests.get("https://cryptopanic.com/api/v1/posts/", params=params, timeout=10)
-            response.raise_for_status()
-            posts = response.json().get("results", [])
-            news_items = []
-            for post in posts:
+        if not Config.CRYPTO_API_KEY: return []
+        url = f"https://cryptopanic.com/api/v1/posts/?auth_token={Config.CRYPTO_API_KEY}&public=true"
+        data = self._make_request(url)
+        if not data or 'results' not in data: return []
+        
+        news_items = []
+        for post in data['results']:
+            try:
                 published_time = date_parser.parse(post.get('created_at')).replace(tzinfo=None) if post.get('created_at') else datetime.utcnow()
-                news_items.append({
-                    'title': post.get('title', 'Без заголовка'),
-                    'link': post.get('url', ''),
-                    'published': published_time
-                })
-            return news_items
-        except Exception as e:
-            logger.error(f"Ошибка при получении новостей с CryptoPanic: {e}")
-            return []
+                news_items.append({'title': post.get('title', 'Без заголовка'), 'link': post.get('url', ''), 'published': published_time})
+            except Exception as e:
+                logger.warning(f"Ошибка парсинга даты для новости CryptoPanic: {e}")
+                continue
+        return news_items
 
     def _get_news_from_rss(self, url):
         try:
             user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
             feed = feedparser.parse(url, agent=user_agent)
             
-            if feed.bozo:
-                logger.warning(f"Лента {url} может быть некорректной (bozo-исключение): {feed.bozo_exception}")
+            if feed.bozo: logger.warning(f"Лента {url} может быть некорректной (bozo-исключение): {feed.bozo_exception}")
 
             news_items = []
             for entry in feed.entries:
-                published_time = date_parser.parse(entry.published).replace(tzinfo=None) if hasattr(entry, 'published') else datetime.utcnow()
-                news_items.append({
-                    'title': entry.title,
-                    'link': entry.link,
-                    'published': published_time
-                })
+                try:
+                    published_time = date_parser.parse(entry.published).replace(tzinfo=None) if hasattr(entry, 'published') else datetime.utcnow()
+                    news_items.append({'title': entry.title, 'link': entry.link, 'published': published_time})
+                except Exception as e:
+                    logger.warning(f"Ошибка парсинга даты для RSS-новости из {url}: {e}")
+                    continue
             return news_items
         except Exception as e:
             logger.error(f"Не удалось получить новости из {url}: {e}")
@@ -469,29 +456,27 @@ class ApiHandler:
         return "📰 <b>Последние крипто-новости:</b>\n\n" + "\n\n".join(items)
     
     def get_eth_gas_price(self):
+        data = self._make_request("https://ethgas.watch/api/gas")
+        if not data: return "[❌ Не удалось получить данные о газе]"
         try:
-            res = requests.get("https://ethgas.watch/api/gas", timeout=5).json()
             return (f"⛽️ <b>Актуальная цена газа (Gwei):</b>\n\n"
-                    f"🐢 <b>Медленно:</b> <code>{res.get('slow', {}).get('gwei', 'N/A')}</code>\n"
-                    f"🚶‍♂️ <b>Средне:</b> <code>{res.get('normal', {}).get('gwei', 'N/A')}</code>\n"
-                    f"🚀 <b>Быстро:</b> <code>{res.get('fast', {}).get('gwei', 'N/A')}</code>\n\n"
+                    f"🐢 <b>Медленно:</b> <code>{data.get('slow', {}).get('gwei', 'N/A')}</code>\n"
+                    f"🚶‍♂️ <b>Средне:</b> <code>{data.get('normal', {}).get('gwei', 'N/A')}</code>\n"
+                    f"🚀 <b>Быстро:</b> <code>{data.get('fast', {}).get('gwei', 'N/A')}</code>\n\n"
                     f"<i>Данные от ethgas.watch</i>")
-        except Exception as e: logger.error(f"Ошибка сети при запросе цены на газ: {e}"); return "[❌ Не удалось получить данные о газе]"
+        except Exception as e:
+            logger.error(f"Ошибка обработки данных о газе: {e}"); return "[❌ Не удалось получить данные о газе]"
 
     def get_btc_network_status(self):
         try:
             session = requests.Session()
-            height_url = "https://mempool.space/api/blocks/tip/height"
-            fees_url = "https://mempool.space/api/v1/fees/recommended"
-            mempool_url = "https://mempool.space/api/mempool"
+            session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'})
+            
+            height_res = session.get("https://mempool.space/api/blocks/tip/height", timeout=5)
+            fees_res = session.get("https://mempool.space/api/v1/fees/recommended", timeout=5)
+            mempool_res = session.get("https://mempool.space/api/mempool", timeout=5)
 
-            height_res = session.get(height_url, timeout=5)
-            fees_res = session.get(fees_url, timeout=5)
-            mempool_res = session.get(mempool_url, timeout=5)
-
-            height_res.raise_for_status()
-            fees_res.raise_for_status()
-            mempool_res.raise_for_status()
+            height_res.raise_for_status(); fees_res.raise_for_status(); mempool_res.raise_for_status()
 
             height = int(height_res.text)
             fees = fees_res.json()
@@ -834,7 +819,7 @@ class SpamAnalyzer:
         
         if not self.user_profiles: return "📊 <b>Статистика чата:</b>\n\nПока не собрано данных."
 
-        first_message_date_str = min(p['first_msg'] for p in self.user_profiles.values() if p.get('first_msg'))
+        first_message_date_str = min((p['first_msg'] for p in self.user_profiles.values() if p.get('first_msg')), default=None)
         days_since_first_msg = (now - datetime.fromisoformat(first_message_date_str)).days if first_message_date_str else 0
         avg_messages_per_day = total_messages / days_since_first_msg if days_since_first_msg > 0 else total_messages
 
@@ -1056,7 +1041,7 @@ def handle_quiz(msg):
     
     user_quiz_states[msg.from_user.id] = {'score': 0, 'question_index': 0, 'questions': questions[:Config.QUIZ_QUESTIONS_COUNT]}
     bot.send_message(msg.chat.id, f"🔥 <b>Начинаем крипто-викторину!</b>\nОтветьте на {Config.QUIZ_QUESTIONS_COUNT} вопросов.", reply_markup=types.ReplyKeyboardRemove())
-    send_quiz_question(msg.chat.id, msg.from_user.id)
+    send_quiz_question(msg.from_user.id, msg.from_user.id)
 
 def send_quiz_question(chat_id, user_id):
     state = user_quiz_states.get(user_id)
