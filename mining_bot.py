@@ -41,7 +41,7 @@ class Config:
     """Класс для хранения всех настроек и констант."""
     BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
     WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-    CRYPTO_API_KEY = os.getenv("CRYPTO_API_KEY")
+    CRYPTO_API_KEY = os.getenv("CRYPTO_API_KEY") # Используется для CryptoPanic как один из источников
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
     NEWS_CHAT_ID = os.getenv("NEWS_CHAT_ID")
     ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
@@ -50,13 +50,13 @@ class Config:
     SHEET_NAME = os.getenv("SHEET_NAME", "Лист1")
     GAME_DATA_FILE = "game_data.json"
     PROFILES_DATA_FILE = "user_profiles.json"
-    ASIC_CACHE_FILE = "asic_data_cache.json" 
+    ASIC_CACHE_FILE = "asic_data_cache.json"
 
     if not BOT_TOKEN:
         logger.critical("Критическая ошибка: TG_BOT_TOKEN не установлен.")
         raise ValueError("Критическая ошибка: TG_BOT_TOKEN не установлен")
 
-    PARTNER_URL = "https://app.leadteh.ru/w/dTeKr"
+    PARTNER_URL = os.getenv("PARTNER_URL", "https://cutt.ly/hrWUtARR")
     PARTNER_BUTTON_TEXT_OPTIONS = ["🎁 Узнать спеццены", "🔥 Эксклюзивное предложение", "💡 Получить консультацию", "💎 Прайс от экспертов"]
     PARTNER_AD_TEXT_OPTIONS = [
         "Хотите превратить виртуальные BTC в реальные? Для этого нужно настоящее оборудование! Наши партнеры предлагают лучшие условия для старта.",
@@ -74,7 +74,27 @@ class Config:
     HALVING_INTERVAL = 210000
 
     CRYPTO_TERMS = ["Блокчейн", "Газ (Gas)", "Халвинг", "ICO", "DeFi", "NFT", "Сатоши", "Кит (Whale)", "HODL", "DEX", "Смарт-контракт"]
-    
+
+    # --- Улучшения на основе обратной связи ---
+    # Псевдонимы для популярных криптовалют
+    COIN_ALIASES = {
+        'бтк': 'BTC', 'биткоин': 'BTC', 'биток': 'BTC',
+        'eth': 'ETH', 'эфир': 'ETH', 'эфириум': 'ETH',
+        'ltc': 'LTC', 'лайткоин': 'LTC', 'лайток': 'LTC',
+        'sol': 'SOL', 'солана': 'SOL', 'сол': 'SOL',
+        'usdt': 'USDT', 'юсдт': 'USDT', 'тезер': 'USDT',
+    }
+    # Кнопки для клавиатуры выбора курса
+    POPULAR_COINS = ['BTC', 'ETH', 'LTC', 'SOL']
+
+    # Несколько источников новостей для надежности
+    NEWS_RSS_FEEDS = [
+        "https://bits.media/rss/",           # Новости криптовалют
+        "https://forklog.com/rss",           # Forklog
+        "https://www.rbc.ru/crypto/feed/rss" # РБК Крипто
+    ]
+    # -------------------------------------------
+
     LEVEL_MULTIPLIERS = {1: 1, 2: 1.5, 3: 2.2, 4: 3.5, 5: 5}
     UPGRADE_COSTS = {2: 0.001, 3: 0.005, 4: 0.02, 5: 0.1}
     STREAK_BONUS_MULTIPLIER = 0.05
@@ -83,7 +103,7 @@ class Config:
     QUIZ_REWARD = 0.0001
     QUIZ_MIN_CORRECT_FOR_REWARD = 3
     QUIZ_QUESTIONS_COUNT = 5
-    
+
     QUIZ_QUESTIONS = [
         {"question": "Кто является анонимным создателем Bitcoin?", "options": ["Виталик Бутерин", "Сатоши Накамото", "Чарли Ли", "Илон Маск"], "correct_index": 1},
         {"question": "Как называется процесс уменьшения награды за блок в сети Bitcoin в два раза?", "options": ["Форк", "Аирдроп", "Халвинг", "Сжигание"], "correct_index": 2},
@@ -94,12 +114,15 @@ class Config:
     SPAM_KEYWORDS = ['p2p', 'арбитраж', 'обмен', 'сигналы', 'обучение', 'заработок', 'инвестиции']
     TECH_QUESTION_KEYWORDS = ['почему', 'как', 'что делать', 'проблема', 'ошибка', 'не работает', 'отваливается', 'перегревается', 'настроить']
     TECH_SUBJECT_KEYWORDS = ['asic', 'асик', 'майнер', 'блок питания', 'прошивка', 'хешрейт', 'плата', 'пул']
-    
+
     FALLBACK_ASICS = [
         {'name': 'Antminer S21', 'hashrate': '200.00 TH/s', 'power_watts': 3550.0, 'daily_revenue': 11.50},
         {'name': 'Whatsminer M60S', 'hashrate': '186.00 TH/s', 'power_watts': 3441.0, 'daily_revenue': 10.80},
         {'name': 'Antminer S19k Pro', 'hashrate': '120.00 TH/s', 'power_watts': 2760.0, 'daily_revenue': 6.50},
     ]
+
+    WARN_LIMIT = 3
+    MUTE_DURATION_HOURS = 24
 
 # --- Инициализация клиентов ---
 class ExceptionHandler(telebot.ExceptionHandler):
@@ -130,6 +153,9 @@ class ApiHandler:
         self.asic_cache = self._load_asic_cache_from_file()
         self.currency_cache = {"rate": None, "timestamp": None}
         atexit.register(self._save_asic_cache_to_file)
+        self.session = requests.Session()
+        self.session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'})
+
 
     def _load_asic_cache_from_file(self):
         try:
@@ -158,8 +184,8 @@ class ApiHandler:
         try:
             if not Config.GOOGLE_JSON_STR or not Config.GOOGLE_JSON_STR.strip(): return None
             if not Config.GOOGLE_JSON_STR.strip().startswith('{'):
-                 logger.error("Переменная GOOGLE_JSON не является валидным JSON объектом.")
-                 return None
+                logger.error("Переменная GOOGLE_JSON не является валидным JSON объектом.")
+                return None
             creds_dict = json.loads(Config.GOOGLE_JSON_STR)
             creds = Credentials.from_service_account_info(creds_dict, scopes=['https://www.googleapis.com/auth/spreadsheets'])
             return gspread.authorize(creds).open_by_key(Config.SHEET_ID).worksheet(Config.SHEET_NAME)
@@ -173,7 +199,7 @@ class ApiHandler:
         except Exception as e: logger.error(f"Ошибка записи в Google Sheets: {e}")
 
     def _sanitize_html(self, html_string: str) -> str:
-        soup = BeautifulSoup(html_string, "html.parser")
+        soup = BeautifulSoup(html_string, "lxml")
         allowed_tags = {'b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del', 'a', 'code', 'pre'}
         for tag in soup.find_all(True):
             if tag.name not in allowed_tags:
@@ -196,7 +222,7 @@ class ApiHandler:
         sources = [f"https://api.binance.com/api/v3/ticker/price?symbol={ticker}USDT", f"https://api.kucoin.com/api/v1/market/orderbook/level1?symbol={ticker}-USDT"]
         for i, url in enumerate(sources):
             try:
-                res = requests.get(url, timeout=4).json()
+                res = self.session.get(url, timeout=4).json()
                 if i == 0 and 'price' in res: return (float(res['price']), "Binance")
                 if i == 1 and res.get('data', {}).get('price'): return (float(res['data']['price']), "KuCoin")
             except Exception: continue
@@ -205,7 +231,7 @@ class ApiHandler:
     def _get_asics_from_api(self):
         try:
             url = "https://api.minerstat.com/v2/hardware"
-            r = requests.get(url, timeout=15); r.raise_for_status()
+            r = self.session.get(url, timeout=15); r.raise_for_status()
             all_hardware = r.json()
             sha256_asics = [
                 {
@@ -225,7 +251,7 @@ class ApiHandler:
 
     def _get_asics_from_scraping(self):
         try:
-            r = requests.get("https://www.asicminervalue.com", timeout=15); r.raise_for_status()
+            r = self.session.get("https://www.asicminervalue.com", timeout=15); r.raise_for_status()
             soup = BeautifulSoup(r.text, "lxml")
             table = soup.find("table", id=re.compile(r'sha-256', re.I))
             if not table:
@@ -240,9 +266,9 @@ class ApiHandler:
                 revenue = re.search(r'([\d\.]+)', cols[4].get_text(strip=True).replace('$', ''))
                 if power and revenue:
                     parsed_asics.append({
-                        'name': cols[1].find('a').get_text(strip=True), 
-                        'hashrate': cols[2].get_text(strip=True), 
-                        'power_watts': float(power.group(1).replace(',', '')), 
+                        'name': cols[1].find('a').get_text(strip=True),
+                        'hashrate': cols[2].get_text(strip=True),
+                        'power_watts': float(power.group(1).replace(',', '')),
                         'daily_revenue': float(revenue.group(1))
                     })
             if not parsed_asics: raise ValueError("Не удалось распарсить данные.")
@@ -256,7 +282,7 @@ class ApiHandler:
 
         logger.info("Пытаюсь получить данные об ASIC из API...")
         asics = self._get_asics_from_api()
-        
+
         if not asics:
             logger.warning("API не вернул данные, переключаюсь на парсинг сайта...")
             asics = self._get_asics_from_scraping()
@@ -265,17 +291,17 @@ class ApiHandler:
             self.asic_cache = {"data": asics[:5], "timestamp": datetime.now()}
             logger.info(f"Успешно получено {len(self.asic_cache['data'])} ASIC из онлайн-источников.")
             return self.asic_cache["data"]
-        
+
         if self.asic_cache.get("data"):
             logger.error("Все онлайн-источники недоступны, использую данные из локального кэша.")
             return self.asic_cache.get("data")
-        
+
         logger.error("Все онлайн-источники и кэш недоступны, использую аварийный список ASIC.")
         return Config.FALLBACK_ASICS
-            
+
     def get_fear_and_greed_index(self):
         try:
-            data = requests.get("https://api.alternative.me/fng/?limit=1", timeout=5).json()['data'][0]
+            data = self.session.get("https://api.alternative.me/fng/?limit=1", timeout=5).json()['data'][0]
             value, classification = int(data['value']), data['value_classification']
             plt.style.use('dark_background'); fig, ax = plt.subplots(figsize=(8, 4.5), subplot_kw={'projection': 'polar'})
             ax.set_yticklabels([]); ax.set_xticklabels([]); ax.grid(False); ax.spines['polar'].set_visible(False); ax.set_ylim(0, 1)
@@ -299,7 +325,7 @@ class ApiHandler:
         sources = ["https://api.exchangerate.host/latest?base=USD&symbols=RUB", "https://api.exchangerate-api.com/v4/latest/USD"]
         for url in sources:
             try:
-                response = requests.get(url, timeout=4); response.raise_for_status()
+                response = self.session.get(url, timeout=4); response.raise_for_status()
                 rate = response.json().get('rates', {}).get('RUB')
                 if rate: self.currency_cache = {"rate": rate, "timestamp": datetime.now()}; return rate
             except Exception: continue
@@ -307,7 +333,7 @@ class ApiHandler:
 
     def get_halving_info(self):
         try:
-            current_block = int(requests.get("https://blockchain.info/q/getblockcount", timeout=5).text)
+            current_block = int(self.session.get("https://blockchain.info/q/getblockcount", timeout=5).text)
             blocks_left = ((current_block // Config.HALVING_INTERVAL) + 1) * Config.HALVING_INTERVAL - current_block
             if blocks_left <= 0: return "🎉 <b>Халвинг уже произошел!</b>"
             days, rem_min = divmod(blocks_left * 10, 1440); hours, _ = divmod(rem_min, 60)
@@ -315,21 +341,52 @@ class ApiHandler:
         except Exception as e: logger.error(f"Ошибка получения данных для халвинга: {e}"); return "[❌ Не удалось получить данные о халвинге]"
 
     def get_crypto_news(self):
-        if not Config.CRYPTO_API_KEY: return "[❌ Функция новостей отключена.]"
-        try:
-            params = {"auth_token": Config.CRYPTO_API_KEY, "public": "true", "currencies": "BTC,ETH"}
-            posts = requests.get("https://cryptopanic.com/api/v1/posts/", params=params, timeout=10).json().get("results", [])[:3]
-            if not posts: return "[🧐 Новостей по вашему запросу не найдено]"
-            items = []
-            for p in posts:
-                summary = self.ask_gpt(f"Сделай краткое саммари (1 предложение): '{p['title']}'", "gpt-4o-mini")
-                items.append(f"🔹 <a href=\"{p.get('url', '')}\">{summary}</a>")
-            return "📰 <b>Последние крипто-новости:</b>\n\n" + "\n\n".join(items)
-        except requests.RequestException as e: logger.error(f"Ошибка API новостей: {e}"); return "[❌ Ошибка API новостей]"
+        """
+        Улучшенная функция для получения новостей из нескольких RSS-источников.
+        """
+        news_items = []
+        sources = Config.NEWS_RSS_FEEDS
+        random.shuffle(sources) # Перемешиваем источники, чтобы каждый раз начинать с разных
+
+        for url in sources:
+            try:
+                response = self.session.get(url, timeout=10)
+                response.raise_for_status()
+                # Используем 'lxml-xml' для корректного парсинга RSS
+                soup = BeautifulSoup(response.content, 'lxml-xml')
+                items = soup.find_all('item')
+
+                for item in items[:3]: # Берем не более 3 новостей с одного источника
+                    title = item.title.text.strip()
+                    link = item.link.text.strip()
+                    news_items.append(f"🔹 <a href=\"{link}\">{telebot.util.escape(title)}</a>")
+                
+                if len(news_items) >= 5: # Если набрали достаточно новостей, выходим
+                    break
+            except Exception as e:
+                logger.warning(f"Не удалось получить новости из {url}: {e}")
+                continue
+        
+        # Резервный вариант через CryptoPanic API, если RSS не сработали
+        if not news_items and Config.CRYPTO_API_KEY:
+            logger.info("RSS-источники не дали результата, пробую CryptoPanic API...")
+            try:
+                params = {"auth_token": Config.CRYPTO_API_KEY, "public": "true"}
+                posts = self.session.get("https://cryptopanic.com/api/v1/posts/", params=params, timeout=10).json().get("results", [])[:5]
+                for p in posts:
+                    news_items.append(f"🔹 <a href=\"{p.get('url', '')}\">{telebot.util.escape(p['title'])}</a>")
+            except Exception as e:
+                logger.error(f"Ошибка резервного API новостей CryptoPanic: {e}")
+
+        if not news_items:
+            return "[� К сожалению, сейчас не удалось найти свежих новостей. Попробуйте позже.]"
+        
+        return "📰 <b>Последние крипто-новости:</b>\n\n" + "\n\n".join(news_items[:5])
+
 
     def get_eth_gas_price(self):
         try:
-            res = requests.get("https://ethgas.watch/api/gas", timeout=5).json()
+            res = self.session.get("https://ethgas.watch/api/gas", timeout=5).json()
             return (f"⛽️ <b>Актуальная цена газа (Gwei):</b>\n\n"
                     f"🐢 <b>Медленно:</b> <code>{res.get('slow', {}).get('gwei', 'N/A')}</code>\n"
                     f"🚶‍♂️ <b>Средне:</b> <code>{res.get('normal', {}).get('gwei', 'N/A')}</code>\n"
@@ -339,14 +396,13 @@ class ApiHandler:
 
     def get_btc_network_status(self):
         try:
-            session = requests.Session()
             height_url = "https://mempool.space/api/blocks/tip/height"
             fees_url = "https://mempool.space/api/v1/fees/recommended"
             mempool_url = "https://mempool.space/api/mempool"
 
-            height_res = session.get(height_url, timeout=5)
-            fees_res = session.get(fees_url, timeout=5)
-            mempool_res = session.get(mempool_url, timeout=5)
+            height_res = self.session.get(height_url, timeout=5)
+            fees_res = self.session.get(fees_url, timeout=5)
+            mempool_res = self.session.get(mempool_url, timeout=5)
 
             height_res.raise_for_status()
             fees_res.raise_for_status()
@@ -365,9 +421,9 @@ class ApiHandler:
                     f"🧱 <b>Текущий блок:</b> <code>{height:,}</code>\n"
                     f"📈 <b>Неподтвержденные транзакции:</b> <code>{unconfirmed_txs:,}</code>\n\n"
                     f"💸 <b>Рекомендуемые комиссии (sat/vB):</b>\n"
-                    f"  - 🚀 <b>Высокий приоритет:</b> <code>{fastest_fee}</code>\n"
-                    f"  - 🚶‍♂️ <b>Средний приоритет:</b> <code>{half_hour_fee}</code>\n"
-                    f"  - 🐢 <b>Низкий приоритет:</b> <code>{hour_fee}</code>")
+                    f"  - 🚀 <b>Высокий приоритет:</b> <code>{fastest_fee}</code>\n"
+                    f"  - 🚶‍♂️ <b>Средний приоритет:</b> <code>{half_hour_fee}</code>\n"
+                    f"  - 🐢 <b>Низкий приоритет:</b> <code>{hour_fee}</code>")
 
         except Exception as e:
             logger.error(f"Ошибка получения статуса сети Bitcoin: {e}")
@@ -418,10 +474,10 @@ class GameLogic:
             return "У вас уже есть ферма!"
         
         btc_price, _ = api.get_crypto_price("BTC")
-        if not btc_price: btc_price = 60000 
+        if not btc_price: btc_price = 60000
         
         self.user_rigs[user_id] = {
-            'last_collected': None, 'balance': 0.0, 'level': 1, 'streak': 0, 
+            'last_collected': None, 'balance': 0.0, 'level': 1, 'streak': 0,
             'name': user_name, 'boost_active_until': None,
             'asic_model': asic_data['name'],
             'base_rate': asic_data['daily_revenue'] / btc_price
@@ -454,7 +510,7 @@ class GameLogic:
             h, rem = divmod(time_left.seconds, 3600); m, _ = divmod(rem, 60)
             boost_status = f"⚡️ <b>Буст x2 активен еще: {h}ч {m}м</b>\n"
         
-        base_rate = rig.get('base_rate', 0.0001) 
+        base_rate = rig.get('base_rate', 0.0001)
         current_rate = base_rate * Config.LEVEL_MULTIPLIERS.get(rig['level'], 1)
 
         text = (f"🖥️ <b>Ферма {telebot.util.escape(rig['name'])}</b>\n"
@@ -464,7 +520,7 @@ class GameLogic:
                 f"<b>Баланс:</b> <code>{rig['balance']:.8f}</code> BTC\n"
                 f"<b>Дневная серия:</b> {rig['streak']} 🔥 (бонус <b>+{rig['streak'] * Config.STREAK_BONUS_MULTIPLIER:.0%}</b>)\n"
                 f"{boost_status}\n{upgrade_cost_text}")
-        return text, None 
+        return text, None
 
     def collect_reward(self, user_id):
         rig = self.user_rigs.get(user_id)
@@ -497,7 +553,7 @@ class GameLogic:
         rig['last_collected'] = now
         
         return (f"✅ Собрано <b>{total_mined:.8f}</b> BTC{' (x2 Буст!)' if boost_multiplier > 1 else ''}!\n"
-                f"  (База: {base_mined:.8f} + Бонус за серию: {streak_bonus:.8f})\n"
+                f"  (База: {base_mined:.8f} + Бонус за серию: {streak_bonus:.8f})\n"
                 f"🔥 Ваша серия: <b>{rig['streak']} дней!</b>\n"
                 f"💰 Ваш новый баланс: <code>{rig['balance']:.8f}</code> BTC.")
 
@@ -574,8 +630,8 @@ class SpamAnalyzer:
             'first_msg': now_iso,
             'msg_count': 0,
             'spam_count': 0,
-            'lols_ban': False, 
-            'cas_ban': False, 
+            'lols_ban': False,
+            'cas_ban': False,
         })
         profile['msg_count'] += 1
         profile['name'] = user.full_name
@@ -608,8 +664,8 @@ class SpamAnalyzer:
                 f"<i>Первое сообщение, увиденное ботом.</i>\n\n"
                 f"🔸 <b>spam_count:</b> {profile['spam_count']} (фактор: {spam_factor:.2f}%)\n"
                 f"<i>Количество сообщений, похожих на спам.</i>\n\n"
-                f"🔹 <b>lols_ban:</b> {'Да' if profile['lols_ban'] else 'Нет'}\n"
-                f"🔸 <b>cas_ban:</b> {'Да' if profile['cas_ban'] else 'Нет'}\n"
+                f"🔹 <b>lols_ban:</b> {'Да' if profile.get('lols_ban', False) else 'Нет'}\n"
+                f"🔸 <b>cas_ban:</b> {'Да' if profile.get('cas_ban', False) else 'Нет'}\n"
                 f"<i>Наличие в глобальных бан-листах.</i>")
 
     def get_chat_statistics(self, days=7):
@@ -621,13 +677,16 @@ class SpamAnalyzer:
         active_users = 0
         new_users = 0
         
+        if not self.user_profiles:
+             return "📊 <b>Статистика чата пока недоступна.</b>"
+
         for profile in self.user_profiles.values():
             if profile.get('last_seen') and datetime.fromisoformat(profile['last_seen']) > week_ago:
                 active_users += 1
             if profile.get('first_msg') and datetime.fromisoformat(profile['first_msg']) > week_ago:
                 new_users += 1
         
-        first_message_date_str = min(p['first_msg'] for p in self.user_profiles.values() if p.get('first_msg'))
+        first_message_date_str = min((p['first_msg'] for p in self.user_profiles.values() if p.get('first_msg')), default=None)
         days_since_first_msg = (now - datetime.fromisoformat(first_message_date_str)).days if first_message_date_str else 1
         avg_messages_per_day = total_messages / days_since_first_msg if days_since_first_msg > 0 else total_messages
 
@@ -650,8 +709,8 @@ spam_analyzer = SpamAnalyzer(Config.PROFILES_DATA_FILE)
 def get_main_keyboard():
     markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     buttons = [
-        "💹 Курс", "⚙️ Топ-5 ASIC", "⛏️ Калькулятор", "📰 Новости", 
-        "😱 Индекс Страха", "⏳ Халвинг", "📡 Статус BTC", "🧠 Викторина", 
+        "💹 Курс", "⚙️ Топ-5 ASIC", "⛏️ Калькулятор", "📰 Новости",
+        "😱 Индекс Страха", "⏳ Халвинг", "📡 Статус BTC", "🧠 Викторина",
         "🎓 Слово дня", "🕹️ Виртуальный Майнинг"
     ]
     markup.add(*[types.KeyboardButton(text) for text in buttons])
@@ -669,15 +728,18 @@ def send_photo_with_partner_button(chat_id, photo, caption):
         if not photo: raise ValueError("Объект фото пустой")
         markup = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton(random.choice(Config.PARTNER_BUTTON_TEXT_OPTIONS), url=Config.PARTNER_URL))
         bot.send_photo(chat_id, photo, caption=f"{caption}\n\n---\n<i>{random.choice(Config.BOT_HINTS)}</i>", reply_markup=markup)
-    except Exception as e: 
-        logger.error(f"Не удалось отправить фото: {e}. Отправляю текстом."); 
+    except Exception as e:
+        logger.error(f"Не удалось отправить фото: {e}. Отправляю текстом.");
         send_message_with_partner_button(chat_id, caption)
 
 def is_admin(chat_id, user_id):
     try:
+        # Для личных чатов любой пользователь - "админ"
+        if str(chat_id) == str(user_id):
+            return True
         return user_id in [admin.user.id for admin in bot.get_chat_administrators(chat_id)]
     except Exception as e:
-        logger.error(f"Не удалось проверить права администратора: {e}")
+        logger.error(f"Не удалось проверить права администратора для чата {chat_id}: {e}")
         return False
 
 # ========================================================================================
@@ -689,12 +751,16 @@ def handle_start_help(msg):
 
 @bot.message_handler(commands=['userinfo', 'chatstats', 'ban', 'spam', 'unban'])
 def handle_admin_commands(msg):
+    if msg.chat.type == 'private':
+         bot.reply_to(msg, "Эта команда работает только в группах.")
+         return
+
     is_user_admin = is_admin(msg.chat.id, msg.from_user.id)
     command = msg.text.split('@')[0].split(' ')[0]
     
     if not is_user_admin:
-        if command in ['/ban', '/spam', '/unban', '/chatstats']:
-            bot.reply_to(msg, "Эта команда предназначена для администраторов чата, чтобы поддерживать порядок. Они могут удалять спам и блокировать нарушителей.")
+        if command in ['/ban', '/spam', '/unban', '/chatstats', '/userinfo']:
+            bot.reply_to(msg, "Эта команда предназначена для администраторов чата.")
         return
 
     if command == '/userinfo':
@@ -735,12 +801,39 @@ def handle_admin_commands(msg):
 
 @bot.message_handler(func=lambda msg: msg.text == "💹 Курс", content_types=['text'])
 def handle_price_request(msg):
-    sent = bot.send_message(msg.chat.id, "Курс какой криптовалюты вас интересует? (напр: BTC, ETH, SOL)", reply_markup=types.ReplyKeyboardRemove())
+    """
+    Новый обработчик курса. Предлагает кнопки с популярными монетами.
+    """
+    markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True, one_time_keyboard=True)
+    buttons = [types.KeyboardButton(coin) for coin in Config.POPULAR_COINS]
+    markup.add(*buttons)
+    markup.add(types.KeyboardButton("⬅️ Назад в меню"))
+    sent = bot.send_message(msg.chat.id, "Выберите монету на клавиатуре или введите тикер (напр: TON, XRP):", reply_markup=markup)
     bot.register_next_step_handler(sent, process_price_step)
 
 def process_price_step(msg):
-    price, source = api.get_crypto_price(msg.text)
-    text = f"💹 Курс {msg.text.upper()}/USD: <b>${price:,.2f}</b>\n<i>(Данные от {source})</i>" if price else f"❌ Не удалось получить курс для {msg.text.upper()}."
+    """
+    Улучшенный обработчик ввода. Распознает псевдонимы и валидирует ввод.
+    """
+    if msg.text == "⬅️ Назад в меню":
+        bot.send_message(msg.chat.id, "Возвращаю в главное меню.", reply_markup=get_main_keyboard())
+        return
+
+    # 1. Нормализация ввода
+    ticker_input = msg.text.strip().lower()
+
+    # 2. Проверка псевдонимов
+    ticker = Config.COIN_ALIASES.get(ticker_input, ticker_input).upper()
+
+    # 3. Валидация
+    # Простой regex, чтобы отсечь мусорный ввод (длинные тексты, рекламу)
+    if not re.match(r'^[A-Z0-9]{2,10}$', ticker):
+        bot.send_message(msg.chat.id, "❌ Неверный формат. Пожалуйста, введите тикер (например, BTC) или выберите монету на клавиатуре.", reply_markup=get_main_keyboard())
+        return
+
+    # 4. Запрос цены
+    price, source = api.get_crypto_price(ticker)
+    text = f"💹 Курс {ticker}/USD: <b>${price:,.2f}</b>\n<i>(Данные от {source})</i>" if price else f"❌ Не удалось получить курс для {ticker}."
     send_message_with_partner_button(msg.chat.id, text)
     bot.send_message(msg.chat.id, "Выберите действие:", reply_markup=get_main_keyboard())
 
@@ -751,17 +844,23 @@ def handle_asics_text(msg):
     asics = api.get_top_asics()
     if not asics: return send_message_with_partner_button(msg.chat.id, "Не удалось получить данные об ASIC.")
     rows = [f"{a['name']:<22.21}| {a['hashrate']:<9}| {a['power_watts']:<5.0f}| ${a['daily_revenue']:<10.2f}" for a in asics]
-    response = f"<pre>Модель                | H/s      | P, W | Доход/день\n" \
-               f"----------------------|----------|------|-----------\n" + "\n".join(rows) + "</pre>"
+    response = f"<pre>Модель                  | H/s      | P, W | Доход/день\n" \
+               f"------------------------|----------|------|-----------\n" + "\n".join(rows) + "</pre>"
     response += f"\n\n{api.ask_gpt('Напиши короткий мотивирующий комментарий (1-2 предложения) для майнинг-чата по списку доходных ASIC.', 'gpt-4o-mini')}"
     send_message_with_partner_button(msg.chat.id, response)
 
 @bot.message_handler(func=lambda msg: msg.text == "⛏️ Калькулятор", content_types=['text'])
 def handle_calculator_request(msg):
-    sent = bot.send_message(msg.chat.id, "💡 Введите стоимость электроэнергии в <b>рублях</b> за кВт/ч:", reply_markup=types.ReplyKeyboardRemove())
+    markup = types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+    markup.add(types.KeyboardButton("⬅️ Назад в меню"))
+    sent = bot.send_message(msg.chat.id, "💡 Введите стоимость электроэнергии в <b>рублях</b> за кВт/ч:", reply_markup=markup)
     bot.register_next_step_handler(sent, process_calculator_step)
 
 def process_calculator_step(msg):
+    if msg.text == "⬅️ Назад в меню":
+        bot.send_message(msg.chat.id, "Возвращаю в главное меню.", reply_markup=get_main_keyboard())
+        return
+
     try:
         cost = float(msg.text.replace(',', '.'))
         rate = api.get_usd_rub_rate(); asics_data = api.get_top_asics()
@@ -771,7 +870,7 @@ def process_calculator_step(msg):
             result = [f"💰 <b>Расчет профита (розетка {cost:.2f} ₽/кВтч)</b>\n"]
             for asic in asics_data:
                 daily_cost = (asic['power_watts'] / 1000) * 24 * cost_usd; profit = asic['daily_revenue'] - daily_cost
-                result.append(f"<b>{telebot.util.escape(asic['name'])}</b>\n  Профит: <b>${profit:.2f}/день</b>")
+                result.append(f"<b>{telebot.util.escape(asic['name'])}</b>\n  Профит: <b>${profit:.2f}/день</b>")
             text = "\n\n".join(result)
     except ValueError:
         text = "❌ Неверный формат. Пожалуйста, введите число (например: 4.5 или 5)."
@@ -870,7 +969,7 @@ def get_game_menu(user_id, user_name):
         types.InlineKeyboardButton("🏆 Топ Майнеров", callback_data="game_top"),
         types.InlineKeyboardButton("🛍️ Магазин", callback_data="game_shop"),
         types.InlineKeyboardButton("💵 Вывести в реал", callback_data="game_withdraw"),
-        types.InlineKeyboardButton("🔄 Обновить", callback_data="game_rig") 
+        types.InlineKeyboardButton("🔄 Обновить", callback_data="game_rig")
     ]
     markup.add(*buttons)
     return rig_info_text, markup
@@ -880,22 +979,49 @@ def get_game_menu(user_id, user_name):
 def handle_game_callbacks(call):
     action = call.data.split('_')[1]
     user_id = call.from_user.id
+    user_name = call.from_user.first_name
     message = call.message
     
     response_text = ""
-    edit_menu = True
+    edit_menu = True # По умолчанию обновляем меню
     
-    if action == 'collect':
+    if action == 'rig':
+        bot.answer_callback_query(call.id, "Обновляю информацию...")
+    elif action == 'collect':
         response_text = game.collect_reward(user_id)
         bot.answer_callback_query(call.id, "✅ Награда собрана!")
     elif action == 'upgrade':
         response_text = game.upgrade_rig(user_id)
         bot.answer_callback_query(call.id, "Попытка улучшения...")
+    elif action == 'top':
+        response_text = game.get_top_miners()
+        bot.answer_callback_query(call.id)
+        edit_menu = False # Не обновляем меню, а просто шлем сообщение
+    elif action == 'shop':
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        markup.add(types.InlineKeyboardButton(f"⚡️ Купить буст x2 ({Config.BOOST_COST} BTC)", callback_data="game_buyboost"))
+        markup.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="game_back"))
+        bot.edit_message_text("🛍️ <b>Магазин улучшений:</b>", message.chat.id, message.message_id, reply_markup=markup)
+        bot.answer_callback_query(call.id)
+        return
+    elif action == 'buyboost':
+        response_text = game.buy_boost(user_id)
+        bot.answer_callback_query(call.id, "Покупаем буст...")
+    elif action == 'withdraw':
+        ad_text = random.choice(Config.PARTNER_AD_TEXT_OPTIONS)
+        response_text = f"💰 <b>Вывод в реальный мир</b>\n\n{ad_text}"
+        bot.answer_callback_query(call.id, "Открываем путь к реальным деньгам!")
+        edit_menu = False
+    elif action == 'back':
+        pass # Просто обновит меню ниже
     
     if response_text and not edit_menu:
         send_message_with_partner_button(message.chat.id, response_text)
     elif edit_menu:
-        text, markup = get_game_menu(user_id, call.from_user.first_name)
+        if response_text:
+             bot.answer_callback_query(call.id, response_text, show_alert=True)
+        
+        text, markup = get_game_menu(user_id, user_name)
         try:
             bot.edit_message_text(text, message.chat.id, message.message_id, reply_markup=markup)
         except telebot.apihelper.ApiTelegramException as e:
@@ -905,12 +1031,20 @@ def handle_game_callbacks(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith('start_rig_'))
 def handle_start_rig_callback(call):
     try:
+        # Временное решение для `choices`
+        # В идеале, нужно передавать `choices` через состояние или другой механизм
+        starter_asics_choices_str = bot.temp_starter_asics.get(call.from_user.id)
+        if not starter_asics_choices_str:
+            bot.answer_callback_query(call.id, "Время выбора истекло, попробуйте снова.", show_alert=True)
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+            return
+
+        starter_asics = json.loads(starter_asics_choices_str)
         asic_index = int(call.data.split('_')[-1])
         user_id = call.from_user.id
         user_name = call.from_user.first_name
 
-        starter_asics = api.get_top_asics()
-        if not starter_asics or asic_index >= len(starter_asics):
+        if asic_index >= len(starter_asics):
             bot.answer_callback_query(call.id, "Ошибка: не удалось найти выбранный ASIC.", show_alert=True)
             bot.edit_message_text("Произошла ошибка при выборе. Попробуйте снова.", call.message.chat.id, call.message.message_id)
             return
@@ -929,6 +1063,10 @@ def handle_start_rig_callback(call):
 @bot.message_handler(content_types=['text'], func=lambda msg: not msg.text.startswith('/'))
 def handle_non_command_text(msg):
     try:
+        # Пропускаем обработку кнопок главного меню
+        if msg.text in ["💹 Курс", "⚙️ Топ-5 ASIC", "⛏️ Калькулятор", "📰 Новости", "😱 Индекс Страха", "⏳ Халвинг", "📡 Статус BTC", "🧠 Викторина", "🎓 Слово дня", "🕹️ Виртуальный Майнинг"]:
+            return
+            
         spam_analyzer.process_message(msg)
         
         if msg.chat.type in ('group', 'supergroup'):
@@ -953,7 +1091,7 @@ def handle_non_command_text(msg):
             response = api.ask_gpt(msg.text)
             send_message_with_partner_button(msg.chat.id, response)
     except Exception as e:
-        logger.error("Критическая ошибка в handle_other_text!", exc_info=e)
+        logger.error("Критическая ошибка в handle_non_command_text!", exc_info=e)
         bot.send_message(msg.chat.id, "😵 Ой, что-то пошло не так. Мы уже разбираемся!")
 
 def handle_technical_question(msg):
@@ -1008,6 +1146,7 @@ def auto_check_status():
     if api.get_crypto_price("BTC")[0] is None: errors.append("API цены")
     if openai_client and "[❌" in api.ask_gpt("Тест"): errors.append("API OpenAI")
     if Config.GOOGLE_JSON_STR and not api.get_gsheet(): errors.append("Google Sheets")
+    if not api.get_crypto_news().startswith("📰"): errors.append("API Новостей")
     status = "✅ Все системы в норме." if not errors else f"⚠️ Сбой в: {', '.join(errors)}"
     try: bot.send_message(Config.ADMIN_CHAT_ID, f"<b>Отчет о состоянии ({datetime.now().strftime('%H:%M')})</b>\n{status}")
     except Exception as e: logger.error(f"Не удалось отправить отчет о состоянии администратору: {e}")
