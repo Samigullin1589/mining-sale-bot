@@ -8,7 +8,7 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from aiogram.fsm.storage.memory import MemoryStorage # Для хранения состояний, если понадобится в будущем
-from aiogram.client.default import DefaultBotProperties # *** НОВЫЙ ИМПОРТ ***
+from aiogram.client.default import DefaultBotProperties # *** НОВЫЙ ИМПОРТ: Добавлен для совместимости с aiogram 3.7+ ***
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -30,7 +30,7 @@ if not BOT_TOKEN:
 storage = MemoryStorage()
 
 # Инициализация бота и диспетчера
-# *** ОБНОВЛЕННАЯ ИНИЦИАЛИЗАЦИЯ BOT ***
+# *** ОБНОВЛЕННАЯ ИНИЦИАЛИЗАЦИЯ BOT для совместимости с aiogram 3.7+ ***
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=storage)
 
@@ -114,7 +114,8 @@ async def show_rates(message: types.Message) -> None:
 
 
 @dp.message(F.text == "⚙️ Топ ASIC")
-@cached(cache=asic_cache, key=lambda: 'top_asics') # Используем декоратор @cached с нашим asic_cache
+# *** ИСПРАВЛЕНИЕ ЗДЕСЬ: key=lambda message: 'top_asics' - лямбда-функция теперь принимает аргумент message ***
+@cached(cache=asic_cache, key=lambda message: 'top_asics')
 async def get_top_asics(message: types.Message) -> None:
     """
     Обрабатывает нажатие кнопки "Топ ASIC".
