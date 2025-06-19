@@ -20,12 +20,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bs4 import BeautifulSoup
 from cachetools import TTLCache, cached
-from dotenv import load_dotenv
 from fuzzywuzzy import fuzz, process
 from openai import AsyncOpenAI
-
-# Загрузка переменных окружения из файла .env
-load_dotenv()
 
 # ==============================================================================
 # Раздел 2: Конфигурация и константы
@@ -648,3 +644,4 @@ if __name__ == '__main__':
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Бот остановлен.")
+
