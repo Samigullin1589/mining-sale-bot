@@ -12,6 +12,7 @@ import schedule
 import json 
 import atexit 
 import httpx 
+import xml.etree.ElementTree as ET
 from flask import Flask, request 
 import gspread 
 from google.oauth2.service_account import Credentials 
@@ -169,14 +170,6 @@ class ApiHandler:
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9',
             'Accept-Language': 'en-US,en;q=0.9,ru;q=0.8',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1',
-            'Cache-Control': 'max-age=0'
         }
         try: 
             response = requests.get(url, headers=headers, timeout=timeout) 
@@ -281,9 +274,8 @@ class ApiHandler:
         return (None, None) 
 
     # ========================================================================================
-    # БЛОК ПОЛУЧЕНИЯ ДАННЫХ ОБ ASIC. ВЕРСИЯ 2.3 - МАКСИМАЛЬНАЯ НАДЕЖНОСТЬ
+    # БЛОК ПОЛУЧЕНИЯ ДАННЫХ ОБ ASIC. ВЕРСИЯ 3.0 - МАКСИМАЛЬНАЯ НАДЕЖНОСТЬ
     # ========================================================================================
-
     def _get_asics_from_minerstat(self): 
         """Источник #1: API от Minerstat."""
         logger.info("Источник #1 (API): Пытаюсь получить данные с minerstat.com...")
@@ -358,8 +350,7 @@ class ApiHandler:
             if not parsed_asics: raise ValueError("API ViaBTC не вернул доходных ASIC.")
             return sorted(parsed_asics, key=lambda x: x['daily_revenue'], reverse=True)
         except Exception as e:
-            logger.error(f"Непредвиденная ошибка при парсинге API ViaBTC: {e}", exc_info=True)
-            return None
+            logger.error(f"Непредвиденная ошибка при парсинге API ViaBTC: {e}", exc_info=True); return None
             
     def _get_asics_from_asicminervalue(self): 
         """Источник #4: Парсинг сайта asicminervalue.com."""
@@ -370,6 +361,7 @@ class ApiHandler:
             soup = BeautifulSoup(response.text, "lxml") 
             parsed_asics = [] 
             rows = soup.select("tbody > tr") 
+            if not rows: raise ValueError("Парсинг (AMV): Тег tbody не найден.")
             logger.info(f"Парсинг (AMV): Найдено {len(rows)} строк.") 
             COL_MODEL, COL_HASHRATE, COL_POWER, COL_PROFIT = 0, 2, 3, 6
             for row in rows: 
@@ -379,21 +371,16 @@ class ApiHandler:
                     name_tag = cols[COL_MODEL].find('a')
                     name = name_tag.get_text(strip=True) if name_tag else cols[COL_MODEL].get_text(strip=True)
                     if not name or name.strip() in ['N/A', '']: continue
-                    
                     hashrate_text = cols[COL_HASHRATE].get_text(strip=True) 
-                    
                     power_text = cols[COL_POWER].get_text(strip=True) 
                     power_match = re.search(r'([\d,]+)', power_text)
                     if not power_match: continue
                     power_val = float(power_match.group(1).replace(',', ''))
-                    
                     full_revenue_text = cols[COL_PROFIT].get_text(strip=True) 
                     revenue_match = re.search(r'(-?)\$?([\d\.]+)', full_revenue_text) 
                     if not revenue_match: continue 
-                    
                     sign = -1 if revenue_match.group(1) == '-' else 1 
                     revenue_val = float(revenue_match.group(2)) * sign 
-                    
                     if revenue_val > 0: 
                         parsed_asics.append({'name': name.strip(), 'hashrate': hashrate_text, 'power_watts': power_val, 'daily_revenue': revenue_val}) 
                 except Exception as e: 
@@ -413,7 +400,9 @@ class ApiHandler:
         try:
             soup = BeautifulSoup(response.text, 'lxml')
             parsed_asics = []
-            rows = soup.select('table#asic-table tbody tr')
+            table = soup.find('table', id='asic-table')
+            if not table: raise ValueError("Парсинг (hashrate.no): Таблица с id='asic-table' не найдена.")
+            rows = table.select('tbody tr')
             logger.info(f"Парсинг (hashrate.no): Найдено {len(rows)} строк.")
             for row in rows:
                 try:
@@ -440,31 +429,42 @@ class ApiHandler:
     def _get_asics_from_2cryptocalc(self):
         """Источник #6: API от 2CryptoCalc."""
         logger.info("Источник #6 (API): Пытаюсь получить данные с 2cryptocalc.com...")
-        url = "https://2cryptocalc.com/api/v2/miners"
+        url = "https://2cryptocalc.com/api/v2/miners" # Этот эндпоинт больше не работает
+        logger.warning(f"Источник #6 ({url}) больше не действителен и пропускается.")
+        return None
+
+    def _get_asics_from_nicehash(self):
+        """Источник #7: API от NiceHash."""
+        logger.info("Источник #7 (API): Пытаюсь получить данные с NiceHash...")
+        url = "https://api2.nicehash.com/main/api/v2/public/profcalc/devices"
         response = self._make_request(url, is_json=True)
-        if not response or not response.get('miners'): return None
+        if not response or not response.get('devices'): return None
         parsed_asics = []
         try:
-            for miner in response['miners']:
-                if miner.get('type') != 'asic': continue
-                # Находим самый доходный алгоритм
-                best_algo = max(miner.get('algos', []), key=lambda x: x.get('revenue24', 0), default=None)
-                if not best_algo: continue
-                
-                revenue = best_algo.get('revenue24', 0)
+            for device in response['devices']:
+                revenue = float(device.get('paying', 0)) * 1000 * 1000 * 1000 # Конвертация из BTC/MH/day в BTC/TH/day
+                power = float(device.get('power', 0))
                 if revenue > 0:
-                    hashrate_value = best_algo.get('hashrate', 0)
-                    hashrate_unit = best_algo.get('hashrate_unit', 'H/s')
                     parsed_asics.append({
-                        'name': miner.get('name', 'N/A'),
-                        'hashrate': f"{hashrate_value} {hashrate_unit}",
-                        'power_watts': best_algo.get('power', 0),
+                        'name': f"NiceHash: {device.get('name', 'N/A')}",
+                        'hashrate': f"{device.get('speed')} {device.get('speed_unit')}",
+                        'power_watts': power,
                         'daily_revenue': revenue
                     })
-            if not parsed_asics: raise ValueError("API 2CryptoCalc не вернул доходных ASIC.")
+            if not parsed_asics: raise ValueError("API NiceHash не вернул доходных ASIC.")
+            
+            # Нужна конвертация в USD
+            btc_price, _ = self.get_crypto_price('BTC')
+            if not btc_price: 
+                logger.warning("Не удалось получить цену BTC для расчета доходности с NiceHash.")
+                return None
+            
+            for asic in parsed_asics:
+                asic['daily_revenue'] *= btc_price
+
             return sorted(parsed_asics, key=lambda x: x['daily_revenue'], reverse=True)
         except Exception as e:
-            logger.error(f"Непредвиденная ошибка при парсинге API 2CryptoCalc: {e}", exc_info=True); return None
+            logger.error(f"Непредвиденная ошибка при парсинге API NiceHash: {e}", exc_info=True); return None
 
     def get_top_asics(self, force_update: bool = False): 
         if not force_update and self.asic_cache.get("data") and self.asic_cache.get("timestamp") and (datetime.now() - self.asic_cache.get("timestamp") < timedelta(hours=1)): 
@@ -476,7 +476,7 @@ class ApiHandler:
             self._get_asics_from_viabtc,
             self._get_asics_from_minerstat,
             self._get_asics_from_whattomine,
-            self._get_asics_from_2cryptocalc,
+            self._get_asics_from_nicehash,
             self._get_asics_from_hashrate_no,
             self._get_asics_from_asicminervalue,
         ]
@@ -537,35 +537,43 @@ class ApiHandler:
         if self.currency_cache.get("rate") and (datetime.now() - self.currency_cache.get("timestamp", datetime.min) < timedelta(minutes=30)):
             return self.currency_cache["rate"], False
 
+        # Источник #1: API Центробанка РФ (самый надежный)
+        try:
+            today = datetime.now().strftime('%d/%m/%Y')
+            cbr_url = f"https://www.cbr.ru/scripts/XML_daily.asp?date_req={today}"
+            response = self._make_request(cbr_url, is_json=False)
+            if response:
+                root = ET.fromstring(response.content)
+                usd_rate_str = root.find("./Valute[CharCode='USD']/Value").text
+                rate = float(usd_rate_str.replace(',', '.'))
+                self.currency_cache = {"rate": rate, "timestamp": datetime.now()}
+                logger.info(f"Курс USD/RUB получен с cbr.ru: {rate}")
+                return rate, False
+        except Exception as e:
+            logger.warning(f"Источник #1 (cbr.ru) не удался: {e}")
+
+        # Каскад резервных API
         sources = [
-            "https://api.exchangerate.host/latest?base=USD&symbols=RUB",
-            "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json",
-            "https://open.er-api.com/v6/latest/USD",
-            "https://api.frankfurter.app/latest?from=USD&to=RUB",
-            "https://api.exchangerate-api.com/v4/latest/USD"
+            ("https://api.exchangerate.host/latest?base=USD&symbols=RUB", lambda data: data.get('rates', {}).get('RUB')),
+            ("https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json", lambda data: data.get('usd', {}).get('rub')),
+            ("https://open.er-api.com/v6/latest/USD", lambda data: data.get('rates', {}).get('RUB')),
+            ("https://api.frankfurter.app/latest?from=USD&to=RUB", lambda data: data.get('rates', {}).get('RUB')),
+            ("https://api.exchangerate-api.com/v4/latest/USD", lambda data: data.get('rates', {}).get('RUB')),
         ]
         
-        for i, url in enumerate(sources):
+        for i, (url, parser) in enumerate(sources):
             try:
                 data = self._make_request(url)
                 if not data:
-                    logger.warning(f"Источник курса #{i+1} ({url}) не вернул данные.")
+                    logger.warning(f"Источник курса #{i+2} ({url}) не вернул данные.")
                     continue
-                
-                rate = None
-                if 'rates' in data and 'RUB' in data['rates']: rate = data['rates']['RUB']
-                elif 'usd' in data and 'rub' in data['usd']: rate = data['usd']['rub']
-                elif 'conversion_rates' in data and 'RUB' in data['conversion_rates']: rate = data['conversion_rates']['RUB']
-
+                rate = parser(data)
                 if rate:
-                    logger.info(f"Курс USD/RUB получен с источника #{i+1}: {rate}")
+                    logger.info(f"Курс USD/RUB получен с источника #{i+2}: {rate}")
                     self.currency_cache = {"rate": float(rate), "timestamp": datetime.now()}
                     return float(rate), False
-                else:
-                    logger.warning(f"Источник курса #{i+1} ({url}) не содержит нужных данных.")
-
             except Exception as e:
-                logger.error(f"Ошибка при обработке источника курса #{i+1} ({url}): {e}")
+                logger.error(f"Ошибка при обработке источника курса #{i+2} ({url}): {e}")
                 continue
 
         logger.error("Все онлайн-источники курса валют недоступны. Использую аварийный курс.")
@@ -1520,7 +1528,8 @@ def auto_check_status():
     if not Config.ADMIN_CHAT_ID: return 
     logger.info("Проверка состояния систем...") 
     errors = [] 
-    if api.get_crypto_price("BTC")[0] is None: errors.append("API цены") 
+    rate, _ = api.get_usd_rub_rate()
+    if not rate: errors.append("API курса валют")
     if openai_client and "[❌" in api.ask_gpt("Тест"): errors.append("API OpenAI") 
     if Config.GOOGLE_JSON_STR and not api.get_gsheet(): errors.append("Google Sheets") 
     if not api.get_top_asics(force_update=True): errors.append("Парсинг ASIC") 
