@@ -1,903 +1,650 @@
 # -*- coding: utf-8 -*-
-
-# ========================================================================================
-# 1. ИМПОРТЫ
-# ========================================================================================
-import os
-import telebot
-import time
-import threading
-import schedule
-import json
-import httpx
-import gspread
-import io
-import re
-import random
+# ==============================================================================
+# Раздел 1: Импорты и начальная настройка
+# ==============================================================================
+import asyncio
 import logging
+import os
+import random
+import re
+from dataclasses import dataclass
+from typing import List, Optional, Dict
+
+import aiohttp
+import bleach
 import feedparser
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-
-from flask import Flask, request
-from google.oauth2.service_account import Credentials
-from telebot import types
-from openai import OpenAI
-from datetime import datetime, timedelta
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import CommandStart, Command
+from aiogram.types import Message, CallbackQuery
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bs4 import BeautifulSoup
-from dateutil import parser as date_parser
-from concurrent.futures import ThreadPoolExecutor
+from cachetools import TTLCache, cached
+from dotenv import load_dotenv
+from fuzzywuzzy import fuzz, process
+from openai import AsyncOpenAI
 
-# ========================================================================================
-# 2. КОНФИГУРАЦИЯ И КОНСТАНТЫ
-# ========================================================================================
+# Загрузка переменных окружения из файла .env
+load_dotenv()
+
+# ==============================================================================
+# Раздел 2: Конфигурация и константы
+# ==============================================================================
+
+# --- Конфигурация API ---
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+CMC_API_KEY = os.getenv("CMC_API_KEY")  # CoinMarketCap API Key
+
+# --- Конфигурация парсинга и сбора данных ---
+ASIC_SOURCES = {
+    'asicminervalue': 'https://www.asicminervalue.com/',
+}
+MINERSTAT_API_URL = "https://api.minerstat.com/v2/hardware"
+COINGECKO_API_URL = "https://api.coingecko.com/api/v3"
+MINERSTAT_COINS_URL = "https://api.minerstat.com/v2/coins"
+FEAR_AND_GREED_API_URL = "https://pro-api.coinmarketcap.com/v3/fear-and-greed/historical"
+
+# --- Конфигурация новостей ---
+NEWS_RSS_FEEDS = [
+    "https://cointelegraph.com/rss/tag/russia",
+    "https://forklog.com/feed",
+    "https://www.rbc.ru/crypto/feed",
+    "https://bits.media/rss/",
+]
+NEWS_CHAT_ID = os.getenv("NEWS_CHAT_ID")  # ID чата для отправки новостей
+NEWS_INTERVAL_HOURS = 3
+
+# --- Конфигурация кэширования ---
+# Кэш для данных по ASIC-майнерам (TTL 1 час)
+asic_cache = TTLCache(maxsize=1, ttl=3600)
+# Кэш для цен на криптовалюты (TTL 5 минут)
+crypto_price_cache = TTLCache(maxsize=500, ttl=300)
+# Кэш для "Индекса страха и жадности" (TTL 4 часа)
+fear_greed_cache = TTLCache(maxsize=1, ttl=14400)
+# Кэш для списка монет с алгоритмами (TTL 24 часа)
+coin_list_cache = TTLCache(maxsize=1, ttl=86400)
+
+# --- Настройка журналирования ---
 logging.basicConfig(
     level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s [%(name)s.%(funcName)s:%(lineno)d] %(message)s',
-    datefmt='%d/%b/%Y %H:%M:%S'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
-class Config:
-    """Класс для хранения всех настроек и констант."""
-    BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
-    WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-    NEWS_CHAT_ID = os.getenv("NEWS_CHAT_ID")
-    ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
+# --- Инициализация основных компонентов ---
+bot = Bot(token=TELEGRAM_BOT_TOKEN)
+dp = Dispatcher()
+scheduler = AsyncIOScheduler(timezone="UTC")
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+# ==============================================================================
+# Раздел 3: Модели данных (Dataclasses)
+# ==============================================================================
+
+@dataclass
+class AsicMiner:
+    """Каноническая модель данных для одного ASIC-майнера."""
+    name: str
+    algorithm: str
+    hashrate: str
+    power: int  # в Ваттах
+    profitability: float  # в USD/день
+    source: str
+
+@dataclass
+class CryptoCoin:
+    """Модель данных для криптовалюты с ценой и алгоритмом."""
+    id: str
+    symbol: str
+    name: str
+    price: float
+    algorithm: Optional[str] = None
+    market_cap: Optional[int] = None
+
+# ==============================================================================
+# Раздел 4: Вспомогательные и утилитарные функции
+# ==============================================================================
+
+def sanitize_html(text: str) -> str:
+    """
+    Полностью удаляет все HTML-теги и атрибуты, оставляя только обычный текст.
+    Это 100% надежный способ предотвратить ошибку Telegram "can't parse entities".
+    """
+    if not text:
+        return ""
+    return bleach.clean(text, tags=[], attributes={}, strip=True).strip()
+
+async def resilient_request(session: aiohttp.ClientSession, url: str, headers: Optional[Dict] = None, params: Optional[Dict] = None) -> Optional[Dict]:
+    """
+    Выполняет асинхронный GET-запрос с базовой обработкой ошибок и возвращает JSON.
+    Использует ротацию User-Agent для маскировки запросов.
+    """
+    try:
+        user_agent_list = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+        ]
+        request_headers = {'User-Agent': random.choice(user_agent_list)}
+        if headers:
+            request_headers.update(headers)
+
+        async with session.get(url, headers=request_headers, params=params, timeout=15) as response:
+            response.raise_for_status()
+            return await response.json()
+    except aiohttp.ClientError as e:
+        logger.error(f"Ошибка сетевого запроса к {url}: {e}")
+    except asyncio.TimeoutError:
+        logger.error(f"Тайм-аут при запросе к {url}")
+    except Exception as e:
+        logger.error(f"Неизвестная ошибка при запросе к {url}: {e}")
+    return None
+
+def parse_power(power_str: str) -> int:
+    """Преобразует строку мощности (e.g., '3400W') в целое число."""
+    return int(re.sub(r'[^0-9]', '', power_str)) if power_str else 0
+
+def parse_profitability(profit_str: str) -> float:
+    """Преобразует строку прибыльности (e.g., '$5.12') в число с плавающей точкой."""
+    cleaned_str = re.sub(r'[^\d.]', '', profit_str)
+    return float(cleaned_str) if cleaned_str else 0.0
+
+# ==============================================================================
+# Раздел 5: Основные модули сбора данных
+# ==============================================================================
+
+# --- Модуль сбора данных по ASIC-майнерам ---
+
+async def scrape_asicminervalue(session: aiohttp.ClientSession) -> List[AsicMiner]:
+    """
+    Скрапит данные о прибыльности ASIC-майнеров с AsicMinerValue.com.
+    """
+    miners: List[AsicMiner] = []
+    url = ASIC_SOURCES['asicminervalue']
     
-    GAME_DATA_FILE = "game_data.json"
-    PROFILES_DATA_FILE = "user_profiles.json"
-    ASIC_CACHE_FILE = "asic_data_cache.json"
-    DYNAMIC_KEYWORDS_FILE = "dynamic_keywords.json"
-    COINGECKO_CACHE_FILE = "coingecko_cache.json"
+    try:
+        async with session.get(url, timeout=20) as response:
+            response.raise_for_status()
+            html = await response.text()
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        logger.error(f"Не удалось получить HTML с AsicMinerValue: {e}")
+        return miners
 
-    if not BOT_TOKEN:
-        logger.critical("Критическая ошибка: TG_BOT_TOKEN не установлен.")
-        raise ValueError("Критическая ошибка: TG_BOT_TOKEN не установлен")
-
-    PARTNER_URL = os.getenv("PARTNER_URL", "https://cutt.ly/5rWGcgYL")
-    PARTNER_BUTTON_TEXT_OPTIONS = ["🎁 Узнать спеццены", "🔥 Эксклюзивное предложение", "💡 Получить консультацию", "💎 Прайс от экспертов"]
-    PARTNER_AD_TEXT_OPTIONS = [
-        "Хотите превратить виртуальные BTC в реальные? Для этого нужно настоящее оборудование! Наши партнеры предлагают лучшие условия для старта.",
-        "Виртуальный майнинг - это только начало. Готовы к реальной добыче? Ознакомьтесь с предложениями от проверенных поставщиков.",
-    ]
-    BOT_HINTS = [
-        "💡 Узнайте курс любой монеты, просто написав ее тикер!", "⚙️ Посмотрите на самые доходные ASIC",
-        "⛏️ Рассчитайте прибыль с помощью 'Калькулятора'", "📰 Хотите свежие крипто-новости?",
-        "🤑 Попробуйте наш симулятор майнинга!", "😱 Проверьте Индекс Страха и Жадности",
-        "🏆 Сравните себя с лучшими в таблице лидеров", "🎓 Что такое 'HODL'? Узнайте: `/word`",
-        "🧠 Проверьте знания и заработайте в `/quiz`", "🛍️ Загляните в магазин улучшений"
-    ]
-    
-    LEVEL_MULTIPLIERS = {1: 1, 2: 1.5, 3: 2.2, 4: 3.5, 5: 5}
-    UPGRADE_COSTS = {2: 0.001, 3: 0.005, 4: 0.02, 5: 0.1}
-    STREAK_BONUS_MULTIPLIER = 0.05
-    QUIZ_REWARD = 0.0001
-    QUIZ_MIN_CORRECT_FOR_REWARD = 3
-    QUIZ_QUESTIONS_COUNT = 5
-    SHOP_ITEMS = {
-        'boost': {'name': '⚡️ Буст х2 (24ч)', 'cost': 0.0005},
-        'overclock': {'name': '⚙️ Оверклокинг-чип (+5% навсегда)', 'cost': 0.002, 'effect': 0.05}
-    }
-    RANDOM_EVENT_CHANCE = 0.1
-
-    HALVING_INTERVAL = 210000
-    CRYPTO_TERMS = ["Блокчейн", "Газ (Gas)", "Халвинг", "ICO", "DeFi", "NFT", "Сатоши", "Кит (Whale)", "HODL", "DEX", "Смарт-контракт"]
-    
-    WARN_LIMIT = 3
-    MUTE_DURATION_HOURS = 24
-    SPAM_KEYWORDS = ['p2p', 'арбитраж', 'обмен', 'сигналы', 'обучение', 'заработок', 'инвестиции', 'вложения', 'схема', 'связка']
-    TECH_QUESTION_KEYWORDS = ['почему', 'как', 'что делать', 'проблема', 'ошибка', 'не работает', 'отваливается', 'перегревается', 'настроить']
-    TECH_SUBJECT_KEYWORDS = ['asic', 'асик', 'майнер', 'блок питания', 'прошивка', 'хешрейт', 'плата', 'пул']
-    
-    FALLBACK_ASICS = [
-        {'name': 'Antminer S21 200T', 'hashrate': '200 TH/s', 'power_watts': 3550, 'daily_revenue': 11.50, 'algorithm': 'SHA-256'},
-        {'name': 'Antminer T21 190T', 'hashrate': '190 TH/s', 'power_watts': 3610, 'daily_revenue': 10.80, 'algorithm': 'SHA-256'},
-        {'name': 'Antminer L7 9500M', 'hashrate': '9.5 GH/s', 'power_watts': 3425, 'daily_revenue': 12.00, 'algorithm': 'Scrypt'},
-        {'name': 'Antminer KS5 Pro 21T', 'hashrate': '21 TH/s', 'power_watts': 3150, 'daily_revenue': 15.00, 'algorithm': 'KHeavyHash'},
-    ]
-
-    TICKER_ALIASES = {'бтк': 'BTC', 'биткоин': 'BTC', 'биток': 'BTC', 'eth': 'ETH', 'эфир': 'ETH', 'эфириум': 'ETH', 'sol': 'SOL', 'солана': 'SOL', 'ltc': 'LTC', 'лайткоин': 'LTC', 'лайт': 'LTC', 'doge': 'DOGE', 'доги': 'DOGE', 'дог': 'DOGE', 'kas': 'KAS', 'каспа': 'KAS', 'алео': 'ALEO'}
-    POPULAR_TICKERS = ['BTC', 'ETH', 'SOL', 'TON', 'KAS']
-    NEWS_RSS_FEEDS = ["https://forklog.com/feed", "https://bits.media/rss/", "https://www.rbc.ru/crypto/feed", "https://beincrypto.ru/feed/", "https://cointelegraph.com/rss/tag/russia"]
-
-class ExceptionHandler(telebot.ExceptionHandler):
-    def handle(self, exception): logger.error("Произошла ошибка в обработчике pyTelegramBotAPI:", exc_info=exception); return True
-
-bot = telebot.TeleBot(Config.BOT_TOKEN, threaded=False, parse_mode='HTML', exception_handler=ExceptionHandler())
-app = Flask(__name__)
-
-try:
-    if Config.OPENAI_API_KEY: openai_client = OpenAI(api_key=Config.OPENAI_API_KEY, http_client=httpx.Client())
-    else: openai_client = None; logger.warning("OPENAI_API_KEY не найден. Функциональность GPT будет отключена.")
-except Exception as e: openai_client = None; logger.critical(f"Не удалось инициализировать клиент OpenAI: {e}", exc_info=True)
-
-user_quiz_states = {}
-
-# ========================================================================================
-# 3. КЛАССЫ ЛОГИКИ (API, ИГРА, АНТИСПАМ) - ВЕРСИЯ 9.1
-# ========================================================================================
-class ApiHandler:
-    def __init__(self):
-        self.asic_cache = self._load_json_file(Config.ASIC_CACHE_FILE, is_cache=True)
-        self.currency_cache = {"rate": None, "timestamp": None}
-        self.coingecko_cache = self._load_json_file(Config.COINGECKO_CACHE_FILE, default_value={})
-
-    def _make_request(self, url, timeout=20, is_json=True, custom_headers=None, retries=3, backoff_factor=1.5):
-        headers = {'User-Agent': f'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36', 'Accept': 'application/json, text/html,application/xhtml+xml,application/xml;q=0.9', 'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8'}
-        if custom_headers: headers.update(custom_headers)
+    try:
+        soup = BeautifulSoup(html, 'lxml')
+        table = soup.find('table', {'class': 'table-hover'})
+        if not table:
+            logger.warning("Не удалось найти таблицу на AsicMinerValue")
+            return miners
         
-        for i in range(retries):
-            try:
-                with httpx.Client(headers=headers, timeout=timeout, follow_redirects=True) as client:
-                    response = client.get(url); response.raise_for_status()
-                    return response.json() if is_json else response
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code == 429:
-                    wait_time = backoff_factor * (2 ** i)
-                    logger.warning(f"Слишком много запросов к {url}. Попытка {i+1}/{retries}. Жду {wait_time:.2f} секунд.")
-                    time.sleep(wait_time)
-                else: logger.error(f"HTTP ошибка для {url}: {e}"); return None
-            except (httpx.RequestError, json.JSONDecodeError) as e: logger.error(f"Сетевой запрос или декодирование JSON не удалось для {url}: {e}"); return None
-        logger.error(f"Все попытки запроса к {url} провалились.")
+        rows = table.find('tbody').find_all('tr')
+        for row in rows:
+            cols = row.find_all('td')
+            if len(cols) > 6:
+                try:
+                    # ИСПРАВЛЕНО: Индексы колонок скорректированы для правильного парсинга.
+                    name = cols[0].text.strip()
+                    hashrate = cols[2].text.strip()
+                    power_str = cols[3].text.strip()
+                    algorithm = cols[5].text.strip()
+                    profitability_str = cols[6].text.strip()
+                    
+                    profitability = parse_profitability(profitability_str)
+                    
+                    if profitability > 0:
+                        miners.append(AsicMiner(
+                            name=name,
+                            algorithm=algorithm,
+                            hashrate=hashrate,
+                            power=parse_power(power_str),
+                            profitability=profitability,
+                            source='AsicMinerValue'
+                        ))
+                except (ValueError, IndexError) as e:
+                    logger.warning(f"Ошибка парсинга строки на AsicMinerValue: {e} | Строка: {[c.text.strip() for c in cols]}")
+                    continue
+    except Exception as e:
+        logger.error(f"Критическая ошибка при скрапинге AsicMinerValue: {e}", exc_info=True)
+
+    return miners
+
+@cached(asic_cache)
+async def get_profitable_asics() -> List[AsicMiner]:
+    """
+    Агрегирует данные по ASIC-майнерам из нескольких источников, сливает и дедуплицирует их.
+    """
+    logger.info("Обновление кэша ASIC-майнеров...")
+    async with aiohttp.ClientSession() as session:
+        scraped_miners = await scrape_asicminervalue(session)
+
+    if not scraped_miners:
+        logger.warning("Не удалось получить данные по ASIC ни из одного источника.")
+        return []
+    
+    # В данной версии используется один, но наиболее полный источник (AsicMinerValue).
+    # Логика слияния с Minerstat может быть добавлена для обогащения данных.
+    
+    # Сортируем по прибыльности в убывающем порядке
+    sorted_miners = sorted(scraped_miners, key=lambda m: m.profitability, reverse=True)
+    logger.info(f"Кэш ASIC-майнеров обновлен. Найдено {len(sorted_miners)} уникальных устройств.")
+    return sorted_miners
+
+# --- Модуль получения данных по криптовалютам ---
+
+@cached(coin_list_cache)
+async def get_coin_list_with_algorithms() -> Dict[str, str]:
+    """
+    Получает и кэширует полный список монет с их алгоритмами из Minerstat.
+    Возвращает словарь {СИМВОЛ: АЛГОРИТМ}.
+    """
+    logger.info("Обновление кэша списка монет с алгоритмами...")
+    coin_algo_map = {}
+    async with aiohttp.ClientSession() as session:
+        data = await resilient_request(session, MINERSTAT_COINS_URL)
+        if data:
+            for coin_data in data:
+                symbol = coin_data.get('coin')
+                algorithm = coin_data.get('algorithm')
+                if symbol and algorithm:
+                    coin_algo_map[symbol.upper()] = algorithm
+    logger.info(f"Кэш списка монет обновлен. Загружено {len(coin_algo_map)} монет.")
+    return coin_algo_map
+
+@cached(crypto_price_cache)
+async def get_crypto_price(query: str) -> Optional[CryptoCoin]:
+    """
+    Получает цену, рыночные данные и алгоритм для криптовалюты по тикеру или названию.
+    Использует CoinGecko для цен и Minerstat для алгоритмов.
+    """
+    query = query.lower().strip()
+    if not query:
+        return None
+        
+    async with aiohttp.ClientSession() as session:
+        # 1. Поиск монеты на CoinGecko
+        search_data = await resilient_request(session, f"{COINGECKO_API_URL}/search", params={'query': query})
+        if not search_data or not search_data.get('coins'):
+            return None
+
+        # ИСПРАВЛЕНО: Берем первый, наиболее релевантный результат
+        coin_info = search_data['coins'][0]
+        coin_id = coin_info.get('id')
+        if not coin_id:
+            return None
+
+        # 2. Получение детальных рыночных данных
+        market_data_list = await resilient_request(session, f"{COINGECKO_API_URL}/coins/markets", params={'vs_currency': 'usd', 'ids': coin_id})
+        if not market_data_list:
+            return None
+            
+        market_data = market_data_list[0]
+        
+        # 3. Получение алгоритма
+        coin_algo_map = await get_coin_list_with_algorithms()
+        symbol = market_data.get('symbol', '').upper()
+        algorithm = coin_algo_map.get(symbol)
+
+        return CryptoCoin(
+            id=market_data.get('id'),
+            symbol=symbol,
+            name=market_data.get('name'),
+            price=market_data.get('current_price', 0.0),
+            market_cap=market_data.get('market_cap', 0),
+            algorithm=algorithm
+        )
+
+# --- Модуль "Индекс страха и жадности" ---
+
+@cached(fear_greed_cache)
+async def get_fear_and_greed_index() -> Optional[Dict]:
+    """
+    Получает последнее значение "Индекса страха и жадности" из API CoinMarketCap.
+    """
+    if not CMC_API_KEY:
+        return None
+    logger.info("Обновление кэша 'Индекса страха и жадности'...")
+    headers = {'X-CMC_PRO_API_KEY': CMC_API_KEY}
+    
+    async with aiohttp.ClientSession() as session:
+        data = await resilient_request(session, FEAR_AND_GREED_API_URL, headers=headers, params={'limit': '1'})
+        if data and data.get('status', {}).get('error_code') == 0 and data.get('data'):
+            # ИСПРАВЛЕНО: Получаем первый элемент из списка данных
+            latest_data = data['data'][0]
+            logger.info("Кэш 'Индекса страха и жадности' обновлен.")
+            return {
+                'value': latest_data.get('value'),
+                'classification': latest_data.get('value_classification')
+            }
+    return None
+
+# --- Модуль новостей ---
+
+async def fetch_latest_news() -> List[Dict]:
+    """
+    Парсит RSS-ленты и возвращает список последних новостей.
+    """
+    all_news = []
+    for url in NEWS_RSS_FEEDS:
+        try:
+            # feedparser работает синхронно, запускаем в executor-е, чтобы не блокировать event loop
+            loop = asyncio.get_running_loop()
+            feed = await loop.run_in_executor(None, feedparser.parse, url)
+            
+            for entry in feed.entries:
+                all_news.append({
+                    'title': entry.title,
+                    'link': entry.link,
+                    'summary': sanitize_html(getattr(entry, 'summary', '')),
+                    'published': getattr(entry, 'published_parsed', None)
+                })
+        except Exception as e:
+            logger.error(f"Не удалось спарсить RSS-ленту {url}: {e}")
+    
+    # Сортируем по дате публикации, самые новые - вверху
+    all_news.sort(key=lambda x: x['published'] or (0,0,0,0,0,0), reverse=True)
+    
+    # Убираем дубликаты по заголовкам
+    seen_titles = set()
+    unique_news = []
+    for news_item in all_news:
+        if news_item['title'].lower() not in seen_titles:
+            unique_news.append(news_item)
+            seen_titles.add(news_item['title'].lower())
+
+    return unique_news[:5] # Возвращаем 5 последних новостей
+
+async def send_news_job():
+    """
+    Задача для APScheduler: получает новости и отправляет их в указанный чат.
+    """
+    if not NEWS_CHAT_ID:
+        logger.warning("Переменная окружения NEWS_CHAT_ID не установлена. Отправка новостей невозможна.")
+        return
+        
+    logger.info("Запуск задачи по отправке новостей...")
+    try:
+        latest_news = await fetch_latest_news()
+        if not latest_news:
+            logger.info("Новых новостей для отправки не найдено.")
+            return
+
+        message_text = "📰 **Последние новости из мира криптовалют:**\n\n"
+        for i, news_item in enumerate(latest_news):
+            title = sanitize_html(news_item['title']).replace('[', '(').replace(']', ')')
+            message_text += f"{i+1}. [{title}]({news_item['link']})\n"
+        
+        await bot.send_message(NEWS_CHAT_ID, message_text, parse_mode="Markdown", disable_web_page_preview=True)
+        logger.info(f"Новости успешно отправлены в чат {NEWS_CHAT_ID}.")
+    except Exception as e:
+        logger.error(f"Ошибка при выполнении задачи отправки новостей: {e}", exc_info=True)
+
+# --- Модуль викторины с GPT ---
+
+async def generate_quiz_question() -> Optional[Dict]:
+    """
+    Генерирует вопрос для викторины с помощью OpenAI GPT на основе последних новостей.
+    """
+    if not openai_client:
+        return None
+        
+    logger.info("Генерация вопроса для викторины...")
+    try:
+        news = await fetch_latest_news()
+        if not news:
+            return None
+        
+        # Используем краткое содержание последней новости как контекст
+        context = news[0]['summary']
+        
+        prompt = f"""
+        На основе следующего текста новости из мира криптовалют, создай один вопрос для викторины с четырьмя вариантами ответа.
+        
+        Контекст:
+        \"\"\"
+        {context}
+        \"\"\"
+        
+        Твоя задача:
+        1. Внимательно прочти контекст и выдели ключевой факт.
+        2. Сформулируй четкий вопрос, основанный на этом факте.
+        3. Создай один правильный ответ.
+        4. Создай три правдоподобных, но неверных ответа.
+        5. Верни результат в виде строгого JSON-объекта со следующими ключами: "question" (строка), "options" (список из 4 строк), "correct_option_index" (число от 0 до 3).
+        
+        JSON-ответ должен быть единственным выводом, без дополнительных пояснений.
+        """
+
+        response = await openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            temperature=0.7,
+        )
+        
+        quiz_data = await asyncio.to_thread(lambda: response.choices[0].message.model_dump_json())
+        import json
+        quiz_data = json.loads(json.loads(quiz_data)['content'])
+        
+        # Валидация полученных данных
+        if all(k in quiz_data for k in ['question', 'options', 'correct_option_index']) and len(quiz_data['options']) == 4:
+            logger.info("Вопрос для викторины успешно сгенерирован.")
+            return quiz_data
+        else:
+            logger.warning(f"GPT вернул некорректный формат JSON: {quiz_data}")
+            return None
+
+    except Exception as e:
+        logger.error(f"Ошибка при генерации вопроса викторины через OpenAI: {e}", exc_info=True)
         return None
 
-    def _load_json_file(self, file_path, is_cache=False, default_value=None):
-        if is_cache: data_to_return = {"data": [], "timestamp": None}
-        else: data_to_return = default_value if default_value is not None else {}
-        if not os.path.exists(file_path): return data_to_return
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                loaded_data = json.load(f)
-                if is_cache and "timestamp" in loaded_data and loaded_data["timestamp"]:
-                    cache_time = datetime.fromisoformat(loaded_data["timestamp"])
-                    if datetime.now() - cache_time < timedelta(hours=4):
-                        loaded_data["timestamp"] = cache_time; return loaded_data
-                elif not is_cache: return loaded_data
-        except Exception as e: logger.error(f"Не удалось загрузить или обработать {file_path}: {e}")
-        return data_to_return
+# ==============================================================================
+# Раздел 6: Обработчики команд и колбэков Telegram
+# ==============================================================================
 
-    def _save_json_file(self, file_path, data_dict):
-        try:
-            with open(file_path, 'w', encoding='utf-8') as f:
-                data_to_save = data_dict.copy()
-                if isinstance(data_to_save.get("timestamp"), datetime): data_to_save["timestamp"] = data_to_save["timestamp"].isoformat()
-                json.dump(data_to_save, f, indent=4, ensure_ascii=False)
-        except Exception as e: logger.error(f"Ошибка при сохранении файла {file_path}: {e}")
-        
-    def sanitize_html(self, html_string: str) -> str:
-        if not html_string: return ""
-        soup = BeautifulSoup(html_string, "html.parser")
-        for tag in soup.find_all(True):
-            if tag.name not in ['b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del', 'a', 'code', 'pre', 'span', 'tg-spoiler']:
-                tag.unwrap()
-        for tag in soup.find_all(True):
-            if tag.name == 'a':
-                href = tag.get('href')
-                tag.attrs = {}
-                if href: tag['href'] = href
-            elif tag.name != 'a': tag.attrs = {}
-        return str(soup)
-
-    def ask_gpt(self, prompt: str, model: str = "gpt-4o"):
-        if not openai_client: return "[❌ Ошибка: Клиент OpenAI не инициализирован.]"
-        try:
-            res = openai_client.chat.completions.create(model=model, messages=[{"role": "system", "content": "Ты — полезный ассистент, отвечающий на русском языке."}, {"role": "user", "content": prompt}], timeout=30.0)
-            return self.sanitize_html(res.choices[0].message.content.strip())
-        except Exception as e: logger.error(f"Ошибка вызова OpenAI API: {e}"); return "[❌ Ошибка GPT.]"
-
-    def get_top_asics_for_algo(self, algorithm: str, count=3):
-        if not algorithm or algorithm == "N/A": return ""
-        all_asics = self.get_top_asics()
-        normalized_algorithm = algorithm.lower().replace('-', '').replace('_', '').replace(' ', '')
-        relevant_asics = [asic for asic in all_asics if asic.get('algorithm') and normalized_algorithm in asic['algorithm'].lower().replace('-', '').replace('_', '').replace(' ', '')]
-        if not relevant_asics: return ""
-        sorted_asics = sorted(relevant_asics, key=lambda x: x.get('daily_revenue', 0), reverse=True)
-        text_lines = [f"\n\n⚙️ <b>Актуальное оборудование под {algorithm}:</b>"]
-        for asic in sorted_asics[:count]: text_lines.append(f"  • <b>{telebot.util.escape(asic['name'])}</b>: ${asic.get('daily_revenue', 0):.2f}/день")
-        return "\n".join(text_lines)
-
-    def get_crypto_price(self, ticker="BTC"):
-        ticker_input = ticker.strip().lower()
-        ticker_upper = Config.TICKER_ALIASES.get(ticker_input, ticker_input.upper())
-        coin_id = self.coingecko_cache.get(ticker_upper.lower())
-        if not coin_id:
-            search_data = self._make_request(f"https://api.coingecko.com/api/v3/search?query={ticker_input}")
-            if search_data and search_data.get('coins'):
-                top_coin = search_data['coins'][0]
-                coin_id, ticker_upper = top_coin.get('id'), top_coin.get('symbol', ticker_upper).upper()
-                self.coingecko_cache[ticker_upper.lower()] = coin_id
-            else: return None, None
-        price_response = self._make_request(f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd")
-        if not price_response or not price_response.get(coin_id, {}).get('usd'): return None, None
-        price_data = {'price': float(price_response[coin_id]['usd']), 'source': 'CoinGecko', 'ticker': ticker_upper}
-        details_response = self._make_request(f"https://api.coingecko.com/api/v3/coins/{coin_id}?localization=false&tickers=false&market_data=false&community_data=false&developer_data=false&sparkline=false")
-        algorithm = details_response.get('hashing_algorithm') if details_response else None
-        return price_data, self.get_top_asics_for_algo(algorithm)
-
-    def _get_asics_from_whattomine(self):
-        logger.info("Источник #1 (API): Пытаюсь получить данные с whattomine.com...")
-        data = self._make_request("https://whattomine.com/asics.json", custom_headers={'Accept': 'application/json'})
-        if not data or 'asics' not in data: return []
-        parsed_asics = []
-        for name, asic_data in data['asics'].items():
-            if asic_data.get('status') != 'Active' or not asic_data.get('revenue'): continue
-            try:
-                revenue = float(re.sub(r'[^\d\.]', '', asic_data['revenue']))
-                if revenue > 0:
-                    parsed_asics.append({'name': name, 'hashrate': f"{asic_data.get('hashrate')} ({asic_data.get('algorithm')})", 'power_watts': float(asic_data.get('power', 0)), 'daily_revenue': revenue, 'algorithm': asic_data.get('algorithm')})
-            except (ValueError, TypeError): continue
-        logger.info(f"WhatToMine: успешно обработано {len(parsed_asics)} асиков.")
-        return parsed_asics
-
-    def _get_asics_from_minerstat(self):
-        logger.info("Источник #2 (API): Пытаюсь получить данные с minerstat.com...")
-        all_hardware = self._make_request("https://api.minerstat.com/v2/hardware")
-        if not all_hardware: return []
-        parsed_asics = []
-        for device in all_hardware:
-            if not isinstance(device, dict) or device.get("type") != "asic": continue
-            best_algo_data, best_algo_name, max_revenue = None, "N/A", -1
-            for algo_name, algo_data in device.get("algorithms", {}).items():
-                try:
-                    revenue = float(algo_data.get("revenue_in_usd", "0").replace("$", ""))
-                    if revenue > max_revenue: max_revenue, best_algo_data, best_algo_name = revenue, algo_data, algo_name
-                except (ValueError, TypeError): continue
-            if best_algo_data and max_revenue > 0:
-                hashrate_val = float(best_algo_data.get('speed', 0))
-                if hashrate_val / 1e12 >= 1: hashrate_str = f"{hashrate_val / 1e12:.2f} TH/s"
-                elif hashrate_val / 1e9 >= 1: hashrate_str = f"{hashrate_val / 1e9:.2f} GH/s"
-                else: hashrate_str = f"{hashrate_val / 1e6:.2f} MH/s"
-                parsed_asics.append({'name': device.get("name", "N/A"), 'hashrate': hashrate_str, 'power_watts': float(best_algo_data.get("power", 0)), 'daily_revenue': max_revenue, 'algorithm': best_algo_name})
-        logger.info(f"Minerstat: успешно обработано {len(parsed_asics)} асиков.")
-        return parsed_asics
-
-    def get_top_asics(self, force_update: bool = False):
-        if not force_update and self.asic_cache.get("data"): return self.asic_cache.get("data")
-        all_asics = []
-        source_functions = [self._get_asics_from_whattomine, self._get_asics_from_minerstat]
-        with ThreadPoolExecutor(max_workers=len(source_functions)) as executor:
-            for result in executor.map(lambda f: f(), source_functions):
-                if result: all_asics.extend(result)
-        if not all_asics:
-            if self.asic_cache.get("data"):
-                logger.warning("Все онлайн-источники недоступны, использую данные из старого кэша.")
-                return self.asic_cache.get("data")
-            logger.error("КРИТИЧЕСКАЯ ОШИБКА: Все онлайн-источники и кэш недоступны, использую аварийный список ASIC.")
-            return Config.FALLBACK_ASICS
-        unique_asics = {asic['name']: asic for asic in sorted(all_asics, key=lambda x: x['daily_revenue'])}
-        final_list = sorted(unique_asics.values(), key=lambda x: x['daily_revenue'], reverse=True)
-        self.asic_cache = {"data": final_list, "timestamp": datetime.now()}
-        logger.info(f"Успешно собрано и закэшировано {len(final_list)} уникальных ASIC.")
-        return final_list
-        
-    def get_fear_and_greed_index(self):
-        data = self._make_request("https://api.alternative.me/fng/?limit=1")
-        if not data or 'data' not in data or not data['data']: return None, "[❌ Ошибка при получении индекса]"
-        try:
-            value_data = data['data'][0]; value, classification = int(value_data['value']), value_data['value_classification']
-            plt.style.use('dark_background'); fig, ax = plt.subplots(figsize=(8, 4.5), subplot_kw={'projection': 'polar'})
-            ax.set_yticklabels([]); ax.set_xticklabels([]); ax.grid(False); ax.spines['polar'].set_visible(False); ax.set_ylim(0, 1)
-            colors = ['#d94b4b', '#e88452', '#ece36a', '#b7d968', '#73c269']
-            for i in range(100): ax.barh(1, 0.0314, left=3.14 - (i * 0.0314), height=0.3, color=colors[min(len(colors) - 1, int(i / 25))])
-            angle = 3.14 - (value * 0.0314)
-            ax.annotate('', xy=(angle, 1), xytext=(0, 0), arrowprops=dict(facecolor='white', shrink=0.05, width=4, headwidth=10))
-            fig.text(0.5, 0.5, f"{value}", ha='center', va='center', fontsize=48, color='white', weight='bold')
-            fig.text(0.5, 0.35, classification, ha='center', va='center', fontsize=20, color='white')
-            buf = io.BytesIO(); plt.savefig(buf, format='png', dpi=150, transparent=True); buf.seek(0); plt.close(fig)
-            explanation = self.ask_gpt(f"Кратко объясни для майнера, как 'Индекс страха и жадности' со значением '{value} ({classification})' влияет на рынок. Не более 2-3 предложений.")
-            return buf, f"😱 <b>Индекс страха и жадности: {value} - {classification}</b>\n\n{explanation}"
-        except Exception as e: logger.error(f"Ошибка при создании графика индекса страха: {e}"); return None, "[❌ Ошибка при получении индекса]"
-
-    def get_usd_rub_rate(self):
-        if self.currency_cache.get("rate") and (datetime.now() - self.currency_cache.get("timestamp", datetime.min) < timedelta(minutes=30)): return self.currency_cache["rate"], False
-        sources = [{"name": "CBRF", "url": "https://www.cbr-xml-daily.ru/daily_json.js", "parser": lambda data: data.get('Valute', {}).get('USD', {}).get('Value')}, {"name": "Exchangerate.host", "url": "https://api.exchangerate.host/latest?base=USD&symbols=RUB", "parser": lambda data: data.get('rates', {}).get('RUB')}]
-        for source_info in sources:
-            try:
-                data = self._make_request(source_info['url'])
-                if data and (rate := source_info['parser'](data)):
-                    logger.info(f"Курс USD/RUB получен с источника {source_info['name']}: {rate}"); self.currency_cache = {"rate": float(rate), "timestamp": datetime.now()}; return float(rate), False
-            except Exception as e: logger.error(f"Ошибка при обработке источника курса {source_info['name']}: {e}")
-        logger.error("Все онлайн-источники курса валют недоступны. Использую аварийный курс."); return 90.0, True
-
-    def get_halving_info(self):
-        urls = ["https://mempool.space/api/blocks/tip/height", "https://blockchain.info/q/getblockcount"]
-        current_block = next((int(r.text) for url in urls if (r := self._make_request(url, is_json=False)) and r.text.isdigit()), None)
-        if not current_block: return "[❌ Не удалось получить данные о халвинге]"
-        try:
-            blocks_left = ((current_block // Config.HALVING_INTERVAL) + 1) * Config.HALVING_INTERVAL - current_block
-            if blocks_left <= 0: return "🎉 <b>Халвинг уже произошел!</b>"
-            days, rem_min = divmod(blocks_left * 10, 1440); hours, _ = divmod(rem_min, 60)
-            return f"⏳ <b>До халвинга Bitcoin осталось:</b>\n\n🗓 <b>Дней:</b> <code>{days}</code> | ⏰ <b>Часов:</b> <code>{hours}</code>\n🧱 <b>Блоков до халвинга:</b> <code>{blocks_left:,}</code>"
-        except Exception as e: logger.error(f"Ошибка обработки данных для халвинга: {e}"); return "[❌ Ошибка]"
-
-    def _get_news_from_rss(self, url):
-        try:
-            feed = feedparser.parse(url, agent=f'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/{random.randint(100, 126)}.0.0.0')
-            if feed.bozo: logger.warning(f"Лента {url} может быть некорректной: {feed.bozo_exception}")
-            return [{'title': e.title, 'link': e.link, 'published': date_parser.parse(e.published).replace(tzinfo=None)} for e in feed.entries if hasattr(e, 'published') and hasattr(e, 'title') and hasattr(e, 'link')]
-        except Exception as e: logger.error(f"Не удалось получить новости из {url}: {e}"); return []
-
-    def get_crypto_news(self):
-        all_news = []
-        with ThreadPoolExecutor(max_workers=len(Config.NEWS_RSS_FEEDS)) as executor:
-            for result in executor.map(self._get_news_from_rss, Config.NEWS_RSS_FEEDS):
-                if result: all_news.extend(result)
-        if not all_news: return "[🧐 Не удалось загрузить новости ни из одного источника.]"
-        all_news.sort(key=lambda x: x['published'], reverse=True)
-        seen_titles = set(); unique_news = [item for item in all_news if item['title'].strip().lower() not in seen_titles and not seen_titles.add(item['title'].strip().lower())]
-        if not unique_news: return "[🧐 Свежих новостей не найдено.]"
-        items = []
-        for p in unique_news[:4]:
-            try:
-                prompt = f"Сделай очень краткое саммари новости в одно предложение на русском языке: '{p['title']}'"
-                summary = self.ask_gpt(prompt, "gpt-4o-mini")
-                items.append(f"🔹 <a href=\"{p.get('link', '')}\">{summary}</a>")
-            except Exception as e: logger.error(f"Ошибка при обработке новости для GPT: {p['title']} - {e}"); continue
-        return "📰 <b>Последние крипто-новости:</b>\n\n" + "\n\n".join(items)
-        
-    def get_eth_gas_price(self):
-        sources = [{"n": "ethgas.watch", "u": "https://ethgas.watch/api/gas", "p": lambda d: (d.get('slow', {}).get('gwei'), d.get('normal', {}).get('gwei'), d.get('fast', {}).get('gwei'))}, {"n": "Etherscan", "u": f"https://api.etherscan.io/api?module=gastracker&action=gasoracle", "p": lambda d: (d.get('result', {}).get('SafeGasPrice'), d.get('result', {}).get('ProposeGasPrice'), d.get('result', {}).get('FastGasPrice'))}]
-        for s in sources:
-            if (data := self._make_request(s['u'])):
-                try:
-                    slow, normal, fast = s['p'](data)
-                    if all((slow, normal, fast)): return f"⛽️ <b>Актуальная цена газа (Gwei):</b>\n\n🐢 <b>Медленно:</b> <code>{slow}</code>\n🚶‍♂️ <b>Средне:</b> <code>{normal}</code>\n🚀 <b>Быстро:</b> <code>{fast}</code>\n\n<i>Данные от {s['n']}</i>"
-                except Exception as e: logger.error(f"Ошибка обработки газа от {s['n']}: {e}"); continue
-        return "[❌ Не удалось получить данные о газе]"
-
-    def get_btc_network_status(self):
-        try:
-            with httpx.Client(timeout=10) as session:
-                fees, mempool, height = session.get("https://mempool.space/api/v1/fees/recommended").json(), session.get("https://mempool.space/api/mempool").json(), session.get("https://mempool.space/api/blocks/tip/height").text
-                return f"📡 <b>Статус сети Bitcoin:</b>\n\n🧱 <b>Текущий блок:</b> <code>{int(height):,}</code>\n📈 <b>Транзакций в мемпуле:</b> <code>{mempool.get('count', 'N/A'):,}</code>\n\n💸 <b>Рекомендуемые комиссии (sat/vB):</b>\n  - 🚀 <b>Высокий приоритет:</b> <code>{fees.get('fastestFee', 'N/A')}</code>\n  - 🚶‍♂️ <b>Средний приоритет:</b> <code>{fees.get('halfHourFee', 'N/A')}</code>\n  - 🐢 <b>Низкий приоритет:</b> <code>{fees.get('hourFee', 'N/A')}</code>"
-        except Exception as e: logger.error(f"Ошибка получения статуса сети Bitcoin: {e}"); return "[❌ Ошибка сети BTC]"
-    
-    def generate_quiz_questions_with_gpt(self):
-        logger.info("Генерирую новые вопросы для викторины с помощью GPT...")
-        prompt = 'Создай 5 вопросов для викторины на тему криптовалют и майнинга. Вопросы должны быть интересными и разного уровня сложности. Ответ верни строго в формате JSON-массива объектов, без лишних слов. Каждый объект должен иметь ключи: "question", "options" (массив из 4 строк), "correct_index" (число от 0 до 3).'
-        try:
-            response_text = self.ask_gpt(prompt)
-            json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
-            if not json_match: logger.error("GPT не вернул валидный JSON массив для викторины."); return None
-            questions = json.loads(json_match.group(0))
-            if isinstance(questions, list) and all('question' in q and 'options' in q and 'correct_index' in q for q in questions):
-                logger.info("Новые вопросы для викторины успешно сгенерированы."); return questions
-            else: logger.error("Структура JSON от GPT для викторины неверна."); return None
-        except Exception as e: logger.error(f"Ошибка при генерации или парсинге вопросов викторины: {e}"); return None
-
-# ========================================================================================
-# 4. ВСПОМОГАТЕЛЬНЫЕ КЛАССЫ И ФУНКЦИИ
-# ========================================================================================
-
-class GameLogic:
-    def __init__(self, data_file):
-        self.data_file = data_file
-        self.user_rigs = api._load_json_file(self.data_file, default_value={})
-
-    def _convert_timestamps_to_dt(self, data):
-        for key, value in data.items():
-            if isinstance(value, str) and ('until' in key or 'collected' in key):
-                try: data[key] = datetime.fromisoformat(value)
-                except (ValueError, TypeError): data[key] = None
-        return data
-
-    def create_rig(self, user_id, user_name, asic_data):
-        if str(user_id) in self.user_rigs: return "У вас уже есть ферма!"
-        price_data, _ = api.get_crypto_price("BTC")
-        btc_price = price_data['price'] if price_data else 65000
-        self.user_rigs[str(user_id)] = {'last_collected': None, 'balance': 0.0, 'level': 1, 'streak': 0, 'name': user_name, 'boost_active_until': None, 'asic_model': asic_data['name'], 'base_rate': asic_data['daily_revenue'] / btc_price, 'overclock_bonus': 0.0, 'penalty_multiplier': 1.0}
-        return f"🎉 Поздравляем! Ваша ферма с <b>{asic_data['name']}</b> успешно создана!"
-
-    def get_rig_info(self, user_id, user_name):
-        rig_data = self.user_rigs.get(str(user_id))
-        if not rig_data:
-            starter_asics = api.get_top_asics()
-            if not starter_asics: return "К сожалению, сейчас не удается получить список оборудования. Попробуйте позже.", None
-            markup = types.InlineKeyboardMarkup(row_width=1)
-            choices = random.sample(starter_asics, k=min(3, len(starter_asics)))
-            temp_user_choices[user_id] = choices
-            buttons = [types.InlineKeyboardButton(f"Выбрать {asic['name']}", callback_data=f"start_rig_{i}") for i, asic in enumerate(choices)]
-            markup.add(*buttons)
-            return "Добро пожаловать! Давайте создадим вашу первую виртуальную ферму. Выберите, с какого ASIC вы хотите начать:", markup
-        
-        rig = self._convert_timestamps_to_dt(rig_data.copy())
-        rig['name'] = user_name
-        next_level = rig['level'] + 1
-        upgrade_cost_text = f"Стоимость улучшения: <code>{Config.UPGRADE_COSTS.get(next_level, 'N/A')}</code> BTC." if next_level in Config.UPGRADE_COSTS else "Вы достигли максимального уровня!"
-        boost_status = ""
-        if rig.get('boost_active_until') and datetime.now() < rig['boost_active_until']:
-            h, m = divmod((rig['boost_active_until'] - datetime.now()).seconds, 3600)[0], divmod((rig['boost_active_until'] - datetime.now()).seconds % 3600, 60)[0]
-            boost_status = f"⚡️ <b>Буст x2 активен еще: {h}ч {m}м</b>\n"
-        base_rate, overclock_bonus = rig.get('base_rate', 0.0001), rig.get('overclock_bonus', 0.0)
-        current_rate = base_rate * (1 + overclock_bonus) * Config.LEVEL_MULTIPLIERS.get(rig['level'], 1)
-        overclock_text = f"(+ {overclock_bonus:.1%})" if overclock_bonus > 0 else ""
-        return (f"🖥️ <b>Ферма «{telebot.util.escape(rig['name'])}»</b>\n<i>Оборудование: {rig.get('asic_model', 'Стандартное')}</i>\n\n<b>Уровень:</b> {rig['level']}\n<b>Базовая добыча:</b> <code>{current_rate:.8f} BTC/день</code> {overclock_text}\n<b>Баланс:</b> <code>{rig['balance']:.8f}</code> BTC\n<b>Дневная серия:</b> {rig['streak']} 🔥 (бонус <b>+{rig['streak'] * Config.STREAK_BONUS_MULTIPLIER:.0%}</b>)\n{boost_status}\n{upgrade_cost_text}"), None
-
-    def collect_reward(self, user_id):
-        rig = self.user_rigs.get(str(user_id));
-        if not rig: return "🤔 У вас нет фермы. Начните с <code>/my_rig</code>."
-        now = datetime.now()
-        last_collected_str = rig.get('last_collected')
-        last_collected_dt = datetime.fromisoformat(last_collected_str) if last_collected_str else None
-        
-        if last_collected_dt and (now - last_collected_dt) < timedelta(hours=23, minutes=55):
-            time_left = timedelta(hours=24) - (now - last_collected_dt)
-            h, m = divmod(time_left.seconds, 3600)[0], divmod(time_left.seconds % 3600, 60)[0]
-            return f"Вы уже собирали награду. Попробуйте снова через <b>{h}ч {m}м</b>."
-            
-        rig['streak'] = rig['streak'] + 1 if last_collected_dt and (now - last_collected_dt) < timedelta(hours=48) else 1
-        base_mined = rig.get('base_rate', 0.0001) * (1 + rig.get('overclock_bonus', 0.0)) * Config.LEVEL_MULTIPLIERS.get(rig['level'], 1)
-        streak_bonus = base_mined * rig['streak'] * Config.STREAK_BONUS_MULTIPLIER
-        
-        boost_active_until_dt = datetime.fromisoformat(rig['boost_active_until']) if rig.get('boost_active_until') else None
-        boost_multiplier = 2 if boost_active_until_dt and now < boost_active_until_dt else 1
-
-        total_mined = (base_mined + streak_bonus) * boost_multiplier * rig.get('penalty_multiplier', 1.0)
-        penalty_text = f"\n📉 <i>Применен штраф {rig.get('penalty_multiplier', 1.0):.0%} от прошлого события.</i>" if rig.get('penalty_multiplier', 1.0) < 1.0 else ""
-        if rig.get('penalty_multiplier', 1.0) < 1.0: rig['penalty_multiplier'] = 1.0
-        rig['balance'] += total_mined; rig['last_collected'] = now.isoformat()
-        event_text = ""
-        if random.random() < Config.RANDOM_EVENT_CHANCE:
-            if random.random() < 0.5: bonus_pct, bonus_amount = random.randint(5, 15), total_mined * (random.randint(5, 15) / 100); rig['balance'] += bonus_amount; event_text = f"\n\n🎉 <b>Событие: Памп курса!</b> Вы получили бонус {bonus_pct}% (+{bonus_amount:.8f} BTC)!"
-            else: penalty_pct = random.randint(10, 25); rig['penalty_multiplier'] = 1 - (penalty_pct / 100); event_text = f"\n\n💥 <b>Событие: Скачок напряжения!</b> Ваша следующая добыча будет снижена на {penalty_pct}%."
-        return f"✅ Собрано <b>{total_mined:.8f}</b> BTC{' (x2 Буст!)' if boost_multiplier > 1 else ''}!\n  (База: {base_mined:.8f} + Серия: {streak_bonus:.8f}){penalty_text}\n🔥 Ваша серия: <b>{rig['streak']} дней!</b>\n💰 Ваш новый баланс: <code>{rig['balance']:.8f}</code> BTC.{event_text}"
-
-    def buy_item(self, user_id, item_key):
-        rig, item = self.user_rigs.get(str(user_id)), Config.SHOP_ITEMS.get(item_key)
-        if not rig: return "🤔 У вас нет фермы.";
-        if not item: return "❌ Такого товара нет."
-        if rig['balance'] < item['cost']: return f"❌ <b>Недостаточно средств.</b> Нужно {item['cost']:.4f} BTC."
-        rig['balance'] -= item['cost']
-        if item_key == 'boost': rig['boost_active_until'] = (datetime.now() + timedelta(hours=24)).isoformat(); return f"⚡️ <b>Энергетический буст куплен!</b> Ваша добыча удвоена на 24 часа."
-        if item_key == 'overclock': rig['overclock_bonus'] = rig.get('overclock_bonus', 0.0) + item['effect']; return f"⚙️ <b>Оверклокинг-чип установлен!</b> Ваша базовая добыча навсегда увеличена на {item['effect']:.0%}."
-
-    def upgrade_rig(self, user_id):
-        rig = self.user_rigs.get(str(user_id));
-        if not rig: return "🤔 У вас нет фермы."
-        next_level, cost = rig['level'] + 1, Config.UPGRADE_COSTS.get(rig['level'] + 1)
-        if not cost: return "🎉 Поздравляем, у вас максимальный уровень фермы!"
-        if rig['balance'] >= cost: rig['balance'] -= cost; rig['level'] = next_level; return f"🚀 <b>Улучшение завершено!</b> Ваша ферма достигла <b>{next_level}</b> уровня!"
-        else: return f"❌ <b>Недостаточно средств.</b>"
-            
-    def get_top_miners(self):
-        if not self.user_rigs: return "Пока нет ни одного майнера для составления топа."
-        sorted_rigs = sorted(self.user_rigs.values(), key=lambda r: r.get('balance', 0), reverse=True)
-        return "🏆 <b>Топ-5 Виртуальных Майнеров:</b>\n" + "\n".join([f"<b>{i+1}.</b> {telebot.util.escape(rig.get('name','N/A'))} - <code>{rig.get('balance',0):.6f}</code> BTC (Ур. {rig.get('level',1)})" for i, rig in enumerate(sorted_rigs[:5])])
-        
-    def apply_quiz_reward(self, user_id):
-        if str(user_id) in self.user_rigs: self.user_rigs[str(user_id)]['balance'] += Config.QUIZ_REWARD; return f"\n\n🎁 За отличный результат вам начислено <b>{Config.QUIZ_REWARD:.4f} BTC!</b>"
-        return f"\n\n🎁 Вы бы получили <b>{Config.QUIZ_REWARD:.4f} BTC</b>, если бы у вас была ферма! Начните с <code>/my_rig</code>."
-
-class SpamAnalyzer:
-    def __init__(self, profiles_file, keywords_file):
-        self.user_profiles = api._load_json_file(profiles_file, default_value={})
-        self.dynamic_keywords = api._load_json_file(keywords_file, default_value=[])
-
-    def add_keywords_from_text(self, text):
-        if not text: return
-        words = {word for word in re.findall(r'\b\w{5,}\b', text.lower()) if not word.isdigit()}
-        all_spam_words, added_count = set(Config.SPAM_KEYWORDS + self.dynamic_keywords), 0
-        for keyword in words:
-            if keyword not in all_spam_words: self.dynamic_keywords.append(keyword); added_count += 1
-        if added_count > 0: logger.info(f"Добавлено {added_count} новых ключевых слов в фильтр.")
-
-    def process_message(self, msg: types.Message):
-        user = msg.from_user; text = msg.text or msg.caption or ""
-        profile = self.user_profiles.setdefault(str(user.id), {'first_msg': datetime.utcnow().isoformat(), 'msg_count': 0, 'spam_count': 0})
-        profile.update({'user_id': user.id, 'name': user.full_name, 'username': user.username, 'msg_count': profile.get('msg_count', 0) + 1, 'last_seen': datetime.utcnow().isoformat()})
-        if any(keyword in text.lower() for keyword in Config.SPAM_KEYWORDS + self.dynamic_keywords): self.handle_spam_detection(msg)
-
-    def handle_spam_detection(self, msg: types.Message, initiated_by_admin=False):
-        user, profile = msg.from_user, self.user_profiles.get(str(msg.from_user.id))
-        if not profile: return
-        profile['spam_count'] = profile.get('spam_count', 0) + 1
-        logger.warning(f"Обнаружен спам от {user.full_name} ({user.id}). Счетчик: {profile['spam_count']}")
-        try: bot.delete_message(msg.chat.id, msg.message_id)
-        except Exception: pass
-        if Config.ADMIN_CHAT_ID:
-            markup = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("✅ Не спам", callback_data=f"not_spam_{user.id}_{msg.chat.id}"))
-            admin_text = f"❗️<b>Обнаружен спам</b>{' (админом)' if initiated_by_admin else ''}\n\n<b>От:</b> {telebot.util.escape(user.full_name)} (<code>{user.id}</code>)\n<b>Чат:</b> <code>{msg.chat.id}</code>\n<b>Текст:</b>\n<blockquote>{telebot.util.escape(msg.text or msg.caption or '')}</blockquote>"
-            try: bot.send_message(Config.ADMIN_CHAT_ID, admin_text, reply_markup=markup)
-            except Exception as e: logger.error(f"Не удалось отправить лог администратору: {e}")
-        if profile['spam_count'] >= Config.WARN_LIMIT:
-            try:
-                bot.restrict_chat_member(msg.chat.id, user.id, until_date=time.time() + Config.MUTE_DURATION_HOURS * 3600)
-                bot.send_message(msg.chat.id, f"❗️ Пользователь {telebot.util.escape(user.full_name)} получил слишком много предупреждений и ограничен в правах на {Config.MUTE_DURATION_HOURS}ч."); profile['spam_count'] = 0
-            except Exception as e: logger.error(f"Не удалось выдать мьют пользователю {user.id}: {e}")
-        else: bot.send_message(msg.chat.id, f"⚠️ Предупреждение для {telebot.util.escape(user.full_name)}! Ваше сообщение похоже на спам. Осталось предупреждений: <b>{Config.WARN_LIMIT - profile['spam_count']}</b>.")
-
-    def get_user_info_text(self, user_id: int) -> str:
-        profile = self.user_profiles.get(str(user_id))
-        if not profile: return "🔹 Информация о пользователе не найдена."
-        spam_factor = (profile.get('spam_count', 0) / profile.get('msg_count', 1) * 100)
-        first_msg_dt_str = profile.get('first_msg')
-        first_msg_dt = datetime.fromisoformat(first_msg_dt_str) if first_msg_dt_str else None
-        last_seen_dt_str = profile.get('last_seen')
-        last_seen_dt = datetime.fromisoformat(last_seen_dt_str) if last_seen_dt_str else None
-        
-        return (f"ℹ️ <b>Инфо о пользователе</b>\n\n"
-                f"👤 <b>ID:</b> <code>{profile.get('user_id')}</code>\n"
-                f"🔖 <b>Имя:</b> {telebot.util.escape(profile.get('name', 'N/A'))}\n"
-                f"🌐 <b>Юзернейм:</b> @{profile.get('username', 'N/A')}\n\n"
-                f"💬 <b>Сообщений:</b> {profile.get('msg_count', 0)}\n"
-                f"🚨 <b>Предупреждений:</b> {profile.get('spam_count', 0)}/{Config.WARN_LIMIT}\n"
-                f"📈 <b>Спам-фактор:</b> {spam_factor:.2f}%\n\n"
-                f"🗓️ <b>Первое сообщение:</b> {first_msg_dt.strftime('%d %b %Y') if first_msg_dt else 'N/A'}\n"
-                f"👀 <b>Последняя активность:</b> {last_seen_dt.strftime('%d %b %Y, %H:%M') if last_seen_dt else 'N/A'}")
-        
-    def get_chat_statistics(self, days=7):
-        if not self.user_profiles: return "📊 <b>Статистика чата:</b>\n\nНет данных."
-        now = datetime.utcnow(); week_ago = now - timedelta(days=days)
-        active_users = sum(1 for p in self.user_profiles.values() if p.get('last_seen') and datetime.fromisoformat(p['last_seen']) > week_ago)
-        new_users = sum(1 for p in self.user_profiles.values() if p.get('first_msg') and datetime.fromisoformat(p['first_msg']) > week_ago)
-        total_messages = sum(p.get('msg_count', 0) for p in self.user_profiles.values())
-        first_msg_str = min((p['first_msg'] for p in self.user_profiles.values() if p.get('first_msg')), default=None)
-        days_since_start = (now - datetime.fromisoformat(first_msg_str)).days if first_msg_str else 0
-        avg_msg_day = total_messages / days_since_start if days_since_start > 0 else total_messages
-        return f"📊 <b>Статистика чата:</b>\n\n👥 <b>Всего пользователей:</b> {len(self.user_profiles)}\n🔥 <b>Активных за неделю:</b> {active_users}\n🌱 <b>Новых за неделю:</b> {new_users}\n\n💬 <b>Всего сообщений:</b> {total_messages}\n📈 <b>Сообщений в день (в ср.):</b> {avg_msg_day:.2f}"
-
-api = ApiHandler()
-game = GameLogic(Config.GAME_DATA_FILE)
-spam_analyzer = SpamAnalyzer(Config.PROFILES_DATA_FILE, Config.DYNAMIC_KEYWORDS_FILE)
-temp_user_choices = {}
-
-# ========================================================================================
-# 6. ОСНОВНАЯ ЛОГИКА БОТА И ОБРАБОТЧИКИ
-# ========================================================================================
 def get_main_keyboard():
-    markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
-    buttons = ["💹 Курс", "⚙️ Топ ASIC", "⛏️ Калькулятор", "📰 Новости", "😱 Индекс Страха", "⏳ Халвинг", "📡 Статус BTC", "🧠 Викторина", "🕹️ Виртуальный Майнинг"]
-    markup.add(*[types.KeyboardButton(text) for text in buttons])
-    return markup
+    """Возвращает основную клавиатуру с кнопками."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💰 Доходные ASIC-майнеры", callback_data="get_asics")
+    builder.button(text="📈 Курс криптовалюты", callback_data="get_price_prompt")
+    if CMC_API_KEY:
+        builder.button(text="😨 Индекс страха и жадности", callback_data="get_fear_greed")
+    builder.button(text="📰 Последние новости", callback_data="get_news")
+    if OPENAI_API_KEY:
+        builder.button(text="🧠 Викторина", callback_data="start_quiz")
+    builder.adjust(1)
+    return builder.as_markup()
 
-def send_message_with_partner_button(chat_id, text, reply_markup=None):
-    try:
-        if not reply_markup:
-            reply_markup = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton(random.choice(Config.PARTNER_BUTTON_TEXT_OPTIONS), url=Config.PARTNER_URL))
-        bot.send_message(chat_id, f"{text}\n\n---\n<i>{random.choice(Config.BOT_HINTS)}</i>", reply_markup=reply_markup, disable_web_page_preview=True)
-    except telebot.apihelper.ApiTelegramException as e:
-        if "can't parse entities" in str(e):
-            logger.error(f"Ошибка парсинга HTML. Отправляю текст без форматирования. {e}")
-            cleaned_text = re.sub(r'<[^>]+>', '', text)
-            bot.send_message(chat_id, f"{cleaned_text}\n\n---\n<i>{random.choice(Config.BOT_HINTS)}</i>", reply_markup=reply_markup, disable_web_page_preview=True)
-        else:
-            logger.error(f"Не удалось отправить сообщение в чат {chat_id}: {e}")
+@dp.message(CommandStart())
+async def send_welcome(message: Message):
+    """Обработчик команды /start."""
+    await message.answer(
+        "👋 Привет! Я твой крипто-помощник.\n"
+        "Я помогу тебе найти информацию о доходности ASIC-майнеров, курсах криптовалют и многом другом.\n\n"
+        "Выбери одну из опций ниже:",
+        reply_markup=get_main_keyboard()
+    )
 
-def send_photo_with_partner_button(chat_id, photo, caption):
-    try:
-        if not photo: raise ValueError("Объект фото пустой")
-        hint = f"\n\n---\n<i>{random.choice(Config.BOT_HINTS)}</i>"
-        final_caption = f"{caption[:1024 - len(hint) - 4]}...{hint}" if len(caption) > 1024 - len(hint) else f"{caption}{hint}"
-        markup = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton(random.choice(Config.PARTNER_BUTTON_TEXT_OPTIONS), url=Config.PARTNER_URL))
-        bot.send_photo(chat_id, photo, caption=final_caption, reply_markup=markup)
-    except Exception as e:
-        logger.error(f"Не удалось отправить фото: {e}. Отправляю текстом.");
-        send_message_with_partner_button(chat_id, caption)
-
-def is_admin(chat_id, user_id):
-    try:
-        if str(user_id) == Config.ADMIN_CHAT_ID: return True
-        return user_id in [admin.user.id for admin in bot.get_chat_administrators(chat_id)]
-    except Exception: return False
-
-@bot.message_handler(commands=['start', 'help'])
-def handle_start_help(msg):
-    bot.send_message(msg.chat.id, "👋 Привет! Я ваш крипто-помощник.\n\nИспользуйте кнопки для навигации или введите команду.\n\n<b>Админ-команды:</b>\n<code>/userinfo</code>, <code>/spam</code>, <code>/ban</code>, <code>/unban</code>, <code>/unmute</code>, <code>/chatstats</code>", reply_markup=get_main_keyboard())
-
-@bot.message_handler(commands=['userinfo', 'ban', 'unban', 'unmute', 'chatstats', 'spam'])
-def handle_admin_commands(msg):
-    command = msg.text.split('@')[0].split(' ')[0].lower()
-    if not is_admin(msg.chat.id, msg.from_user.id):
-        return bot.reply_to(msg, "🚫 У вас нет прав для выполнения этой команды.")
-    def get_target_user(m):
-        if m.reply_to_message: return m.reply_to_message.from_user, None
-        parts = m.text.split()
-        if len(parts) > 1 and parts[1].isdigit():
-            try: return bot.get_chat_member(m.chat.id, int(parts[1])).user, None
-            except Exception as e: return None, f"Не удалось найти пользователя: {e}"
-        return None, "Пожалуйста, ответьте на сообщение пользователя или укажите его ID."
-    target_user, error = None, None
-    if command in ['/userinfo', '/ban', '/unban', 'unmute']:
-        target_user, error = get_target_user(msg)
-        if error: return bot.reply_to(msg, error)
-    try:
-        if command == '/userinfo': bot.send_message(msg.chat.id, spam_analyzer.get_user_info_text(target_user.id))
-        elif command == '/unban': bot.unban_chat_member(msg.chat.id, target_user.id); bot.reply_to(msg, f"Пользователь {telebot.util.escape(target_user.full_name)} разбанен.")
-        elif command == '/unmute': bot.restrict_chat_member(msg.chat.id, target_user.id, can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True, can_add_web_page_previews=True); bot.reply_to(msg, f"С пользователя {telebot.util.escape(target_user.full_name)} сняты ограничения.")
-        elif command == '/chatstats': bot.send_message(msg.chat.id, spam_analyzer.get_chat_statistics())
-        elif command in ['/ban', '/spam']:
-            if not msg.reply_to_message: return bot.reply_to(msg, "Используйте эту команду в ответ на сообщение.")
-            user_to_act = msg.reply_to_message.from_user
-            spam_analyzer.add_keywords_from_text(msg.reply_to_message.text)
-            if command == '/ban':
-                bot.ban_chat_member(msg.chat.id, user_to_act.id)
-                bot.delete_message(msg.chat.id, msg.reply_to_message.message_id)
-                bot.send_message(msg.chat.id, f"🚫 Пользователь {telebot.util.escape(user_to_act.full_name)} забанен. Подозрительные слова добавлены в фильтр.")
-            else: spam_analyzer.handle_spam_detection(msg.reply_to_message, initiated_by_admin=True)
-            bot.delete_message(msg.chat.id, msg.message_id)
-    except Exception as e: logger.error(f"Ошибка выполнения команды {command}: {e}"); bot.reply_to(msg, "Не удалось выполнить действие.")
-
-@bot.message_handler(func=lambda msg: msg.text in ["💹 Курс", "⚙️ Топ ASIC", "📰 Новости", "😱 Индекс Страха", "⏳ Халвинг", "📡 Статус BTC", "🎓 Слово дня", "🧠 Викторина", "🕹️ Виртуальный Майнинг", "⛏️ Калькулятор"])
-def handle_main_menu_buttons(msg):
-    bot.send_chat_action(msg.chat.id, 'typing')
-    
-    if msg.text == "💹 Курс":
-        markup = types.InlineKeyboardMarkup(row_width=3).add(*[types.InlineKeyboardButton(t, callback_data=f"price_{t}") for t in Config.POPULAR_TICKERS])
-        markup.add(types.InlineKeyboardButton("➡️ Другая монета", callback_data="price_other"))
-        bot.send_message(msg.chat.id, "Курс какой криптовалюты вас интересует?", reply_markup=markup)
-    elif msg.text == "⚙️ Топ ASIC":
-        handle_asics_text(msg)
-    elif msg.text == "⛏️ Калькулятор":
-        handle_calculator_request(msg)
-    elif msg.text == "📰 Новости":
-        text = api.get_crypto_news()
-        send_message_with_partner_button(msg.chat.id, text)
-    elif msg.text == "😱 Индекс Страха": 
-        image, text = api.get_fear_and_greed_index()
-        if image: send_photo_with_partner_button(msg.chat.id, image, text)
-        else: send_message_with_partner_button(msg.chat.id, text)
-    elif msg.text == "⏳ Халвинг":
-        text = api.get_halving_info()
-        send_message_with_partner_button(msg.chat.id, text)
-    elif msg.text == "📡 Статус BTC":
-        text = api.get_btc_network_status()
-        send_message_with_partner_button(msg.chat.id, text)
-    elif msg.text == "🎓 Слово дня":
-        term = random.choice(Config.CRYPTO_TERMS)
-        explanation = api.ask_gpt(f"Объясни термин '{term}' простыми словами для новичка (2-3 предложения).", "gpt-4o-mini")
-        text = f"🎓 <b>Слово дня: {term}</b>\n\n{explanation}"
-        send_message_with_partner_button(msg.chat.id, text)
-    elif msg.text == "🧠 Викторина":
-        handle_quiz(msg)
-    elif msg.text == "🕹️ Виртуальный Майнинг":
-        handle_game_hub(msg)
-
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('price_'))
-def handle_price_callback(call):
-    bot.answer_callback_query(call.id)
-    try: bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id)
-    except Exception: pass
-    action = call.data.split('_')[1]
-    if action == "other":
-        sent = bot.send_message(call.message.chat.id, "Введите тикер монеты (например: Aleo, XRP):", reply_markup=types.ForceReply(selective=True))
-        bot.register_next_step_handler(sent, process_price_step)
-    else:
-        bot.send_chat_action(call.message.chat.id, 'typing')
-        price_data, asic_suggestions = api.get_crypto_price(action)
-        if price_data:
-            text = f"💹 Курс {price_data['ticker'].upper()}/USD: <b>${price_data['price']:,.4f}</b>\n<i>(Данные от {price_data['source']})</i>"
-            if asic_suggestions: text += asic_suggestions
-        else: text = f"❌ Не удалось получить курс для {action.upper()}."
-        send_message_with_partner_button(call.message.chat.id, text)
-
-def process_price_step(msg):
-    if not msg.text or len(msg.text) > 20: return bot.send_message(msg.chat.id, "Некорректный ввод.", reply_markup=get_main_keyboard())
-    bot.send_chat_action(msg.chat.id, 'typing')
-    price_data, asic_suggestions = api.get_crypto_price(msg.text)
-    if price_data:
-        text = f"💹 Курс {price_data['ticker'].upper()}/USD: <b>${price_data['price']:,.4f}</b>\n<i>(Данные от {price_data['source']})</i>"
-        if asic_suggestions: text += asic_suggestions
-    else: text = f"❌ Не удалось получить курс для {msg.text.upper()}."
-    send_message_with_partner_button(msg.chat.id, text)
-    bot.send_message(msg.chat.id, "Выберите действие:", reply_markup=get_main_keyboard())
-
-def handle_asics_text(msg):
-    bot.send_message(msg.chat.id, "⏳ Загружаю актуальный список со всех источников...")
-    asics = api.get_top_asics(force_update=True)
-    if not asics: return send_message_with_partner_button(msg.chat.id, "Не удалось получить данные об ASIC.")
-    asics_to_show = asics[:12]
-    rows = [f"{a.get('name', 'N/A'):<22.21}| {a.get('hashrate', 'N/A'):<18.17}| {a.get('power_watts', 0):<5.0f}| ${a.get('daily_revenue', 0):<10.2f}" for a in asics_to_show]
-    response = (f"<pre>Модель                  | H/s               | P, W | Доход/день\n"
-                f"------------------------|-------------------|------|-----------\n" + "\n".join(rows) + "</pre>")
-    send_message_with_partner_button(msg.chat.id, response)
-
-def handle_calculator_request(msg):
-    sent = bot.send_message(msg.chat.id, "💡 Введите стоимость электроэнергии в <b>рублях</b> за кВт/ч:", reply_markup=types.ForceReply(selective=True))
-    bot.register_next_step_handler(sent, process_calculator_step)
-
-def process_calculator_step(msg):
-    try: cost_rub = float(msg.text.replace(',', '.'))
-    except (ValueError, TypeError):
-        bot.send_message(msg.chat.id, "❌ Неверный формат. Введите число (например: 4.5).", reply_markup=get_main_keyboard()); return
-    rate, is_fallback = api.get_usd_rub_rate()
-    asics_data = api.get_top_asics()
-    if not asics_data:
-        bot.send_message(msg.chat.id, "❌ Не удалось получить данные о доходности ASIC.", reply_markup=get_main_keyboard()); return
-    cost_usd = cost_rub / rate
-    result = [f"💰 <b>Расчет профита (розетка {cost_rub:.2f} ₽/кВтч)</b>"]
-    if is_fallback: result.append(f"<i>(Внимание! Используется резервный курс: 1$≈{rate:.2f}₽)</i>")
-    result.append("")
-    for asic in asics_data[:12]:
-        daily_cost = (asic.get('power_watts', 0) / 1000) * 24 * cost_usd
-        profit = asic.get('daily_revenue', 0) - daily_cost
-        result.append(f"<b>{telebot.util.escape(asic['name'])}</b>\n  Профит: <b>${profit:.2f}/день</b>")
-    send_message_with_partner_button(msg.chat.id, "\n\n".join(result))
-    bot.send_message(msg.chat.id, "Выберите действие:", reply_markup=get_main_keyboard())
-
-def handle_quiz(msg):
-    questions = api.generate_quiz_questions_with_gpt()
-    if not questions: 
-        logger.warning("Не удалось сгенерировать вопросы через GPT, использую статические.")
-        questions = random.sample(Config.QUIZ_QUESTIONS, k=Config.QUIZ_QUESTIONS_COUNT)
-        
-    user_quiz_states[msg.from_user.id] = {'score': 0, 'question_index': 0, 'questions': questions}
-    bot.send_message(msg.chat.id, f"🔥 <b>Начинаем крипто-викторину!</b>\nОтветьте на {len(questions)} вопросов.", reply_markup=types.ReplyKeyboardRemove())
-    send_quiz_question(msg.chat.id, msg.from_user.id)
-
-def send_quiz_question(chat_id, user_id):
-    state = user_quiz_states.get(user_id)
-    if not state or state['question_index'] >= len(state['questions']):
-        if state:
-            score = state.get('score', 0)
-            reward_text = game.apply_quiz_reward(user_id) if score >= Config.QUIZ_MIN_CORRECT_FOR_REWARD else ""
-            bot.send_message(chat_id, f"🎉 <b>Викторина завершена!</b>\nВаш результат: <b>{score} из {len(state['questions'])}</b>.{reward_text}", reply_markup=get_main_keyboard())
-            user_quiz_states.pop(user_id, None)
+@dp.callback_query(lambda c: c.data == 'get_asics')
+async def handle_asics_command(callback_query: CallbackQuery):
+    """Обработчик кнопки 'Доходные ASIC-майнеры'."""
+    await callback_query.message.answer("🔍 Ищу самые доходные ASIC-майнеры... Это может занять несколько секунд.")
+    asics = await get_profitable_asics()
+    if not asics:
+        await callback_query.message.answer("😕 Не удалось получить данные о майнерах. Попробуйте позже.")
+        await callback_query.answer()
         return
-    q_data = state['questions'][state['question_index']]
-    markup = types.InlineKeyboardMarkup(row_width=2).add(*[types.InlineKeyboardButton(opt, callback_data=f"quiz_{state['question_index']}_{i}") for i, opt in enumerate(q_data['options'])])
-    bot.send_message(chat_id, f"<b>Вопрос {state['question_index'] + 1}:</b>\n{q_data['question']}", reply_markup=markup)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('quiz_'))
-def handle_quiz_answer(call):
-    user_id = call.from_user.id
-    state = user_quiz_states.get(user_id)
-    if not state: return bot.answer_callback_query(call.id, "Викторина уже не активна.")
-    _, q_index_str, answer_index_str = call.data.split('_')
-    q_index, answer_index = int(q_index_str), int(answer_index_str)
-    if q_index != state.get('question_index'): return bot.answer_callback_query(call.id)
-    bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id)
-    q_data = state['questions'][q_index]
-    if answer_index == q_data['correct_index']:
-        state['score'] += 1; bot.send_message(call.message.chat.id, "✅ Правильно!")
+    response_text = "🏆 **Топ-10 самых доходных ASIC-майнеров на сегодня:**\n\n"
+    for i, miner in enumerate(asics[:10]):
+        response_text += (
+            f"**{i+1}. {sanitize_html(miner.name)}**\n"
+            f"   - Алгоритм: `{miner.algorithm}`\n"
+            f"   - Хешрейт: `{miner.hashrate}`\n"
+            f"   - Потребление: `{miner.power} W`\n"
+            f"   - **Доход в день: `${miner.profitability:.2f}`**\n\n"
+        )
+    
+    await callback_query.message.answer(response_text, parse_mode="Markdown")
+    await callback_query.answer()
+
+@dp.callback_query(lambda c: c.data == 'get_price_prompt')
+async def handle_price_prompt(callback_query: CallbackQuery):
+    """Запрашивает у пользователя тикер монеты."""
+    await callback_query.message.answer("Введите тикер или название криптовалюты (например, `BTC`, `Ethereum`, `Aleo`):", parse_mode="Markdown")
+    await callback_query.answer()
+
+async def process_crypto_query(message: Message):
+    """Общая функция для обработки запроса курса криптовалюты."""
+    query = message.text.strip()
+    await message.answer(f"🔍 Ищу информацию по '{query}'...")
+    
+    coin = await get_crypto_price(query)
+    if not coin:
+        await message.answer(f"😕 Не удалось найти информацию по запросу '{query}'. Убедитесь, что тикер или название верны.")
+        return
+        
+    response_text = (
+        f"**{coin.name} ({coin.symbol.upper()})**\n\n"
+        f"💰 **Цена:** ${coin.price:,.4f}\n"
+    )
+    if coin.market_cap and coin.market_cap > 0:
+        response_text += f"📊 **Рыночная капитализация:** ${coin.market_cap:,.0f}\n"
+    
+    if coin.algorithm:
+        response_text += f"⚙️ **Алгоритм:** `{coin.algorithm}`\n\n"
+        
+        all_asics = await get_profitable_asics()
+        # Игнорируем регистр и возможные пробелы/тире при сравнении алгоритмов
+        normalized_algo = coin.algorithm.lower().replace('-', '').replace(' ', '')
+        relevant_asics = [
+            asic for asic in all_asics 
+            if asic.algorithm.lower().replace('-', '').replace(' ', '') == normalized_algo
+        ]
+        
+        if relevant_asics:
+            response_text += "⛏️ **Рекомендуемое оборудование:**\n"
+            for i, asic in enumerate(relevant_asics[:3]):
+                response_text += f"- {sanitize_html(asic.name)} (Доход: ${asic.profitability:.2f}/день)\n"
+        else:
+            response_text += "⛏️ Подходящее ASIC-оборудование не найдено в базе."
     else:
-        bot.send_message(call.message.chat.id, f"❌ Неверно. Правильный ответ: <b>{q_data['options'][q_data['correct_index']]}</b>")
-    state['question_index'] += 1
-    bot.answer_callback_query(call.id)
-    time.sleep(1.5); send_quiz_question(call.message.chat.id, user_id)
+        response_text += "⛏️ Алгоритм майнинга не определен для этой монеты."
 
-def handle_game_hub(msg):
-    text, markup = get_game_menu(msg.from_user.id, msg.from_user.full_name)
-    bot.send_message(msg.chat.id, text, reply_markup=markup)
+    await message.answer(response_text, parse_mode="Markdown")
 
-def get_game_menu(user_id, user_name):
-    rig_info_text, rig_info_markup = game.get_rig_info(user_id, user_name)
-    if rig_info_markup: return rig_info_text, rig_info_markup
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(types.InlineKeyboardButton("💰 Собрать", callback_data="game_collect"), types.InlineKeyboardButton("� Улучшить", callback_data="game_upgrade"))
-    markup.add(types.InlineKeyboardButton("🏆 Топ Майнеров", callback_data="game_top"), types.InlineKeyboardButton("🛍️ Магазин", callback_data="game_shop"))
-    markup.add(types.InlineKeyboardButton("💵 Вывести в реал", callback_data="game_withdraw"), types.InlineKeyboardButton("🔄 Обновить", callback_data="game_rig"))
-    return rig_info_text, markup
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('game_'))
-def handle_game_callbacks(call):
-    action = call.data.split('_')[1]
-    user_id, user_name, msg = call.from_user.id, call.from_user.full_name, call.message
-    response_text = ""
-    if action == 'collect': response_text = game.collect_reward(user_id)
-    elif action == 'upgrade': response_text = game.upgrade_rig(user_id)
-    elif action == 'top': bot.answer_callback_query(call.id); return send_message_with_partner_button(msg.chat.id, game.get_top_miners())
-    elif action == 'withdraw': bot.answer_callback_query(call.id); return send_message_with_partner_button(msg.chat.id, random.choice(Config.PARTNER_AD_TEXT_OPTIONS))
-    elif action == 'shop':
-        markup = types.InlineKeyboardMarkup(row_width=1)
-        for key, item in Config.SHOP_ITEMS.items():
-            markup.add(types.InlineKeyboardButton(f"{item['name']} ({item['cost']:.4f} BTC)", callback_data=f"game_buy_{key}"))
-        markup.add(types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="game_rig"))
-        bot.edit_message_text("🛍️ <b>Магазин улучшений:</b>", msg.chat.id, msg.message_id, reply_markup=markup); return bot.answer_callback_query(call.id)
-    elif action == 'buy': response_text = game.buy_item(user_id, call.data.split('_')[2])
-    bot.answer_callback_query(call.id)
-    text, markup = get_game_menu(user_id, user_name)
-    final_text = f"{response_text}\n\n{text}" if response_text else text
-    try: bot.edit_message_text(final_text, msg.chat.id, msg.message_id, reply_markup=markup)
-    except telebot.apihelper.ApiTelegramException as e:
-        if "message is not modified" not in str(e): logger.error(f"Ошибка обновления игрового меню: {e}")
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('start_rig_'))
-def handle_start_rig_callback(call):
-    user_id, user_name = call.from_user.id, call.from_user.full_name
-    starter_asics = temp_user_choices.get(user_id)
-    if not starter_asics: return bot.answer_callback_query(call.id, "Выбор устарел, попробуйте снова.", show_alert=True)
-    try:
-        asic_index = int(call.data.split('_')[-1])
-        selected_asic = starter_asics[asic_index]
-        creation_message = game.create_rig(user_id, user_name, selected_asic)
-        bot.answer_callback_query(call.id, "Ферма создается...")
-        text, markup = get_game_menu(user_id, user_name)
-        bot.edit_message_text(f"{creation_message}\n\n{text}", call.message.chat.id, call.message.message_id, reply_markup=markup)
-        del temp_user_choices[user_id]
-    except Exception as e:
-        logger.error(f"Ошибка при создании фермы: {e}"); bot.answer_callback_query(call.id, "Произошла ошибка.", show_alert=True)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('not_spam_'))
-def handle_not_spam_callback(call):
-    _, user_id_str, chat_id_str = call.data.split('_')
-    user_id, original_chat_id = int(user_id_str), int(chat_id_str)
-    if not is_admin(original_chat_id, call.from_user.id): return bot.answer_callback_query(call.id, "Действие для админов.", show_alert=True)
-    profile = spam_analyzer.user_profiles.get(str(user_id))
-    if profile: profile['spam_count'] = max(0, profile.get('spam_count', 0) - 1)
-    try:
-        original_text = call.message.html_text.split("Текст:\n")[1].split("\n\n<i>")[0].replace("<blockquote>", "").replace("</blockquote>", "").strip()
-        user_info = spam_analyzer.user_profiles.get(str(user_id), {'name': 'Неизвестный'})
-        repost_text = f"✅ Сообщение от <b>{telebot.util.escape(user_info['name'])}</b> восстановлено:\n\n<blockquote>{telebot.util.escape(original_text)}</blockquote>"
-        bot.send_message(original_chat_id, repost_text)
-        bot.edit_message_text(call.message.html_text + f"\n\n<b>✅ Восстановлено:</b> {call.from_user.full_name}", call.message.chat.id, call.message.message_id)
-        bot.answer_callback_query(call.id, "Восстановлено.")
-    except Exception as e:
-        logger.error(f"Не удалось восстановить сообщение: {e}"); bot.answer_callback_query(call.id, "Ошибка восстановления.")
-
-@bot.message_handler(content_types=['text', 'caption'], func=lambda msg: not msg.text.startswith('/') and msg.text not in ["💹 Курс", "⚙️ Топ ASIC", "⛏️ Калькулятор", "📰 Новости", "😱 Индекс Страха", "⏳ Халвинг", "📡 Статус BTC", "🧠 Викторина", "🕹️ Виртуальный Майнинг"])
-def handle_text_message(msg):
-    spam_analyzer.process_message(msg)
-    is_reply_to_bot = msg.reply_to_message and msg.reply_to_message.from_user.id == bot.get_me().id
-    is_group_mention = msg.chat.type in ('group', 'supergroup') and f"@{bot.get_me().username}" in msg.text
-    is_private_chat = msg.chat.type == 'private'
-    if not (is_reply_to_bot or is_group_mention or is_private_chat): return
-
-    bot.send_chat_action(msg.chat.id, 'typing')
-    price_data, asic_suggestions = api.get_crypto_price(msg.text)
-    if price_data:
-        text = f"💹 Курс {price_data['ticker'].upper()}/USD: <b>${price_data['price']:,.4f}</b>\n<i>(Данные от {price_data['source']})</i>"
-        if asic_suggestions: text += asic_suggestions
-        send_message_with_partner_button(msg.chat.id, text)
+@dp.message(Command('price'))
+async def price_command_handler(message: Message, command: Command):
+    if command.args:
+        message.text = command.args
+        await process_crypto_query(message)
     else:
-        response = api.ask_gpt(msg.text)
-        send_message_with_partner_button(msg.chat.id, response)
+        await message.answer("Пожалуйста, укажите тикер после команды, например: `/price btc`")
 
-@bot.message_handler(content_types=['new_chat_members'])
-def handle_new_chat_members(msg):
-    for user in msg.new_chat_members:
-        spam_analyzer.process_message(msg)
-        bot.send_message(msg.chat.id, f"👋 Добро пожаловать, {user.full_name}!\n\nЯ крипто-помощник этого чата. Нажмите /start, чтобы увидеть мои возможности.",)
+@dp.message()
+async def handle_text_message(message: Message):
+    """Обрабатывает ввод пользователя для поиска курса криптовалюты."""
+    # Этот обработчик должен быть последним, чтобы ловить обычный текст
+    await process_crypto_query(message)
 
-# ========================================================================================
-# 7. ЗАПУСК БОТА И ПЛАНИРОВЩИКА
-# ========================================================================================
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    if request.headers.get('content-type') == 'application/json': bot.process_new_updates([types.Update.de_json(request.stream.read().decode("utf-8"))]); return '', 200
-    return 'Forbidden', 403
+@dp.callback_query(lambda c: c.data == 'get_fear_greed')
+async def handle_fear_greed_command(callback_query: CallbackQuery):
+    """Обработчик кнопки 'Индекс страха и жадности'."""
+    await callback_query.message.answer("🧐 Анализирую настроения рынка...")
+    index_data = await get_fear_and_greed_index()
+    if not index_data or not index_data.get('value'):
+        await callback_query.message.answer("😕 Не удалось получить данные. Возможно, API-ключ для CoinMarketCap не настроен.")
+        await callback_query.answer()
+        return
 
-@app.route("/")
-def index(): return "Bot is running!"
+    value = int(index_data['value'])
+    classification = index_data['classification']
+    emoji = "😨" if value <= 25 else "😟" if value <= 49 else "😐" if value <= 54 else "😃" if value <= 75 else "🤑"
+    
+    response_text = (
+        f"**Индекс страха и жадности**\n\n"
+        f"{emoji} **Текущее значение: {value} ({classification})**\n\n"
+        f"Индекс измеряет эмоции и настроения на криптовалютном рынке. "
+        f"Низкое значение указывает на 'Экстремальный страх' (возможность для покупки), "
+        f"а высокое - на 'Экстремальную жадность' (рынок может быть перегрет)."
+    )
+    await callback_query.message.answer(response_text, parse_mode="Markdown")
+    await callback_query.answer()
 
-def run_scheduler():
-    logger.info("Планировщик запущен.")
-    schedule.every(3).hours.do(auto_send_news)
-    schedule.every(1).hours.do(lambda: api.get_top_asics(force_update=True))
-    schedule.every(5).minutes.do(lambda: api._save_json_file(Config.GAME_DATA_FILE, game.user_rigs))
-    schedule.every(5).minutes.do(lambda: api._save_json_file(Config.PROFILES_DATA_FILE, spam_analyzer.user_profiles))
-    schedule.every(5).minutes.do(lambda: api._save_json_file(Config.DYNAMIC_KEYWORDS_FILE, spam_analyzer.dynamic_keywords))
-    schedule.every(10).minutes.do(lambda: api._save_json_file(Config.COINGECKO_CACHE_FILE, api.coingecko_cache))
-    while True:
-        try:
-            schedule.run_pending()
-            time.sleep(1)
-        except Exception as e:
-            logger.error(f"Критическая ошибка в цикле планировщика: {e}", exc_info=True)
-            time.sleep(60)
+@dp.callback_query(lambda c: c.data == 'get_news')
+async def handle_news_command(callback_query: CallbackQuery):
+    """Обработчик кнопки 'Последние новости'."""
+    await callback_query.message.answer("📰 Загружаю последние новости...")
+    latest_news = await fetch_latest_news()
+    if not latest_news:
+        await callback_query.message.answer("😕 Не удалось получить новости. Попробуйте позже.")
+        await callback_query.answer()
+        return
 
-def auto_send_news():
+    response_text = "📰 **Последние новости из мира криптовалют:**\n\n"
+    for i, news_item in enumerate(latest_news):
+        title = sanitize_html(news_item['title']).replace('[', '(').replace(']', ')')
+        response_text += f"{i+1}. [{title}]({news_item['link']})\n"
+    
+    await callback_query.message.answer(response_text, parse_mode="Markdown", disable_web_page_preview=True)
+    await callback_query.answer()
+
+@dp.callback_query(lambda c: c.data == 'start_quiz')
+async def handle_quiz_command(callback_query: CallbackQuery):
+    """Обработчик кнопки 'Викторина'."""
+    await callback_query.message.answer("⏳ Генерирую уникальный вопрос для викторины... Пожалуйста, подождите.")
+    quiz_data = await generate_quiz_question()
+    if not quiz_data:
+        await callback_query.message.answer("😕 Не удалось сгенерировать вопрос. Возможно, API-ключ OpenAI не настроен. Попробуйте позже.")
+        await callback_query.answer()
+        return
+
+    await bot.send_poll(
+        chat_id=callback_query.from_user.id,
+        question=quiz_data['question'],
+        options=quiz_data['options'],
+        is_anonymous=False,
+        type='quiz',
+        correct_option_id=quiz_data['correct_option_index']
+    )
+    await callback_query.answer()
+
+
+# ==============================================================================
+# Раздел 7: Основная функция запуска бота
+# ==============================================================================
+async def main():
+    """Основная функция для запуска бота и планировщика."""
+    # Проверка наличия токена
+    if not TELEGRAM_BOT_TOKEN:
+        logger.critical("Токен Telegram-бота не найден. Установите переменную окружения TELEGRAM_BOT_TOKEN.")
+        return
+    if not OPENAI_API_KEY:
+        logger.warning("Ключ OpenAI API не найден. Функция викторины будет недоступна.")
+    if not CMC_API_KEY:
+        logger.warning("Ключ CoinMarketCap API не найден. 'Индекс страха и жадности' будет недоступен.")
+    
+    # Добавление задачи в планировщик
+    if NEWS_CHAT_ID:
+        scheduler.add_job(send_news_job, 'interval', hours=NEWS_INTERVAL_HOURS, misfire_grace_time=600)
+        scheduler.start()
+        logger.info(f"Задача по отправке новостей запланирована каждые {NEWS_INTERVAL_HOURS} часа.")
+    else:
+        logger.warning("NEWS_CHAT_ID не указан, автоматическая отправка новостей отключена.")
+
+    # Запуск бота
+    logger.info("Запуск бота...")
     try:
-        logger.info("ПЛАНИРОВЩИК: Запускаю отправку новостей...")
-        if Config.NEWS_CHAT_ID:
-            news_text = api.get_crypto_news()
-            if "Не удалось" not in news_text and "не найдено" not in news_text:
-                send_message_with_partner_button(Config.NEWS_CHAT_ID, news_text)
-                logger.info("Новости успешно отправлены по расписанию.")
-            else:
-                logger.warning(f"Не удалось получить новости для авто-отправки: {news_text}")
-    except Exception as e:
-        logger.error(f"Ошибка в задаче auto_send_news: {e}", exc_info=True)
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
+        if scheduler.running:
+            scheduler.shutdown()
 
 if __name__ == '__main__':
-    logger.info("Запуск бота...")
-    threading.Thread(target=run_scheduler, daemon=True).start()
-    if Config.WEBHOOK_URL:
-        logger.info(f"Режим: вебхук. URL: {Config.WEBHOOK_URL}"); bot.remove_webhook(); time.sleep(0.5)
-        bot.set_webhook(url=f"{Config.WEBHOOK_URL.rstrip('/')}/webhook")
-        app.run(host="0.0.0.0", port=int(os.environ.get('PORT', 8080)))
-    else:
-        logger.info("Режим: long-polling."); bot.remove_webhook(); bot.polling(none_stop=True)
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот остановлен.")
