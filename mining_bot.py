@@ -122,13 +122,13 @@ except Exception as e: openai_client = None; logger.critical(f"Не удалос
 user_quiz_states = {}
 
 # ========================================================================================
-# 3. КЛАССЫ ЛОГИКИ (API, ИГРА, АНТИСПАМ) - ВЕРСИЯ 8.0
+# 3. КЛАССЫ ЛОГИКИ (API, ИГРА, АНТИСПАМ) - ВЕРСИЯ 9.0
 # ========================================================================================
 class ApiHandler:
     def __init__(self):
         self.asic_cache = self._load_json_file(Config.ASIC_CACHE_FILE, is_cache=True)
         self.currency_cache = {"rate": None, "timestamp": None}
-        self.coingecko_cache = self._load_json_file(Config.COINGECKO_CACHE_FILE)
+        self.coingecko_cache = self._load_json_file(Config.COINGECKO_CACHE_FILE, default_value={})
 
     def _make_request(self, url, timeout=20, is_json=True, custom_headers=None, retries=3, backoff_factor=1.5):
         headers = {'User-Agent': f'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36', 'Accept': 'application/json, text/html,application/xhtml+xml,application/xml;q=0.9', 'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8'}
@@ -140,7 +140,7 @@ class ApiHandler:
                     response = client.get(url); response.raise_for_status()
                     return response.json() if is_json else response
             except httpx.HTTPStatusError as e:
-                if e.response.status_code == 429:
+                if e.response.status_code == 429: # Too Many Requests
                     wait_time = backoff_factor * (2 ** i)
                     logger.warning(f"Слишком много запросов к {url}. Попытка {i+1}/{retries}. Жду {wait_time:.2f} секунд.")
                     time.sleep(wait_time)
@@ -169,7 +169,7 @@ class ApiHandler:
             with open(file_path, 'w', encoding='utf-8') as f:
                 data_to_save = data_dict.copy()
                 if isinstance(data_to_save.get("timestamp"), datetime): data_to_save["timestamp"] = data_to_save["timestamp"].isoformat()
-                json.dump(data_to_save, f, indent=4)
+                json.dump(data_to_save, f, indent=4, ensure_ascii=False)
         except Exception as e: logger.error(f"Ошибка при сохранении файла {file_path}: {e}")
         
     def sanitize_html(self, html_string: str) -> str:
@@ -183,8 +183,7 @@ class ApiHandler:
                 href = tag.get('href')
                 tag.attrs = {}
                 if href: tag['href'] = href
-            elif tag.name != 'a':
-                tag.attrs = {}
+            elif tag.name != 'a': tag.attrs = {}
         return str(soup)
 
     def ask_gpt(self, prompt: str, model: str = "gpt-4o"):
@@ -224,6 +223,7 @@ class ApiHandler:
         return price_data, self.get_top_asics_for_algo(algorithm)
 
     def _get_asics_from_whattomine(self):
+        logger.info("Источник #1 (API): Пытаюсь получить данные с whattomine.com...")
         data = self._make_request("https://whattomine.com/asics.json", custom_headers={'Accept': 'application/json'})
         if not data or 'asics' not in data: return []
         parsed_asics = []
@@ -238,6 +238,7 @@ class ApiHandler:
         return parsed_asics
 
     def _get_asics_from_minerstat(self):
+        logger.info("Источник #2 (API): Пытаюсь получить данные с minerstat.com...")
         all_hardware = self._make_request("https://api.minerstat.com/v2/hardware")
         if not all_hardware: return []
         parsed_asics = []
@@ -361,45 +362,16 @@ class ApiHandler:
     
     def generate_quiz_questions_with_gpt(self):
         logger.info("Генерирую новые вопросы для викторины с помощью GPT...")
-        prompt = """
-        Создай 5 вопросов для викторины на тему криптовалют и майнинга.
-        Вопросы должны быть интересными и разного уровня сложности.
-        Ответ верни строго в формате JSON, без лишних слов.
-        Каждый объект в массиве должен иметь ключи: "question", "options" (массив из 4 строк), "correct_index" (число от 0 до 3).
-        
-        Пример:
-        [
-          {
-            "question": "Какой алгоритм консенсуса использует Bitcoin?",
-            "options": ["Proof-of-Stake", "Proof-of-Work", "Delegated Proof-of-Stake", "Proof-of-Authority"],
-            "correct_index": 1
-          }
-        ]
-        """
+        prompt = 'Создай 5 вопросов для викторины на тему криптовалют и майнинга. Вопросы должны быть интересными и разного уровня сложности. Ответ верни строго в формате JSON-массива объектов, без лишних слов. Каждый объект должен иметь ключи: "question", "options" (массив из 4 строк), "correct_index" (число от 0 до 3).'
         try:
             response_text = self.ask_gpt(prompt)
-            # Извлекаем JSON из ответа GPT, даже если он обернут в ```json
             json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
-            if not json_match:
-                logger.error("GPT не вернул валидный JSON массив для викторины.")
-                return None
-            
+            if not json_match: logger.error("GPT не вернул валидный JSON массив для викторины."); return None
             questions = json.loads(json_match.group(0))
-            # Простая валидация структуры
             if isinstance(questions, list) and all('question' in q and 'options' in q and 'correct_index' in q for q in questions):
-                logger.info("Новые вопросы для викторины успешно сгенерированы.")
-                return questions
-            else:
-                logger.error("Структура JSON от GPT для викторины неверна.")
-                return None
-        except Exception as e:
-            logger.error(f"Ошибка при генерации или парсинге вопросов викторины: {e}")
-            return None
-
-
-# ... Остальная часть кода (классы GameLogic, SpamAnalyzer, обработчики)
-# ... Они используют исправленный ApiHandler и остаются стабильными ...
-# Ниже приведены все обработчики для целостности кода
+                logger.info("Новые вопросы для викторины успешно сгенерированы."); return questions
+            else: logger.error("Структура JSON от GPT для викторины неверна."); return None
+        except Exception as e: logger.error(f"Ошибка при генерации или парсинге вопросов викторины: {e}"); return None
 
 # ========================================================================================
 # 4. ВСПОМОГАТЕЛЬНЫЕ КЛАССЫ И ФУНКЦИИ
@@ -594,15 +566,295 @@ def send_message_with_partner_button(chat_id, text, reply_markup=None):
     except telebot.apihelper.ApiTelegramException as e:
         if "can't parse entities" in str(e):
             logger.error(f"Ошибка парсинга HTML. Отправляю текст без форматирования. {e}")
-            cleaned_text = re.sub(r'<[^>]+>', '', text) # Убираем все теги
+            cleaned_text = re.sub(r'<[^>]+>', '', text)
             bot.send_message(chat_id, f"{cleaned_text}\n\n---\n<i>{random.choice(Config.BOT_HINTS)}</i>", reply_markup=reply_markup, disable_web_page_preview=True)
         else:
             logger.error(f"Не удалось отправить сообщение в чат {chat_id}: {e}")
 
+def send_photo_with_partner_button(chat_id, photo, caption):
+    try:
+        if not photo: raise ValueError("Объект фото пустой")
+        hint = f"\n\n---\n<i>{random.choice(Config.BOT_HINTS)}</i>"
+        final_caption = f"{caption[:1024 - len(hint) - 4]}...{hint}" if len(caption) > 1024 - len(hint) else f"{caption}{hint}"
+        markup = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton(random.choice(Config.PARTNER_BUTTON_TEXT_OPTIONS), url=Config.PARTNER_URL))
+        bot.send_photo(chat_id, photo, caption=final_caption, reply_markup=markup)
+    except Exception as e:
+        logger.error(f"Не удалось отправить фото: {e}. Отправляю текстом.");
+        send_message_with_partner_button(chat_id, caption)
+
+def is_admin(chat_id, user_id):
+    try:
+        if str(user_id) == Config.ADMIN_CHAT_ID: return True
+        return user_id in [admin.user.id for admin in bot.get_chat_administrators(chat_id)]
+    except Exception: return False
+
+@bot.message_handler(commands=['start', 'help'])
+def handle_start_help(msg):
+    bot.send_message(msg.chat.id, "👋 Привет! Я ваш крипто-помощник.\n\nИспользуйте кнопки для навигации или введите команду.\n\n<b>Админ-команды:</b>\n<code>/userinfo</code>, <code>/spam</code>, <code>/ban</code>, <code>/unban</code>, <code>/unmute</code>, <code>/chatstats</code>", reply_markup=get_main_keyboard())
+
+@bot.message_handler(commands=['userinfo', 'ban', 'unban', 'unmute', 'chatstats', 'spam'])
+def handle_admin_commands(msg):
+    command = msg.text.split('@')[0].split(' ')[0].lower()
+    if not is_admin(msg.chat.id, msg.from_user.id):
+        return bot.reply_to(msg, "🚫 У вас нет прав для выполнения этой команды.")
+    def get_target_user(m):
+        if m.reply_to_message: return m.reply_to_message.from_user, None
+        parts = m.text.split()
+        if len(parts) > 1 and parts[1].isdigit():
+            try: return bot.get_chat_member(m.chat.id, int(parts[1])).user, None
+            except Exception as e: return None, f"Не удалось найти пользователя: {e}"
+        return None, "Пожалуйста, ответьте на сообщение пользователя или укажите его ID."
+    target_user, error = None, None
+    if command in ['/userinfo', '/ban', '/unban', 'unmute']:
+        target_user, error = get_target_user(msg)
+        if error: return bot.reply_to(msg, error)
+    try:
+        if command == '/userinfo': bot.send_message(msg.chat.id, spam_analyzer.get_user_info_text(target_user.id))
+        elif command == '/unban': bot.unban_chat_member(msg.chat.id, target_user.id); bot.reply_to(msg, f"Пользователь {telebot.util.escape(target_user.full_name)} разбанен.")
+        elif command == '/unmute': bot.restrict_chat_member(msg.chat.id, target_user.id, can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True, can_add_web_page_previews=True); bot.reply_to(msg, f"С пользователя {telebot.util.escape(target_user.full_name)} сняты ограничения.")
+        elif command == '/chatstats': bot.send_message(msg.chat.id, spam_analyzer.get_chat_statistics())
+        elif command in ['/ban', '/spam']:
+            if not msg.reply_to_message: return bot.reply_to(msg, "Используйте эту команду в ответ на сообщение.")
+            user_to_act = msg.reply_to_message.from_user
+            spam_analyzer.add_keywords_from_text(msg.reply_to_message.text)
+            if command == '/ban':
+                bot.ban_chat_member(msg.chat.id, user_to_act.id)
+                bot.delete_message(msg.chat.id, msg.reply_to_message.message_id)
+                bot.send_message(msg.chat.id, f"🚫 Пользователь {telebot.util.escape(user_to_act.full_name)} забанен. Подозрительные слова добавлены в фильтр.")
+            else: spam_analyzer.handle_spam_detection(msg.reply_to_message, initiated_by_admin=True)
+            bot.delete_message(msg.chat.id, msg.message_id)
+    except Exception as e: logger.error(f"Ошибка выполнения команды {command}: {e}"); bot.reply_to(msg, "Не удалось выполнить действие.")
+
 # ... (Остальные обработчики)
-# Полный код для всех функций и обработчиков, включая исправленные, доступен в предыдущих версиях.
-# Здесь они опущены для краткости, но должны быть в вашем финальном файле.
-# Ниже приведены все обработчики для целостности кода
+@bot.message_handler(func=lambda msg: msg.text in ["💹 Курс", "⚙️ Топ ASIC", "📰 Новости", "😱 Индекс Страха", "⏳ Халвинг", "📡 Статус BTC", "🎓 Слово дня", "🧠 Викторина", "🕹️ Виртуальный Майнинг", "⛏️ Калькулятор"])
+def handle_main_menu_buttons(msg):
+    bot.send_chat_action(msg.chat.id, 'typing')
+    
+    if msg.text == "💹 Курс":
+        markup = types.InlineKeyboardMarkup(row_width=3).add(*[types.InlineKeyboardButton(t, callback_data=f"price_{t}") for t in Config.POPULAR_TICKERS])
+        markup.add(types.InlineKeyboardButton("➡️ Другая монета", callback_data="price_other"))
+        bot.send_message(msg.chat.id, "Курс какой криптовалюты вас интересует?", reply_markup=markup)
+    elif msg.text == "⚙️ Топ ASIC":
+        handle_asics_text(msg)
+    elif msg.text == "⛏️ Калькулятор":
+        handle_calculator_request(msg)
+    elif msg.text == "📰 Новости":
+        text = api.get_crypto_news()
+        send_message_with_partner_button(msg.chat.id, text)
+    elif msg.text == "😱 Индекс Страха": 
+        image, text = api.get_fear_and_greed_index()
+        if image: send_photo_with_partner_button(msg.chat.id, image, text)
+        else: send_message_with_partner_button(msg.chat.id, text)
+    elif msg.text == "⏳ Халвинг":
+        text = api.get_halving_info()
+        send_message_with_partner_button(msg.chat.id, text)
+    elif msg.text == "📡 Статус BTC":
+        text = api.get_btc_network_status()
+        send_message_with_partner_button(msg.chat.id, text)
+    elif msg.text == "🎓 Слово дня":
+        term = random.choice(Config.CRYPTO_TERMS)
+        explanation = api.ask_gpt(f"Объясни термин '{term}' простыми словами для новичка (2-3 предложения).", "gpt-4o-mini")
+        text = f"🎓 <b>Слово дня: {term}</b>\n\n{explanation}"
+        send_message_with_partner_button(msg.chat.id, text)
+    elif msg.text == "🧠 Викторина":
+        handle_quiz(msg)
+    elif msg.text == "🕹️ Виртуальный Майнинг":
+        handle_game_hub(msg)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('price_'))
+def handle_price_callback(call):
+    bot.answer_callback_query(call.id)
+    try: bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id)
+    except Exception: pass
+    action = call.data.split('_')[1]
+    if action == "other":
+        sent = bot.send_message(call.message.chat.id, "Введите тикер монеты (например: Aleo, XRP):", reply_markup=types.ForceReply(selective=True))
+        bot.register_next_step_handler(sent, process_price_step)
+    else:
+        bot.send_chat_action(call.message.chat.id, 'typing')
+        price_data, asic_suggestions = api.get_crypto_price(action)
+        if price_data:
+            text = f"💹 Курс {price_data['ticker'].upper()}/USD: <b>${price_data['price']:,.4f}</b>\n<i>(Данные от {price_data['source']})</i>"
+            if asic_suggestions: text += asic_suggestions
+        else: text = f"❌ Не удалось получить курс для {action.upper()}."
+        send_message_with_partner_button(call.message.chat.id, text)
+
+def process_price_step(msg):
+    if not msg.text or len(msg.text) > 20: return bot.send_message(msg.chat.id, "Некорректный ввод.", reply_markup=get_main_keyboard())
+    bot.send_chat_action(msg.chat.id, 'typing')
+    price_data, asic_suggestions = api.get_crypto_price(msg.text)
+    if price_data:
+        text = f"💹 Курс {price_data['ticker'].upper()}/USD: <b>${price_data['price']:,.4f}</b>\n<i>(Данные от {price_data['source']})</i>"
+        if asic_suggestions: text += asic_suggestions
+    else: text = f"❌ Не удалось получить курс для {msg.text.upper()}."
+    send_message_with_partner_button(msg.chat.id, text)
+    bot.send_message(msg.chat.id, "Выберите действие:", reply_markup=get_main_keyboard())
+
+def handle_asics_text(msg):
+    bot.send_message(msg.chat.id, "⏳ Загружаю актуальный список со всех источников...")
+    asics = api.get_top_asics(force_update=True)
+    if not asics: return send_message_with_partner_button(msg.chat.id, "Не удалось получить данные об ASIC.")
+    asics_to_show = asics[:12]
+    rows = [f"{a.get('name', 'N/A'):<22.21}| {a.get('hashrate', 'N/A'):<18.17}| {a.get('power_watts', 0):<5.0f}| ${a.get('daily_revenue', 0):<10.2f}" for a in asics_to_show]
+    response = (f"<pre>Модель                  | H/s               | P, W | Доход/день\n"
+                f"------------------------|-------------------|------|-----------\n" + "\n".join(rows) + "</pre>")
+    send_message_with_partner_button(msg.chat.id, response)
+
+def handle_calculator_request(msg):
+    sent = bot.send_message(msg.chat.id, "💡 Введите стоимость электроэнергии в <b>рублях</b> за кВт/ч:", reply_markup=types.ForceReply(selective=True))
+    bot.register_next_step_handler(sent, process_calculator_step)
+
+def process_calculator_step(msg):
+    try: cost_rub = float(msg.text.replace(',', '.'))
+    except (ValueError, TypeError):
+        bot.send_message(msg.chat.id, "❌ Неверный формат. Введите число (например: 4.5).", reply_markup=get_main_keyboard()); return
+    rate, is_fallback = api.get_usd_rub_rate()
+    asics_data = api.get_top_asics()
+    if not asics_data:
+        bot.send_message(msg.chat.id, "❌ Не удалось получить данные о доходности ASIC.", reply_markup=get_main_keyboard()); return
+    cost_usd = cost_rub / rate
+    result = [f"💰 <b>Расчет профита (розетка {cost_rub:.2f} ₽/кВтч)</b>"]
+    if is_fallback: result.append(f"<i>(Внимание! Используется резервный курс: 1$≈{rate:.2f}₽)</i>")
+    result.append("")
+    for asic in asics_data[:12]:
+        daily_cost = (asic.get('power_watts', 0) / 1000) * 24 * cost_usd
+        profit = asic.get('daily_revenue', 0) - daily_cost
+        result.append(f"<b>{telebot.util.escape(asic['name'])}</b>\n  Профит: <b>${profit:.2f}/день</b>")
+    send_message_with_partner_button(msg.chat.id, "\n\n".join(result))
+    bot.send_message(msg.chat.id, "Выберите действие:", reply_markup=get_main_keyboard())
+
+
+def handle_quiz(msg):
+    questions = api.generate_quiz_questions_with_gpt()
+    if not questions: questions = Config.QUIZ_QUESTIONS # Fallback to static if GPT fails
+    user_quiz_states[msg.from_user.id] = {'score': 0, 'question_index': 0, 'questions': questions}
+    bot.send_message(msg.chat.id, f"🔥 <b>Начинаем крипто-викторину!</b>\nОтветьте на {len(questions)} вопросов.", reply_markup=types.ReplyKeyboardRemove())
+    send_quiz_question(msg.chat.id, msg.from_user.id)
+
+def send_quiz_question(chat_id, user_id):
+    state = user_quiz_states.get(user_id)
+    if not state or state['question_index'] >= len(state['questions']):
+        if state:
+            score = state.get('score', 0)
+            reward_text = game.apply_quiz_reward(user_id) if score >= Config.QUIZ_MIN_CORRECT_FOR_REWARD else ""
+            bot.send_message(chat_id, f"🎉 <b>Викторина завершена!</b>\nВаш результат: <b>{score} из {len(state['questions'])}</b>.{reward_text}", reply_markup=get_main_keyboard())
+            user_quiz_states.pop(user_id, None)
+        return
+    q_data = state['questions'][state['question_index']]
+    markup = types.InlineKeyboardMarkup(row_width=2).add(*[types.InlineKeyboardButton(opt, callback_data=f"quiz_{state['question_index']}_{i}") for i, opt in enumerate(q_data['options'])])
+    bot.send_message(chat_id, f"<b>Вопрос {state['question_index'] + 1}:</b>\n{q_data['question']}", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('quiz_'))
+def handle_quiz_answer(call):
+    user_id = call.from_user.id
+    state = user_quiz_states.get(user_id)
+    if not state: return bot.answer_callback_query(call.id, "Викторина уже не активна.")
+    _, q_index_str, answer_index_str = call.data.split('_')
+    q_index, answer_index = int(q_index_str), int(answer_index_str)
+    if q_index != state.get('question_index'): return bot.answer_callback_query(call.id)
+    bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id)
+    q_data = state['questions'][q_index]
+    if answer_index == q_data['correct_index']:
+        state['score'] += 1; bot.send_message(call.message.chat.id, "✅ Правильно!")
+    else:
+        bot.send_message(call.message.chat.id, f"❌ Неверно. Правильный ответ: <b>{q_data['options'][q_data['correct_index']]}</b>")
+    state['question_index'] += 1
+    bot.answer_callback_query(call.id)
+    time.sleep(1.5); send_quiz_question(call.message.chat.id, user_id)
+
+def handle_game_hub(msg):
+    text, markup = get_game_menu(msg.from_user.id, msg.from_user.full_name)
+    bot.send_message(msg.chat.id, text, reply_markup=markup)
+
+def get_game_menu(user_id, user_name):
+    rig_info_text, rig_info_markup = game.get_rig_info(user_id, user_name)
+    if rig_info_markup: return rig_info_text, rig_info_markup
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(types.InlineKeyboardButton("💰 Собрать", callback_data="game_collect"), types.InlineKeyboardButton("🚀 Улучшить", callback_data="game_upgrade"))
+    markup.add(types.InlineKeyboardButton("🏆 Топ Майнеров", callback_data="game_top"), types.InlineKeyboardButton("🛍️ Магазин", callback_data="game_shop"))
+    markup.add(types.InlineKeyboardButton("💵 Вывести в реал", callback_data="game_withdraw"), types.InlineKeyboardButton("🔄 Обновить", callback_data="game_rig"))
+    return rig_info_text, markup
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('game_'))
+def handle_game_callbacks(call):
+    action = call.data.split('_')[1]
+    user_id, user_name, msg = call.from_user.id, call.from_user.full_name, call.message
+    response_text = ""
+    if action == 'collect': response_text = game.collect_reward(user_id)
+    elif action == 'upgrade': response_text = game.upgrade_rig(user_id)
+    elif action == 'top': bot.answer_callback_query(call.id); return send_message_with_partner_button(msg.chat.id, game.get_top_miners())
+    elif action == 'withdraw': bot.answer_callback_query(call.id); return send_message_with_partner_button(msg.chat.id, random.choice(Config.PARTNER_AD_TEXT_OPTIONS))
+    elif action == 'shop':
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        for key, item in Config.SHOP_ITEMS.items():
+            markup.add(types.InlineKeyboardButton(f"{item['name']} ({item['cost']:.4f} BTC)", callback_data=f"game_buy_{key}"))
+        markup.add(types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="game_rig"))
+        bot.edit_message_text("🛍️ <b>Магазин улучшений:</b>", msg.chat.id, msg.message_id, reply_markup=markup); return bot.answer_callback_query(call.id)
+    elif action == 'buy': response_text = game.buy_item(user_id, call.data.split('_')[2])
+    bot.answer_callback_query(call.id)
+    text, markup = get_game_menu(user_id, user_name)
+    final_text = f"{response_text}\n\n{text}" if response_text else text
+    try: bot.edit_message_text(final_text, msg.chat.id, msg.message_id, reply_markup=markup)
+    except telebot.apihelper.ApiTelegramException as e:
+        if "message is not modified" not in str(e): logger.error(f"Ошибка обновления игрового меню: {e}")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('start_rig_'))
+def handle_start_rig_callback(call):
+    user_id, user_name = call.from_user.id, call.from_user.full_name
+    starter_asics = temp_user_choices.get(user_id)
+    if not starter_asics: return bot.answer_callback_query(call.id, "Выбор устарел, попробуйте снова.", show_alert=True)
+    try:
+        asic_index = int(call.data.split('_')[-1])
+        selected_asic = starter_asics[asic_index]
+        creation_message = game.create_rig(user_id, user_name, selected_asic)
+        bot.answer_callback_query(call.id, "Ферма создается...")
+        text, markup = get_game_menu(user_id, user_name)
+        bot.edit_message_text(f"{creation_message}\n\n{text}", call.message.chat.id, call.message.message_id, reply_markup=markup)
+        del temp_user_choices[user_id]
+    except Exception as e:
+        logger.error(f"Ошибка при создании фермы: {e}"); bot.answer_callback_query(call.id, "Произошла ошибка.", show_alert=True)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('not_spam_'))
+def handle_not_spam_callback(call):
+    _, user_id_str, chat_id_str = call.data.split('_')
+    user_id, original_chat_id = int(user_id_str), int(chat_id_str)
+    if not is_admin(original_chat_id, call.from_user.id): return bot.answer_callback_query(call.id, "Действие для админов.", show_alert=True)
+    profile = spam_analyzer.user_profiles.get(str(user_id))
+    if profile: profile['spam_count'] = max(0, profile.get('spam_count', 0) - 1)
+    try:
+        original_text = call.message.html_text.split("Текст:\n")[1].split("\n\n<i>")[0].replace("<blockquote>", "").replace("</blockquote>", "").strip()
+        user_info = spam_analyzer.user_profiles.get(str(user_id), {'name': 'Неизвестный'})
+        repost_text = f"✅ Сообщение от <b>{telebot.util.escape(user_info['name'])}</b> восстановлено:\n\n<blockquote>{telebot.util.escape(original_text)}</blockquote>"
+        bot.send_message(original_chat_id, repost_text)
+        bot.edit_message_text(call.message.html_text + f"\n\n<b>✅ Восстановлено:</b> {call.from_user.full_name}", call.message.chat.id, call.message.message_id)
+        bot.answer_callback_query(call.id, "Восстановлено.")
+    except Exception as e:
+        logger.error(f"Не удалось восстановить сообщение: {e}"); bot.answer_callback_query(call.id, "Ошибка восстановления.")
+
+@bot.message_handler(content_types=['text', 'caption'], func=lambda msg: not msg.text.startswith('/') and msg.text not in ["💹 Курс", "⚙️ Топ ASIC", "⛏️ Калькулятор", "📰 Новости", "😱 Индекс Страха", "⏳ Халвинг", "📡 Статус BTC", "🧠 Викторина", "🕹️ Виртуальный Майнинг"])
+def handle_text_message(msg):
+    spam_analyzer.process_message(msg)
+    is_reply_to_bot = msg.reply_to_message and msg.reply_to_message.from_user.id == bot.get_me().id
+    is_group_mention = msg.chat.type in ('group', 'supergroup') and f"@{bot.get_me().username}" in msg.text
+    is_private_chat = msg.chat.type == 'private'
+    if not (is_reply_to_bot or is_group_mention or is_private_chat): return
+
+    bot.send_chat_action(msg.chat.id, 'typing')
+    price_data, asic_suggestions = api.get_crypto_price(msg.text)
+    if price_data:
+        text = f"💹 Курс {price_data['ticker'].upper()}/USD: <b>${price_data['price']:,.4f}</b>\n<i>(Данные от {price_data['source']})</i>"
+        if asic_suggestions: text += asic_suggestions
+        send_message_with_partner_button(msg.chat.id, text)
+    else:
+        response = api.ask_gpt(msg.text)
+        send_message_with_partner_button(msg.chat.id, response)
+
+@bot.message_handler(content_types=['new_chat_members'])
+def handle_new_chat_members(msg):
+    for user in msg.new_chat_members:
+        spam_analyzer.process_message(msg)
+        bot.send_message(msg.chat.id, f"👋 Добро пожаловать, {user.full_name}!\n\nЯ крипто-помощник этого чата. Нажмите /start, чтобы увидеть мои возможности.",)
 
 # ========================================================================================
 # 7. ЗАПУСК БОТА И ПЛАНИРОВЩИКА
