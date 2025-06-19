@@ -163,9 +163,21 @@ class ApiHandler:
         self.currency_cache = {"rate": None, "timestamp": None} 
         atexit.register(self._save_asic_cache_to_file) 
 
-    def _make_request(self, url, timeout=10, is_json=True): 
+    def _make_request(self, url, timeout=15, is_json=True): 
         """Централизованный и надежный метод для выполнения GET-запросов.""" 
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'} 
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9',
+            'Accept-Language': 'en-US,en;q=0.9,ru;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0'
+        }
         try: 
             response = requests.get(url, headers=headers, timeout=timeout) 
             response.raise_for_status() 
@@ -269,14 +281,14 @@ class ApiHandler:
         return (None, None) 
 
     # ========================================================================================
-    # БЛОК ПОЛУЧЕНИЯ ДАННЫХ ОБ ASIC. ВЕРСИЯ 2.2
+    # БЛОК ПОЛУЧЕНИЯ ДАННЫХ ОБ ASIC. ВЕРСИЯ 2.3 - МАКСИМАЛЬНАЯ НАДЕЖНОСТЬ
     # ========================================================================================
 
-    def _get_asics_from_api(self): 
+    def _get_asics_from_minerstat(self): 
         """Источник #1: API от Minerstat."""
         logger.info("Источник #1 (API): Пытаюсь получить данные с minerstat.com...")
         url = "https://api.minerstat.com/v2/hardware" 
-        all_hardware = self._make_request(url, timeout=15) 
+        all_hardware = self._make_request(url, is_json=True) 
         if not all_hardware: return None 
         try: 
             asics = []
@@ -290,23 +302,15 @@ class ApiHandler:
                     if revenue > max_revenue:
                         max_revenue = revenue
                         best_algo = algo_data
-
                 if best_algo and max_revenue > 0:
                     hashrate_val = float(best_algo.get('speed', 0))
-                    if hashrate_val / 1e12 > 1:
-                        hashrate_str = f"{hashrate_val / 1e12:.2f} TH/s"
-                    elif hashrate_val / 1e9 > 1:
-                        hashrate_str = f"{hashrate_val / 1e9:.2f} GH/s"
-                    else:
-                        hashrate_str = f"{hashrate_val / 1e6:.2f} MH/s"
-                    
+                    if hashrate_val / 1e12 >= 1: hashrate_str = f"{hashrate_val / 1e12:.2f} TH/s"
+                    elif hashrate_val / 1e9 >= 1: hashrate_str = f"{hashrate_val / 1e9:.2f} GH/s"
+                    else: hashrate_str = f"{hashrate_val / 1e6:.2f} MH/s"
                     asics.append({ 
-                        'name': device.get("name", "N/A"), 
-                        'hashrate': hashrate_str, 
-                        'power_watts': float(best_algo.get("power", 0)), 
-                        'daily_revenue': max_revenue
+                        'name': device.get("name", "N/A"), 'hashrate': hashrate_str, 
+                        'power_watts': float(best_algo.get("power", 0)), 'daily_revenue': max_revenue
                     })
-            
             if not asics: raise ValueError("Не найдено доходных ASIC в API.") 
             return sorted(asics, key=lambda x: x['daily_revenue'], reverse=True) 
         except Exception as e: 
@@ -316,58 +320,72 @@ class ApiHandler:
         """Источник #2: JSON API от WhatToMine."""
         logger.info("Источник #2 (API): Пытаюсь получить данные с whattomine.com...")
         url = "https://whattomine.com/asics.json"
-        data = self._make_request(url, timeout=15)
-        if not data or 'asics' not in data:
-            return None
-        
+        data = self._make_request(url, is_json=True)
+        if not data or 'asics' not in data: return None
         parsed_asics = []
         try:
             for name, asic_data in data['asics'].items():
                 revenue_str = asic_data.get('revenue')
                 if not revenue_str: continue
-
                 revenue = float(re.sub(r'[^\d\.]', '', revenue_str))
                 if revenue > 0 and asic_data.get('status') == 'Active':
                     parsed_asics.append({
-                        'name': name,
-                        'hashrate': f"{asic_data.get('hashrate')} {asic_data.get('algorithm')}",
-                        'power_watts': float(asic_data.get('power', 0)),
-                        'daily_revenue': revenue
+                        'name': name, 'hashrate': f"{asic_data.get('hashrate')} {asic_data.get('algorithm')}",
+                        'power_watts': float(asic_data.get('power', 0)), 'daily_revenue': revenue
                     })
-            
             if not parsed_asics: raise ValueError("Не найдено доходных ASIC в API WhatToMine.") 
             return sorted(parsed_asics, key=lambda x: x['daily_revenue'], reverse=True)
         except Exception as e:
             logger.warning(f"Ошибка при обработке данных с whattomine.com: {e}"); return None
 
-    def _get_asics_from_scraping(self): 
-        """Источник #3: Парсинг сайта asicminervalue.com."""
-        logger.info("Источник #3 (Парсинг): Пытаюсь получить данные с asicminervalue.com...")
+    def _get_asics_from_viabtc(self):
+        """Источник #3: API от ViaBTC."""
+        logger.info("Источник #3 (API): Пытаюсь получить данные с viabtc.com...")
+        url = "https://www.viabtc.com/api/v1/tools/miner/revenue?coin=BTC&unit=T"
+        response = self._make_request(url, is_json=True)
+        if not response or response.get('code') != 0 or not response.get('data'): return None
+        parsed_asics = []
+        try:
+            for miner in response['data']:
+                revenue = float(miner.get('revenue_usd', 0))
+                if revenue > 0:
+                    parsed_asics.append({
+                        'name': miner.get('miner_name', 'N/A'),
+                        'hashrate': f"{float(miner.get('hashrate', 0)):.2f} TH/s",
+                        'power_watts': float(miner.get('power', 0)) * 1000,
+                        'daily_revenue': revenue
+                    })
+            if not parsed_asics: raise ValueError("API ViaBTC не вернул доходных ASIC.")
+            return sorted(parsed_asics, key=lambda x: x['daily_revenue'], reverse=True)
+        except Exception as e:
+            logger.error(f"Непредвиденная ошибка при парсинге API ViaBTC: {e}", exc_info=True)
+            return None
+            
+    def _get_asics_from_asicminervalue(self): 
+        """Источник #4: Парсинг сайта asicminervalue.com."""
+        logger.info("Источник #4 (Парсинг): Пытаюсь получить данные с asicminervalue.com...")
         response = self._make_request("https://www.asicminervalue.com", is_json=False) 
         if not response: return None 
-        
         try: 
             soup = BeautifulSoup(response.text, "lxml") 
             parsed_asics = [] 
-            
             rows = soup.select("tbody > tr") 
-            logger.info(f"Парсинг (ASICMinerValue): Найдено {len(rows)} строк.") 
-
+            logger.info(f"Парсинг (AMV): Найдено {len(rows)} строк.") 
             COL_MODEL, COL_HASHRATE, COL_POWER, COL_PROFIT = 0, 2, 3, 6
-
             for row in rows: 
                 cols = row.find_all("td") 
                 if len(cols) <= COL_PROFIT: continue 
-
                 try: 
                     name_tag = cols[COL_MODEL].find('a')
                     name = name_tag.get_text(strip=True) if name_tag else cols[COL_MODEL].get_text(strip=True)
-                    if not name or name.strip() == 'N/A': 
-                        continue
-
+                    if not name or name.strip() in ['N/A', '']: continue
+                    
                     hashrate_text = cols[COL_HASHRATE].get_text(strip=True) 
+                    
                     power_text = cols[COL_POWER].get_text(strip=True) 
-                    power_val = float(re.search(r'([\d,]+)', power_text).group(1).replace(',', ''))
+                    power_match = re.search(r'([\d,]+)', power_text)
+                    if not power_match: continue
+                    power_val = float(power_match.group(1).replace(',', ''))
                     
                     full_revenue_text = cols[COL_PROFIT].get_text(strip=True) 
                     revenue_match = re.search(r'(-?)\$?([\d\.]+)', full_revenue_text) 
@@ -377,64 +395,14 @@ class ApiHandler:
                     revenue_val = float(revenue_match.group(2)) * sign 
                     
                     if revenue_val > 0: 
-                        parsed_asics.append({ 
-                            'name': name.strip(), 
-                            'hashrate': hashrate_text, 
-                            'power_watts': power_val, 'daily_revenue': revenue_val 
-                        }) 
+                        parsed_asics.append({'name': name.strip(), 'hashrate': hashrate_text, 'power_watts': power_val, 'daily_revenue': revenue_val}) 
                 except Exception as e: 
-                    logger.warning(f"Парсинг (AMV): ошибка обработки строки: {e}.") 
+                    logger.warning(f"Парсинг (AMV): ошибка обработки строки: {row.get_text(strip=True, separator='|')} - {e}") 
                     continue 
-
-            if not parsed_asics: 
-                logger.error("Парсинг (AMV): не удалось извлечь данные ни из одной строки.") 
-                return None 
-            
+            if not parsed_asics: raise ValueError("Парсинг (AMV): не удалось извлечь данные ни из одной строки.") 
             return sorted(parsed_asics, key=lambda x: x['daily_revenue'], reverse=True) 
         except Exception as e: 
-            logger.error(f"Непредвиденная ошибка при парсинге ASICMinerValue: {e}", exc_info=True) 
-            return None 
-    
-    def _get_asics_from_viabtc(self):
-        """Источник #4: Парсинг сайта ViaBTC."""
-        logger.info("Источник #4 (Парсинг): Пытаюсь получить данные с viabtc.com...")
-        url = "https://www.viabtc.com/tools/miner"
-        response = self._make_request(url, is_json=False)
-        if not response: return None
-
-        try:
-            soup = BeautifulSoup(response.text, 'lxml')
-            parsed_asics = []
-            rows = soup.select('.miner-table tbody tr')
-            logger.info(f"Парсинг (ViaBTC): Найдено {len(rows)} строк.")
-            for row in rows:
-                try:
-                    cols = row.find_all('td')
-                    if len(cols) < 5: continue
-
-                    name = cols[0].get_text(strip=True)
-                    hashrate = cols[2].get_text(strip=True)
-                    power_str = cols[3].get_text(strip=True)
-                    power = float(re.search(r'[\d\.]+', power_str).group(0))
-                    revenue_str = cols[4].get_text(strip=True)
-                    revenue = float(re.search(r'[\d\.]+', revenue_str).group(0))
-                    if revenue > 0:
-                        parsed_asics.append({
-                            'name': name,
-                            'hashrate': hashrate,
-                            'power_watts': power * 1000, 
-                            'daily_revenue': revenue
-                        })
-                except Exception as e:
-                    logger.warning(f"Парсинг (ViaBTC): Ошибка обработки строки: {e}")
-                    continue
-            if not parsed_asics: 
-                logger.error("Парсинг (ViaBTC): не удалось извлечь данные.")
-                return None
-            return sorted(parsed_asics, key=lambda x: x['daily_revenue'], reverse=True)
-        except Exception as e:
-            logger.error(f"Непредвиденная ошибка при парсинге ViaBTC: {e}", exc_info=True)
-            return None
+            logger.error(f"Непредвиденная ошибка при парсинге ASICMinerValue: {e}", exc_info=True); return None 
 
     def _get_asics_from_hashrate_no(self):
         """Источник #5: Парсинг сайта hashrate.no."""
@@ -442,47 +410,62 @@ class ApiHandler:
         url = "https://www.hashrate.no/asics"
         response = self._make_request(url, is_json=False)
         if not response: return None
-
         try:
             soup = BeautifulSoup(response.text, 'lxml')
             parsed_asics = []
-            rows = soup.select('table#kt_datatable_example_1 tbody tr')
+            rows = soup.select('table#asic-table tbody tr')
             logger.info(f"Парсинг (hashrate.no): Найдено {len(rows)} строк.")
             for row in rows:
                 try:
                     cols = row.find_all('td')
                     if len(cols) < 7: continue
-
-                    name_tag = cols[0].find('a')
+                    name_tag = cols[0].find('a');
                     if not name_tag: continue
                     name = name_tag.get_text(strip=True)
-                    
                     hashrate = cols[2].get_text(strip=True)
-                    
                     power_str = cols[3].get_text(strip=True)
-                    power_val = float(re.search(r'[\d\.]+', power_str).group(0))
-                    
-                    revenue_str = cols[5].get_text(strip=True).replace('$', '')
+                    power_val = float(re.search(r'[\d,]+', power_str).group(0).replace(',', ''))
+                    revenue_str = cols[5].get_text(strip=True).replace('$', '').replace(',', '')
                     revenue_val = float(revenue_str)
-                    
                     if revenue_val > 0:
-                        parsed_asics.append({
-                            'name': name,
-                            'hashrate': hashrate,
-                            'power_watts': power_val,
-                            'daily_revenue': revenue_val
-                        })
+                        parsed_asics.append({'name': name, 'hashrate': hashrate, 'power_watts': power_val, 'daily_revenue': revenue_val})
                 except Exception as e:
                     logger.warning(f"Парсинг (hashrate.no): Ошибка обработки строки: {e}")
                     continue
-            if not parsed_asics: 
-                logger.error("Парсинг (hashrate.no): не удалось извлечь данные.")
-                return None
+            if not parsed_asics: raise ValueError("Парсинг (hashrate.no): не удалось извлечь данные.")
             return sorted(parsed_asics, key=lambda x: x['daily_revenue'], reverse=True)
         except Exception as e:
-            logger.error(f"Непредвиденная ошибка при парсинге hashrate.no: {e}", exc_info=True)
-            return None
-    
+            logger.error(f"Непредвиденная ошибка при парсинге hashrate.no: {e}", exc_info=True); return None
+
+    def _get_asics_from_2cryptocalc(self):
+        """Источник #6: API от 2CryptoCalc."""
+        logger.info("Источник #6 (API): Пытаюсь получить данные с 2cryptocalc.com...")
+        url = "https://2cryptocalc.com/api/v2/miners"
+        response = self._make_request(url, is_json=True)
+        if not response or not response.get('miners'): return None
+        parsed_asics = []
+        try:
+            for miner in response['miners']:
+                if miner.get('type') != 'asic': continue
+                # Находим самый доходный алгоритм
+                best_algo = max(miner.get('algos', []), key=lambda x: x.get('revenue24', 0), default=None)
+                if not best_algo: continue
+                
+                revenue = best_algo.get('revenue24', 0)
+                if revenue > 0:
+                    hashrate_value = best_algo.get('hashrate', 0)
+                    hashrate_unit = best_algo.get('hashrate_unit', 'H/s')
+                    parsed_asics.append({
+                        'name': miner.get('name', 'N/A'),
+                        'hashrate': f"{hashrate_value} {hashrate_unit}",
+                        'power_watts': best_algo.get('power', 0),
+                        'daily_revenue': revenue
+                    })
+            if not parsed_asics: raise ValueError("API 2CryptoCalc не вернул доходных ASIC.")
+            return sorted(parsed_asics, key=lambda x: x['daily_revenue'], reverse=True)
+        except Exception as e:
+            logger.error(f"Непредвиденная ошибка при парсинге API 2CryptoCalc: {e}", exc_info=True); return None
+
     def get_top_asics(self, force_update: bool = False): 
         if not force_update and self.asic_cache.get("data") and self.asic_cache.get("timestamp") and (datetime.now() - self.asic_cache.get("timestamp") < timedelta(hours=1)): 
             logger.info("Использую свежие данные из кэша.")
@@ -490,23 +473,24 @@ class ApiHandler:
 
         asics = None
         source_functions = [
-            self._get_asics_from_api,
-            self._get_asics_from_whattomine,
-            self._get_asics_from_scraping,
             self._get_asics_from_viabtc,
-            self._get_asics_from_hashrate_no
+            self._get_asics_from_minerstat,
+            self._get_asics_from_whattomine,
+            self._get_asics_from_2cryptocalc,
+            self._get_asics_from_hashrate_no,
+            self._get_asics_from_asicminervalue,
         ]
 
-        for i, get_asics in enumerate(source_functions):
+        for i, get_asics_func in enumerate(source_functions):
             try:
-                asics = get_asics()
+                asics = get_asics_func()
                 if asics:
-                    logger.info(f"Данные успешно получены из источника #{i+1}.")
+                    logger.info(f"Данные успешно получены из источника #{i+1} ({get_asics_func.__name__}).")
                     break
                 else:
-                    logger.warning(f"Источник #{i+1} не вернул данные. Переключаюсь на следующий.")
+                    logger.warning(f"Источник #{i+1} ({get_asics_func.__name__}) не вернул данные. Переключаюсь на следующий.")
             except Exception as e:
-                logger.error(f"Произошла ошибка при вызове источника #{i+1}: {e}", exc_info=True)
+                logger.error(f"Произошла ошибка при вызове источника #{i+1} ({get_asics_func.__name__}): {e}", exc_info=True)
                 continue
 
         if asics: 
@@ -1105,10 +1089,23 @@ def handle_start_help(msg):
     bot.send_message(msg.chat.id, "👋 Привет! Я ваш крипто-помощник.\n\n<b>Команды модерации (только для админов):</b>\n<code>/userinfo</code> - информация о пользователе\n<code>/spam</code> - пометить сообщение как спам\n<code>/ban</code> - забанить пользователя\n<code>/unban</code> - разбанить пользователя\n<code>/unmute</code> - снять временный мьют\n<code>/chatstats</code> - статистика по чату", reply_markup=get_main_keyboard()) 
 
 @bot.message_handler(commands=['userinfo', 'ban', 'spam', 'unban', 'unmute', 'chatstats']) 
-def handle_admin_commands(msg): 
-    if not is_admin(msg.chat.id, msg.from_user.id): return 
+def handle_admin_commands(msg):
+    command_raw = msg.text.split('@')[0].split(' ')[0]
+    command = command_raw.lower()
 
-    command = msg.text.split('@')[0].split(' ')[0] 
+    if not is_admin(msg.chat.id, msg.from_user.id):
+        admin_command_descriptions = {
+            '/userinfo': 'получения информации о пользователе.',
+            '/ban': 'блокировки пользователя в чате.',
+            '/spam': 'отметки сообщения как спам и наказания пользователя.',
+            '/unban': 'разблокировки пользователя.',
+            '/unmute': 'снятия временных ограничений с пользователя.',
+            '/chatstats': 'просмотра статистики активности чата.'
+        }
+        description = admin_command_descriptions.get(command)
+        if description:
+            bot.reply_to(msg, f"🚫 Вы не можете использовать эту команду. Команда <code>{command}</code> предназначена для администраторов для {description}")
+        return
 
     def get_target_user(message): 
         if message.reply_to_message: return message.reply_to_message.from_user, None 
@@ -1139,7 +1136,7 @@ def handle_admin_commands(msg):
         if error: return bot.reply_to(msg, error) 
         if target_user: 
             try: 
-                bot.restrict_chat_member(msg.chat.id, user_id, can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True, can_add_web_page_previews=True) 
+                bot.restrict_chat_member(msg.chat.id, target_user.id, can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True, can_add_web_page_previews=True) 
                 bot.reply_to(msg, f"С пользователя {telebot.util.escape(target_user.full_name)} сняты временные ограничения.") 
             except Exception as e: logger.error(e); bot.reply_to(msg, "Не удалось снять мьют.") 
 
