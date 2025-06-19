@@ -60,7 +60,7 @@ class Config:
         logger.critical("Критическая ошибка: TG_BOT_TOKEN не установлен.") 
         raise ValueError("Критическая ошибка: TG_BOT_TOKEN не установлен") 
 
-    PARTNER_URL = os.getenv("PARTNER_URL", "https://cutt.ly/5rWGcgYL") 
+    PARTNER_URL = os.getenv("PARTNER_URL", "https://app.leadteh.ru/w/dTeKr") 
     PARTNER_BUTTON_TEXT_OPTIONS = ["🎁 Узнать спеццены", "🔥 Эксклюзивное предложение", "💡 Получить консультацию", "💎 Прайс от экспертов"] 
     PARTNER_AD_TEXT_OPTIONS = [ 
         "Хотите превратить виртуальные BTC в реальные? Для этого нужно настоящее оборудование! Наши партнеры предлагают лучшие условия для старта.", 
@@ -269,7 +269,7 @@ class ApiHandler:
         return (None, None) 
 
     # ========================================================================================
-    # БЛОК ПОЛУЧЕНИЯ ДАННЫХ ОБ ASIC. ВЕРСИЯ 2.1
+    # БЛОК ПОЛУЧЕНИЯ ДАННЫХ ОБ ASIC. ВЕРСИЯ 2.2
     # ========================================================================================
 
     def _get_asics_from_api(self): 
@@ -361,7 +361,10 @@ class ApiHandler:
 
                 try: 
                     name_tag = cols[COL_MODEL].find('a')
-                    name = name_tag.get_text(strip=True) if name_tag else 'N/A'
+                    name = name_tag.get_text(strip=True) if name_tag else cols[COL_MODEL].get_text(strip=True)
+                    if not name or name.strip() == 'N/A': 
+                        continue
+
                     hashrate_text = cols[COL_HASHRATE].get_text(strip=True) 
                     power_text = cols[COL_POWER].get_text(strip=True) 
                     power_val = float(re.search(r'([\d,]+)', power_text).group(1).replace(',', ''))
@@ -375,7 +378,8 @@ class ApiHandler:
                     
                     if revenue_val > 0: 
                         parsed_asics.append({ 
-                            'name': name, 'hashrate': hashrate_text, 
+                            'name': name.strip(), 
+                            'hashrate': hashrate_text, 
                             'power_watts': power_val, 'daily_revenue': revenue_val 
                         }) 
                 except Exception as e: 
@@ -431,6 +435,53 @@ class ApiHandler:
         except Exception as e:
             logger.error(f"Непредвиденная ошибка при парсинге ViaBTC: {e}", exc_info=True)
             return None
+
+    def _get_asics_from_hashrate_no(self):
+        """Источник #5: Парсинг сайта hashrate.no."""
+        logger.info("Источник #5 (Парсинг): Пытаюсь получить данные с hashrate.no...")
+        url = "https://www.hashrate.no/asics"
+        response = self._make_request(url, is_json=False)
+        if not response: return None
+
+        try:
+            soup = BeautifulSoup(response.text, 'lxml')
+            parsed_asics = []
+            rows = soup.select('table#kt_datatable_example_1 tbody tr')
+            logger.info(f"Парсинг (hashrate.no): Найдено {len(rows)} строк.")
+            for row in rows:
+                try:
+                    cols = row.find_all('td')
+                    if len(cols) < 7: continue
+
+                    name_tag = cols[0].find('a')
+                    if not name_tag: continue
+                    name = name_tag.get_text(strip=True)
+                    
+                    hashrate = cols[2].get_text(strip=True)
+                    
+                    power_str = cols[3].get_text(strip=True)
+                    power_val = float(re.search(r'[\d\.]+', power_str).group(0))
+                    
+                    revenue_str = cols[5].get_text(strip=True).replace('$', '')
+                    revenue_val = float(revenue_str)
+                    
+                    if revenue_val > 0:
+                        parsed_asics.append({
+                            'name': name,
+                            'hashrate': hashrate,
+                            'power_watts': power_val,
+                            'daily_revenue': revenue_val
+                        })
+                except Exception as e:
+                    logger.warning(f"Парсинг (hashrate.no): Ошибка обработки строки: {e}")
+                    continue
+            if not parsed_asics: 
+                logger.error("Парсинг (hashrate.no): не удалось извлечь данные.")
+                return None
+            return sorted(parsed_asics, key=lambda x: x['daily_revenue'], reverse=True)
+        except Exception as e:
+            logger.error(f"Непредвиденная ошибка при парсинге hashrate.no: {e}", exc_info=True)
+            return None
     
     def get_top_asics(self, force_update: bool = False): 
         if not force_update and self.asic_cache.get("data") and self.asic_cache.get("timestamp") and (datetime.now() - self.asic_cache.get("timestamp") < timedelta(hours=1)): 
@@ -443,6 +494,7 @@ class ApiHandler:
             self._get_asics_from_whattomine,
             self._get_asics_from_scraping,
             self._get_asics_from_viabtc,
+            self._get_asics_from_hashrate_no
         ]
 
         for i, get_asics in enumerate(source_functions):
@@ -1087,7 +1139,7 @@ def handle_admin_commands(msg):
         if error: return bot.reply_to(msg, error) 
         if target_user: 
             try: 
-                bot.restrict_chat_member(msg.chat.id, target_user.id, can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True, can_add_web_page_previews=True) 
+                bot.restrict_chat_member(msg.chat.id, user_id, can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True, can_add_web_page_previews=True) 
                 bot.reply_to(msg, f"С пользователя {telebot.util.escape(target_user.full_name)} сняты временные ограничения.") 
             except Exception as e: logger.error(e); bot.reply_to(msg, "Не удалось снять мьют.") 
 
