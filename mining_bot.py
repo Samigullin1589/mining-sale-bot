@@ -118,6 +118,10 @@ class Config:
         'doge': 'DOGE', 'доги': 'DOGE', 'дог': 'DOGE',
         'kas': 'KAS', 'каспа': 'KAS'
     }
+    COINGECKO_MAP = {
+        'BTC': 'bitcoin', 'ETH': 'ethereum', 'LTC': 'litecoin', 
+        'DOGE': 'dogecoin', 'KAS': 'kaspa', 'SOL': 'solana'
+    }
     POPULAR_TICKERS = ['BTC', 'ETH', 'LTC', 'DOGE', 'KAS']
     NEWS_RSS_FEEDS = ["https://forklog.com/feed", "https://bits.media/rss/", "https://www.rbc.ru/crypto/feed"]
     
@@ -231,15 +235,17 @@ class ApiHandler:
 
     def get_crypto_price(self, ticker="BTC"):
         ticker = ticker.upper()
+        coingecko_id = Config.COINGECKO_MAP.get(ticker)
         
-        # Источники с URL и лямбда-функциями для извлечения цены. Binance перенесен в конец из-за частых блокировок.
         sources = [
-            {"name": "Bybit", "url": f"https://api.bybit.com/v5/market/tickers?category=spot&symbol={ticker}USDT", "parser": lambda data: data.get('result', {}).get('list', [{}])[0].get('lastPrice')},
-            {"name": "KuCoin", "url": f"https://api.kucoin.com/api/v1/market/orderbook/level1?symbol={ticker}-USDT", "parser": lambda data: data.get('data', {}).get('price')},
-            {"name": "Binance", "url": f"https://api.binance.com/api/v3/ticker/price?symbol={ticker}USDT", "parser": lambda data: data.get('price')}
+            {"name": "CoinGecko", "url": f"https://api.coingecko.com/api/v3/simple/price?ids={coingecko_id}&vs_currencies=usd", "parser": lambda data: data.get(coingecko_id, {}).get('usd'), "enabled": bool(coingecko_id)},
+            {"name": "Bybit", "url": f"https://api.bybit.com/v5/market/tickers?category=spot&symbol={ticker}USDT", "parser": lambda data: data.get('result', {}).get('list', [{}])[0].get('lastPrice'), "enabled": True},
+            {"name": "KuCoin", "url": f"https://api.kucoin.com/api/v1/market/orderbook/level1?symbol={ticker}-USDT", "parser": lambda data: data.get('data', {}).get('price'), "enabled": True},
+            {"name": "Binance", "url": f"https://api.binance.com/api/v3/ticker/price?symbol={ticker}USDT", "parser": lambda data: data.get('price'), "enabled": True}
         ]
 
         for source in sources:
+            if not source['enabled']: continue
             data = self._make_request(source['url'], timeout=4)
             if data:
                 price_str = source['parser'](data)
@@ -281,22 +287,21 @@ class ApiHandler:
         
         try:
             soup = BeautifulSoup(response.text, "lxml")
-            container = soup.find('div', id=lambda x: x and 'sha-256' in x)
-            if not container:
-                logger.error("Парсинг: не найден контейнер для SHA-256. Ищем по заголовку.")
-                header = soup.find(lambda tag: tag.name in ['h2', 'h3'] and 'sha-256' in tag.get_text(strip=True).lower())
-                if header: container = header.find_parent()
-                else:
-                    logger.error("Парсинг: не найден ни контейнер, ни заголовок.")
-                    return None
+            tables = soup.find_all("table")
+            target_table = None
             
-            table = container.find("table")
-            if not table:
-                logger.error("Парсинг: не найдена таблица внутри контейнера.")
+            for table in tables:
+                headers = [th.get_text(strip=True).lower() for th in table.select("thead th")]
+                if 'miner' in headers and 'profit' in headers and 'hashrate' in headers:
+                    target_table = table
+                    break
+            
+            if not target_table:
+                logger.error("Парсинг: не найдена таблица с нужными заголовками (Miner, Hashrate, Profit).")
                 return None
 
             parsed_asics = []
-            for row in table.select("tbody tr"):
+            for row in target_table.select("tbody tr"):
                 cols = row.find_all("td")
                 if len(cols) < 5: continue
                 
