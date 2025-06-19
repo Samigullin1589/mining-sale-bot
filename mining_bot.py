@@ -3,76 +3,76 @@
 # Раздел 1: Импорты и начальная настройка
 # ==============================================================================
 import asyncio
+import json
 import logging
 import os
 import random
 import re
-from dataclasses import dataclass
-from typing import List, Optional, Dict
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import List, Optional, Dict, Any
 
+import aiofiles
 import aiohttp
 import bleach
 import feedparser
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command, Text
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import Message, CallbackQuery, User
+from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bs4 import BeautifulSoup
 from cachetools import TTLCache, cached
-from fuzzywuzzy import fuzz, process
 from openai import AsyncOpenAI
 
 # ==============================================================================
 # Раздел 2: Конфигурация и константы
 # ==============================================================================
+class Config:
+    # --- API и токены ---
+    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    CMC_API_KEY = os.getenv("CMC_API_KEY")
+    ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
 
-# --- Конфигурация API ---
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-CMC_API_KEY = os.getenv("CMC_API_KEY")
+    # --- Файлы данных ---
+    GAME_DATA_FILE = "game_data.json"
+    PROFILES_DATA_FILE = "user_profiles.json"
 
-# --- Конфигурация парсинга и сбора данных ---
-ASIC_SOURCES = {'asicminervalue': 'https://www.asicminervalue.com/'}
-COINGECKO_API_URL = "https://api.coingecko.com/api/v3"
-MINERSTAT_COINS_URL = "https://api.minerstat.com/v2/coins"
-FEAR_AND_GREED_API_URL = "https://pro-api.coinmarketcap.com/v3/fear-and-greed/historical"
+    # --- API URL ---
+    ASIC_SOURCE_URL = 'https://www.asicminervalue.com/'
+    COINGECKO_API_URL = "https://api.coingecko.com/api/v3"
+    MINERSTAT_COINS_URL = "https://api.minerstat.com/v2/coins"
+    FEAR_AND_GREED_API_URL = "https://pro-api.coinmarketcap.com/v3/fear-and-greed/historical"
+    CBR_API_URL = "https://www.cbr-xml-daily.ru/daily_json.js"
 
-# --- Конфигурация новостей ---
-NEWS_RSS_FEEDS = [
-    "https://cointelegraph.com/rss/tag/russia", "https://forklog.com/feed",
-    "https://www.rbc.ru/crypto/feed", "https://bits.media/rss/",
-]
-NEWS_CHAT_ID = os.getenv("NEWS_CHAT_ID")
-NEWS_INTERVAL_HOURS = 3
+    # --- Новости ---
+    NEWS_RSS_FEEDS = ["https://cointelegraph.com/rss/tag/russia", "https://forklog.com/feed", "https://www.rbc.ru/crypto/feed", "https://bits.media/rss/"]
+    NEWS_CHAT_ID = os.getenv("NEWS_CHAT_ID")
+    NEWS_INTERVAL_HOURS = 3
 
-# --- Конфигурация кэширования ---
-asic_cache = TTLCache(maxsize=1, ttl=3600)
-crypto_price_cache = TTLCache(maxsize=500, ttl=300)
-fear_greed_cache = TTLCache(maxsize=1, ttl=14400)
-coin_list_cache = TTLCache(maxsize=1, ttl=86400)
+    # --- Игра ---
+    LEVEL_MULTIPLIERS = {1: 1, 2: 1.5, 3: 2.2, 4: 3.5, 5: 5}
+    UPGRADE_COSTS = {2: 0.001, 3: 0.005, 4: 0.02, 5: 0.1}
 
 # --- Настройка журналирования ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', handlers=[logging.StreamHandler()])
 logger = logging.getLogger(__name__)
 
 # --- Инициализация основных компонентов ---
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
+bot = Bot(token=Config.TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 scheduler = AsyncIOScheduler(timezone="UTC")
-openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+openai_client = AsyncOpenAI(api_key=Config.OPENAI_API_KEY) if Config.OPENAI_API_KEY else None
 
 # ==============================================================================
 # Раздел 3: Модели данных и состояния
 # ==============================================================================
 class Form(StatesGroup):
     waiting_for_ticker = State()
+    waiting_for_calculator_cost = State()
 
 @dataclass
 class AsicMiner:
@@ -81,257 +81,357 @@ class AsicMiner:
 @dataclass
 class CryptoCoin:
     id: str; symbol: str; name: str; price: float
-    algorithm: Optional[str] = None
-    market_cap: Optional[int] = None
+    algorithm: Optional[str] = None; market_cap: Optional[int] = None
+
+@dataclass
+class GameRig:
+    name: str
+    asic_model: str
+    base_rate: float
+    level: int = 1
+    balance: float = 0.0
+    last_collected: Optional[datetime] = None
+
+@dataclass
+class UserProfile:
+    user_id: int; name: str; username: Optional[str]
+    msg_count: int = 0; spam_count: int = 0
+    first_msg: datetime = field(default_factory=datetime.utcnow)
+    last_seen: datetime = field(default_factory=datetime.utcnow)
 
 # ==============================================================================
-# Раздел 4: Вспомогательные функции
+# Раздел 4: Вспомогательные функции и файловый I/O
 # ==============================================================================
-
-def sanitize_html(text: str) -> str:
-    if not text: return ""
-    return bleach.clean(text, tags=[], attributes={}, strip=True).strip()
-
-async def resilient_request(session: aiohttp.ClientSession, url: str, headers: Optional[Dict] = None, params: Optional[Dict] = None) -> Optional[Dict]:
+async def read_json_file(filepath: str) -> Dict:
+    if not os.path.exists(filepath): return {}
     try:
-        request_headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'}
-        if headers: request_headers.update(headers)
-        async with session.get(url, headers=request_headers, params=params, timeout=15) as response:
-            response.raise_for_status()
-            return await response.json()
+        async with aiofiles.open(filepath, 'r', encoding='utf-8') as f:
+            return json.loads(await f.read())
     except Exception as e:
-        logger.error(f"Ошибка запроса к {url}: {e}")
-    return None
+        logger.error(f"Ошибка чтения JSON файла {filepath}: {e}")
+        return {}
 
-def parse_power(power_str: str) -> int:
-    return int(re.sub(r'[^0-9]', '', power_str)) if power_str else 0
-
-def parse_profitability(profit_str: str) -> float:
-    cleaned_str = re.sub(r'[^\d.]', '', profit_str)
-    return float(cleaned_str) if cleaned_str else 0.0
+async def write_json_file(filepath: str, data: Dict):
+    try:
+        async with aiofiles.open(filepath, 'w', encoding='utf-8') as f:
+            await f.write(json.dumps(data, indent=4, ensure_ascii=False, default=str))
+    except Exception as e:
+        logger.error(f"Ошибка записи JSON файла {filepath}: {e}")
 
 # ==============================================================================
-# Раздел 5: Модули сбора данных
+# Раздел 5: Основные модули (API, Калькулятор, Игра, Антиспам)
 # ==============================================================================
 
-async def scrape_asicminervalue(session: aiohttp.ClientSession) -> List[AsicMiner]:
+# --- API Handler ---
+@cached(TTLCache(maxsize=1, ttl=3600))
+async def get_profitable_asics() -> List[AsicMiner]:
+    logger.info("Обновление кэша ASIC-майнеров...")
     miners: List[AsicMiner] = []
     try:
-        async with session.get(ASIC_SOURCES['asicminervalue'], timeout=20) as response:
+        async with aiohttp.ClientSession() as session, session.get(Config.ASIC_SOURCE_URL, timeout=20) as response:
             html = await response.text()
         soup = BeautifulSoup(html, 'lxml')
         table = soup.find('table', {'class': 'table-hover'})
-        if not table: return miners
-        for row in table.find('tbody').find_all('tr'):
-            cols = row.find_all('td')
-            if len(cols) > 6:
-                name, hashrate, power, algo, prof = cols[0].text, cols[2].text, cols[3].text, cols[5].text, cols[6].text
-                profitability = parse_profitability(prof)
-                if profitability > 0:
-                    miners.append(AsicMiner(name.strip(), algo.strip(), hashrate.strip(), parse_power(power), profitability, 'AsicMinerValue'))
+        if table:
+            for row in table.find('tbody').find_all('tr'):
+                cols = row.find_all('td')
+                if len(cols) > 6:
+                    name, hashrate, power, algo, prof = cols[0].text, cols[2].text, cols[3].text, cols[5].text, cols[6].text
+                    profitability = float(re.sub(r'[^\d.]', '', prof)) if prof else 0.0
+                    if profitability > 0:
+                        miners.append(AsicMiner(name.strip(), algo.strip(), hashrate.strip(), int(re.sub(r'\D', '', power)), profitability, 'AsicMinerValue'))
     except Exception as e:
-        logger.error(f"Критическая ошибка при скрапинге AsicMinerValue: {e}", exc_info=True)
-    return miners
-
-@cached(asic_cache)
-async def get_profitable_asics() -> List[AsicMiner]:
-    logger.info("Обновление кэша ASIC-майнеров...")
-    async with aiohttp.ClientSession() as session:
-        miners = await scrape_asicminervalue(session)
-    if not miners:
-        logger.warning("Не удалось получить данные по ASIC.")
-        return []
+        logger.error(f"Ошибка скрапинга AsicMinerValue: {e}", exc_info=True)
+    
     sorted_miners = sorted(miners, key=lambda m: m.profitability, reverse=True)
-    logger.info(f"Кэш ASIC-майнеров обновлен. Найдено {len(sorted_miners)} устройств.")
+    logger.info(f"Кэш ASIC обновлен. Найдено {len(sorted_miners)} устройств.")
     return sorted_miners
 
-@cached(coin_list_cache)
-async def get_coin_list_with_algorithms() -> Dict[str, str]:
-    logger.info("Обновление кэша списка монет с алгоритмами...")
-    coin_algo_map = {}
-    async with aiohttp.ClientSession() as session:
-        data = await resilient_request(session, MINERSTAT_COINS_URL)
-        if data:
-            for coin_data in data:
-                symbol, algorithm = coin_data.get('coin'), coin_data.get('algorithm')
-                if symbol and algorithm: coin_algo_map[symbol.upper()] = algorithm
-    logger.info(f"Кэш списка монет обновлен. Загружено {len(coin_algo_map)} монет.")
-    return coin_algo_map
-
-@cached(crypto_price_cache)
-async def get_crypto_price(query: str) -> Optional[CryptoCoin]:
-    query = query.lower().strip()
-    if not query: return None
-    async with aiohttp.ClientSession() as session:
-        search_data = await resilient_request(session, f"{COINGECKO_API_URL}/search", params={'query': query})
-        if not (search_data and search_data.get('coins')): return None
-        coin_id = search_data['coins'][0].get('id')
-        if not coin_id: return None
-        market_data_list = await resilient_request(session, f"{COINGECKO_API_URL}/coins/markets", params={'vs_currency': 'usd', 'ids': coin_id})
-        if not market_data_list: return None
-        md = market_data_list[0]
-        algo_map = await get_coin_list_with_algorithms()
-        symbol = md.get('symbol', '').upper()
-        return CryptoCoin(md.get('id'), symbol, md.get('name'), md.get('current_price', 0.0), algo_map.get(symbol), md.get('market_cap', 0))
-
-async def get_halving_info() -> str:
-    urls = ["https://mempool.space/api/blocks/tip/height", "https://blockchain.info/q/getblockcount"]
-    current_block = None
-    async with aiohttp.ClientSession() as s:
-        for url in urls:
-            try:
-                async with s.get(url, timeout=10) as r:
-                    if r.status == 200 and (text := await r.text()).isdigit():
-                        current_block = int(text); break
-            except Exception: continue
-    if not current_block: return "[❌ Не удалось получить данные о халвинге]"
+@cached(TTLCache(maxsize=1, ttl=300))
+async def get_usd_rub_rate() -> float:
     try:
-        HALVING_INTERVAL = 210000
-        blocks_left = ((current_block // HALVING_INTERVAL) + 1) * HALVING_INTERVAL - current_block
-        days, rem_min = divmod(blocks_left * 10, 1440)
-        hours, _ = divmod(rem_min, 60)
-        return (f"⏳ **До халвинга Bitcoin осталось:**\n\n"
-                f"🗓 **Дней:** `{days}` | ⏰ **Часов:** `{hours}`\n"
-                f"🧱 **Блоков до халвинга:** `{blocks_left:,}`")
-    except Exception as e:
-        logger.error(f"Ошибка обработки данных халвинга: {e}"); return "[❌ Ошибка]"
+        async with aiohttp.ClientSession() as session, session.get(Config.CBR_API_URL) as response:
+            data = await response.json()
+            rate = data.get('Valute', {}).get('USD', {}).get('Value', 90.0)
+            return float(rate)
+    except Exception:
+        return 90.0
 
-async def fetch_latest_news() -> List[Dict]:
-    all_news = []
-    loop = asyncio.get_running_loop()
-    for url in NEWS_RSS_FEEDS:
-        try:
-            feed = await loop.run_in_executor(None, feedparser.parse, url)
-            for entry in feed.entries:
-                all_news.append({'title': entry.title, 'link': entry.link, 'published': getattr(entry, 'published_parsed', None)})
-        except Exception as e:
-            logger.error(f"Не удалось спарсить RSS-ленту {url}: {e}")
-    all_news.sort(key=lambda x: x['published'] or (0,)*6, reverse=True)
-    seen_titles = set()
-    return [item for item in all_news if item['title'].lower() not in seen_titles and not seen_titles.add(item['title'].lower())][:5]
+# --- Calculator Logic ---
+class Calculator:
+    @staticmethod
+    async def calculate(electricity_cost_rub: float) -> str:
+        asics = await get_profitable_asics()
+        if not asics: return "😕 Не удалось получить данные о майнерах для расчета."
+        
+        rate = await get_usd_rub_rate()
+        cost_usd = electricity_cost_rub / rate
+        
+        result = [f"💰 **Расчет профита (розетка {electricity_cost_rub:.2f} ₽/кВтч)**\n"]
+        for asic in asics[:12]:
+            daily_cost = (asic.power / 1000) * 24 * cost_usd
+            profit = asic.profitability - daily_cost
+            result.append(f"**{bleach.clean(asic.name)}**\n   Профит: **${profit:.2f}/день**")
+        return "\n\n".join(result)
+
+# --- Game Logic ---
+class Game:
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+        self.user_rigs: Dict[str, GameRig] = {}
+
+    async def load(self):
+        data = await read_json_file(self.file_path)
+        for uid, rig_data in data.items():
+            last_collected = datetime.fromisoformat(rig_data['last_collected']) if rig_data.get('last_collected') else None
+            self.user_rigs[uid] = GameRig(**{**rig_data, 'last_collected': last_collected})
+        logger.info(f"Игровые данные загружены. {len(self.user_rigs)} игроков.")
+
+    async def save(self):
+        await write_json_file(self.file_path, {uid: rig.__dict__ for uid, rig in self.user_rigs.items()})
+
+    async def create_rig(self, user: User) -> str:
+        uid = str(user.id)
+        if uid in self.user_rigs: return "У вас уже есть ферма! Посмотрите информацию: /my_rig"
+        
+        top_asics = await get_profitable_asics()
+        if not top_asics: return "😕 Не удалось создать ферму, нет данных об оборудовании."
+        
+        starter_asic = top_asics[random.randint(5, 15)] # Берем не самый топовый для старта
+        btc_price_data = await get_crypto_price("BTC")
+        btc_price = btc_price_data.price if btc_price_data else 65000
+        
+        base_rate = starter_asic.profitability / btc_price
+        
+        self.user_rigs[uid] = GameRig(name=user.full_name, asic_model=starter_asic.name, base_rate=base_rate)
+        return f"🎉 Поздравляем! Ваша ферма с **{starter_asic.name}** создана! Начните собирать награду."
+
+    def get_rig_info(self, uid: str) -> Optional[str]:
+        rig = self.user_rigs.get(uid)
+        if not rig: return None
+        
+        current_rate = rig.base_rate * Config.LEVEL_MULTIPLIERS.get(rig.level, 1)
+        next_level = rig.level + 1
+        upgrade_cost = Config.UPGRADE_COSTS.get(next_level)
+        upgrade_text = f"Стоимость улучшения до {next_level} ур: `{upgrade_cost}` BTC." if upgrade_cost else "Вы достигли максимального уровня!"
+        
+        return (f"🖥️ **Ферма «{bleach.clean(rig.name)}»**\n"
+                f"Оборудование: *{rig.asic_model}*\n\n"
+                f"**Уровень:** {rig.level}\n"
+                f"**Добыча:** `{current_rate:.8f} BTC/день`\n"
+                f"**Баланс:** `{rig.balance:.8f}` BTC\n\n"
+                f"{upgrade_text}")
+
+    def collect_reward(self, uid: str) -> str:
+        rig = self.user_rigs.get(uid)
+        if not rig: return "У вас нет фермы. Создайте ее командой /my_rig"
+        
+        now = datetime.now()
+        if rig.last_collected and (now - rig.last_collected) < timedelta(hours=23, minutes=55):
+            time_left = timedelta(hours=24) - (now - rig.last_collected)
+            h, m = divmod(time_left.seconds, 3600); m //= 60
+            return f"Вы уже собирали награду. Попробуйте снова через **{h}ч {m}м**."
+        
+        base_mined = rig.base_rate * Config.LEVEL_MULTIPLIERS.get(rig.level, 1)
+        rig.balance += base_mined
+        rig.last_collected = now
+        
+        return (f"✅ Собрано **{base_mined:.8f}** BTC!\n"
+                f"💰 Ваш новый баланс: `{rig.balance:.8f}` BTC.")
+
+    def upgrade_rig(self, uid: str) -> str:
+        rig = self.user_rigs.get(uid)
+        if not rig: return "У вас нет фермы."
+        next_level = rig.level + 1
+        cost = Config.UPGRADE_COSTS.get(next_level)
+        if not cost: return "🎉 Поздравляем, у вас максимальный уровень фермы!"
+        if rig.balance < cost: return f"❌ **Недостаточно средств.** Нужно {cost} BTC."
+        
+        rig.balance -= cost
+        rig.level = next_level
+        return f"🚀 **Улучшение завершено!** Ваша ферма достигла **{next_level}** уровня!"
+
+    def get_top_miners(self) -> str:
+        if not self.user_rigs: return "Пока нет ни одного майнера для составления топа."
+        sorted_rigs = sorted(self.user_rigs.values(), key=lambda r: r.balance, reverse=True)
+        top_list = [f"**{i+1}.** {bleach.clean(rig.name)} - `{rig.balance:.6f}` BTC (Ур. {rig.level})" for i, rig in enumerate(sorted_rigs[:5])]
+        return "🏆 **Топ-5 Виртуальных Майнеров:**\n" + "\n".join(top_list)
+
+# --- AntiSpam Logic ---
+class AntiSpam:
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+        self.user_profiles: Dict[str, UserProfile] = {}
+        self.spam_keywords = ['p2p', 'арбитраж', 'обмен', 'сигналы', 'обучение', 'заработок']
+
+    async def load(self):
+        data = await read_json_file(self.file_path)
+        for uid, profile_data in data.items():
+            self.user_profiles[uid] = UserProfile(**profile_data)
+        logger.info(f"Профили пользователей загружены. {len(self.user_profiles)} записей.")
+
+    async def save(self):
+        await write_json_file(self.file_path, {uid: profile.__dict__ for uid, profile in self.user_profiles.items()})
+
+    def process_message(self, message: Message):
+        user = message.from_user
+        uid = str(user.id)
+        if uid not in self.user_profiles:
+            self.user_profiles[uid] = UserProfile(user_id=user.id, name=user.full_name, username=user.username)
+        
+        profile = self.user_profiles[uid]
+        profile.msg_count += 1
+        profile.last_seen = datetime.utcnow()
+
+        text = (message.text or message.caption or "").lower()
+        if any(keyword in text for keyword in self.spam_keywords):
+            profile.spam_count += 1
+            # Здесь можно добавить логику для удаления сообщения и выдачи предупреждения
+            # asyncio.create_task(bot.delete_message(...))
+            # asyncio.create_task(bot.send_message(...))
+            logger.warning(f"Обнаружен спам от {user.full_name} ({uid}). Счетчик: {profile.spam_count}")
+
+# Инициализация модулей
+game = Game(Config.GAME_DATA_FILE)
+antispam = AntiSpam(Config.PROFILES_DATA_FILE)
 
 # ==============================================================================
-# Раздел 6: Функции отображения (для вызова из обработчиков)
+# Раздел 6: Функции отображения и обработчики
 # ==============================================================================
+
+# --- Функции отображения (вызываются из обработчиков) ---
+async def show_main_menu(message: Message, text: str = "👋 Привет! Я твой крипто-помощник."):
+    builder = ReplyKeyboardBuilder()
+    builder.row(types.KeyboardButton(text="💰 Топ ASIC"), types.KeyboardButton(text="📈 Курс"))
+    builder.row(types.KeyboardButton(text="⛏️ Калькулятор"), types.KeyboardButton(text="📰 Новости"))
+    builder.row(types.KeyboardButton(text="⏳ Халвинг"), types.KeyboardButton(text="🕹️ Моя ферма"))
+    await message.answer(text, reply_markup=builder.as_markup(resize_keyboard=True))
 
 async def show_asics(message: Message):
     await message.answer("🔍 Ищу самые доходные ASIC-майнеры...")
     asics = await get_profitable_asics()
-    if not asics:
-        return await message.answer("😕 Не удалось получить данные о майнерах. Попробуйте позже.")
+    if not asics: return await message.answer("😕 Не удалось получить данные о майнерах.")
     response_text = "🏆 **Топ-10 самых доходных ASIC-майнеров на сегодня:**\n\n"
     for i, miner in enumerate(asics[:10]):
-        response_text += (f"**{i+1}. {sanitize_html(miner.name)}**\n"
+        response_text += (f"**{i+1}. {bleach.clean(miner.name)}**\n"
                           f"   - Алгоритм: `{miner.algorithm}`\n"
-                          f"   - Хешрейт: `{miner.hashrate}`\n"
-                          f"   - Потребление: `{miner.power} W`\n"
-                          f"   - **Доход в день: `${miner.profitability:.2f}`**\n\n")
+                          f"   - Доход в день: `${miner.profitability:.2f}`\n")
     await message.answer(response_text, parse_mode="Markdown")
 
-async def show_price_prompt(message: Message, state: FSMContext):
-    await state.set_state(Form.waiting_for_ticker)
-    await message.answer("Введите тикер или название криптовалюты (например, `BTC`):", parse_mode="Markdown")
-
-async def show_fear_greed(message: Message):
-    await message.answer("🧐 Анализирую настроения рынка...")
-    # Эта функция была удалена, так как требует платного API. Можно раскомментировать при наличии ключа.
-    await message.answer("😕 Функция 'Индекс страха и жадности' временно недоступна.")
-
 async def show_news(message: Message):
-    await message.answer("📰 Загружаю последние новости...")
-    latest_news = await fetch_latest_news()
-    if not latest_news:
-        return await message.answer("😕 Не удалось получить новости. Попробуйте позже.")
-    response_text = "📰 **Последние новости из мира криптовалют:**\n\n"
-    for i, news_item in enumerate(latest_news):
-        title = sanitize_html(news_item['title']).replace('[', '(').replace(']', ')')
-        response_text += f"{i+1}. [{title}]({news_item['link']})\n"
-    await message.answer(response_text, parse_mode="Markdown", disable_web_page_preview=True)
+    # Логика получения и отображения новостей (упрощена)
+    await message.answer("📰 Функция новостей в разработке.")
 
 async def show_halving_info(message: Message):
     await message.answer("⏳ Рассчитываю время до халвинга...")
     text = await get_halving_info()
     await message.answer(text, parse_mode="Markdown")
 
-async def start_quiz(message: Message):
-     await message.answer("😕 К сожалению, функция викторины временно отключена.")
-
 async def process_crypto_query(message: Message, state: FSMContext):
     await state.clear()
     query = message.text.strip()
     await message.answer(f"🔍 Ищу информацию по '{query}'...")
     coin = await get_crypto_price(query)
-    if not coin:
-        return await message.answer(f"😕 Не удалось найти информацию по запросу '{query}'.\nУбедитесь, что тикер или название верны.")
+    if not coin: return await message.answer(f"😕 Не удалось найти информацию по запросу '{query}'.")
     response_text = f"**{coin.name} ({coin.symbol.upper()})**\n\n💰 **Цена:** ${coin.price:,.4f}\n"
-    if coin.market_cap: response_text += f"📊 **Капитализация:** ${coin.market_cap:,.0f}\n"
-    if coin.algorithm:
-        response_text += f"⚙️ **Алгоритм:** `{coin.algorithm}`\n\n"
-        all_asics = await get_profitable_asics()
-        norm_algo = coin.algorithm.lower().replace('-', '').replace(' ', '')
-        rel_asics = [a for a in all_asics if a.algorithm.lower().replace('-', '').replace(' ', '') == norm_algo]
-        if rel_asics:
-            response_text += "⛏️ **Рекомендуемое оборудование:**\n"
-            for asic in rel_asics[:3]:
-                response_text += f"- {sanitize_html(asic.name)} (Доход: ${asic.profitability:.2f}/день)\n"
-        else:
-            response_text += "⛏️ Подходящее ASIC-оборудование не найдено."
-    else:
-        response_text += "⛏️ Алгоритм майнинга не определен."
+    if coin.algorithm: response_text += f"⚙️ **Алгоритм:** `{coin.algorithm}`\n"
     await message.answer(response_text, parse_mode="Markdown")
 
-# ==============================================================================
-# Раздел 7: Обработчики команд и колбэков Telegram
-# ==============================================================================
-
-COMMAND_MAP = { "топ asic": show_asics, "курс": show_price_prompt, "индекс страха": show_fear_greed, "новости": show_news, "халвинг": show_halving_info }
-
-def get_main_keyboard():
-    builder = InlineKeyboardBuilder()
-    builder.button(text="💰 Топ ASIC", callback_data="cb_asics"); builder.button(text="📈 Курс", callback_data="cb_price")
-    # builder.button(text="😨 Индекс Страха", callback_data="cb_fear_greed") # Отключено
-    builder.button(text="📰 Новости", callback_data="cb_news"); builder.button(text="⏳ Халвинг", callback_data="cb_halving")
-    builder.adjust(2); return builder.as_markup()
-
+# --- Основные обработчики команд ---
 @dp.message(CommandStart())
 async def send_welcome(message: Message):
-    await message.answer("👋 Привет! Я твой крипто-помощник.", reply_markup=get_main_keyboard())
+    await show_main_menu(message)
 
-# --- Обработчики колбэков (нажатий на инлайн-кнопки) ---
-@dp.callback_query(Text("cb_asics"))
-async def cb_asics(cb: CallbackQuery, state: FSMContext): await show_asics(cb.message); await cb.answer()
-@dp.callback_query(Text("cb_price"))
-async def cb_price(cb: CallbackQuery, state: FSMContext): await show_price_prompt(cb.message, state); await cb.answer()
-@dp.callback_query(Text("cb_fear_greed"))
-async def cb_fear(cb: CallbackQuery, state: FSMContext): await show_fear_greed(cb.message); await cb.answer()
-@dp.callback_query(Text("cb_news"))
-async def cb_news(cb: CallbackQuery, state: FSMContext): await show_news(cb.message); await cb.answer()
-@dp.callback_query(Text("cb_halving"))
-async def cb_halving(cb: CallbackQuery, state: FSMContext): await show_halving_info(cb.message); await cb.answer()
+@dp.message(F.text.lower().contains("топ asic"))
+async def text_asics_handler(message: Message): await show_asics(message)
+@dp.message(F.text.lower().contains("новости"))
+async def text_news_handler(message: Message): await show_news(message)
+@dp.message(F.text.lower().contains("халвинг"))
+async def text_halving_handler(message: Message): await show_halving_info(message)
 
-# --- Умный маршрутизатор текстовых сообщений ---
+# --- Обработчики калькулятора (с состояниями) ---
+@dp.message(F.text.lower().contains("калькулятор"))
+async def calculator_start(message: Message, state: FSMContext):
+    await state.set_state(Form.waiting_for_calculator_cost)
+    await message.answer("💡 Введите стоимость электроэнергии в **рублях** за кВт/ч (например: `4.5`):", parse_mode="Markdown")
+
+@dp.message(Form.waiting_for_calculator_cost)
+async def calculator_process(message: Message, state: FSMContext):
+    try:
+        cost = float(message.text.replace(',', '.'))
+        await state.clear()
+        calculation_result = await Calculator.calculate(cost)
+        await message.answer(calculation_result, parse_mode="Markdown")
+    except ValueError:
+        await message.answer("❌ Неверный формат. Введите число (например: `4.5`).")
+
+# --- Обработчики игры ---
+@dp.message(F.text.lower().contains("моя ферма"))
+async def my_rig_handler(message: Message):
+    uid = str(message.from_user.id)
+    info = game.get_rig_info(uid)
+    if info:
+        builder = InlineKeyboardBuilder()
+        builder.button(text="💰 Собрать", callback_data="game_collect")
+        builder.button(text="🚀 Улучшить", callback_data="game_upgrade")
+        builder.button(text="🏆 Топ-5", callback_data="game_top")
+        builder.adjust(2)
+        await message.answer(info, parse_mode="Markdown", reply_markup=builder.as_markup())
+    else:
+        await game.create_rig(message.from_user)
+        # Повторно вызываем, чтобы показать созданную ферму
+        await my_rig_handler(message)
+
+@dp.callback_query(Text(startswith="game_"))
+async def game_callbacks(cb: CallbackQuery):
+    action = cb.data.split("_")[1]
+    uid = str(cb.from_user.id)
+    response_text = ""
+    if action == "collect": response_text = game.collect_reward(uid)
+    elif action == "upgrade": response_text = game.upgrade_rig(uid)
+    elif action == "top": response_text = game.get_top_miners()
+    
+    await cb.answer(response_text, show_alert=True)
+    
+    # Обновляем сообщение с информацией о ферме
+    info = game.get_rig_info(uid)
+    if info: await cb.message.edit_text(info, parse_mode="Markdown", reply_markup=cb.message.reply_markup)
+
+
+# --- Обработчики курса (с состояниями) ---
+@dp.message(F.text.lower().contains("курс"))
+async def price_start(message: Message, state: FSMContext):
+    await state.set_state(Form.waiting_for_ticker)
+    await message.answer("Введите тикер или название криптовалюты:")
+
 @dp.message(Form.waiting_for_ticker)
-async def ticker_entered(message: Message, state: FSMContext):
+async def process_ticker(message: Message, state: FSMContext):
     await process_crypto_query(message, state)
 
+# --- Общий обработчик текста для антиспама (должен быть последним) ---
 @dp.message()
-async def message_router(message: Message, state: FSMContext):
-    clean_text = message.text.lower().strip()
-    # Ищем, содержит ли сообщение текст команды
-    for command_text, handler_func in COMMAND_MAP.items():
-        if command_text in clean_text:
-            await handler_func(message)
-            return
-    # Если команда не найдена, считаем это запросом на курс
-    await process_crypto_query(message, state)
+async def any_text_handler(message: Message):
+    antispam.process_message(message)
+    # Можно добавить ответ-заглушку, если бот не понял команду
+    # await message.answer("Не совсем понял вас. Воспользуйтесь кнопками меню.")
 
 # ==============================================================================
 # Раздел 8: Основная функция запуска бота
 # ==============================================================================
 async def main():
-    if not TELEGRAM_BOT_TOKEN:
+    if not Config.TELEGRAM_BOT_TOKEN:
         return logger.critical("Токен Telegram-бота не найден!")
     
+    # Загрузка данных при старте
+    await game.load()
+    await antispam.load()
+
+    # Настройка и запуск планировщика
+    scheduler.add_job(game.save, 'interval', minutes=5, id='save_game')
+    scheduler.add_job(antispam.save, 'interval', minutes=5, id='save_profiles')
+    scheduler.start()
+    logger.info("Планировщик для сохранения данных запущен.")
+
     logger.info("Удаление старого вебхука...")
     await bot.delete_webhook(drop_pending_updates=True)
 
@@ -340,6 +440,7 @@ async def main():
         await dp.start_polling(bot)
     finally:
         await bot.session.close()
+        if scheduler.running: scheduler.shutdown()
 
 if __name__ == '__main__':
     try:
