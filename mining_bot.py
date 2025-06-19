@@ -8,6 +8,7 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from aiogram.fsm.storage.memory import MemoryStorage # Для хранения состояний, если понадобится в будущем
+from aiogram.client.default import DefaultBotProperties # *** НОВЫЙ ИМПОРТ ***
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -29,7 +30,8 @@ if not BOT_TOKEN:
 storage = MemoryStorage()
 
 # Инициализация бота и диспетчера
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+# *** ОБНОВЛЕННАЯ ИНИЦИАЛИЗАЦИЯ BOT ***
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=storage)
 
 # --- Кэширование для "Топ ASIC" ---
