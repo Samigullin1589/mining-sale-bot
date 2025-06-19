@@ -60,8 +60,8 @@ class Config:
         logger.critical("Критическая ошибка: TG_BOT_TOKEN не установлен.")
         raise ValueError("Критическая ошибка: TG_BOT_TOKEN не установлен")
 
-    PARTNER_URL = os.getenv("PARTNER_URL", "https://cutt.ly/hrWUtARR")
-    PARTNER_BUTTON_TEXT_OPTIONS = ["� Узнать спеццены", "🔥 Эксклюзивное предложение", "💡 Получить консультацию", "💎 Прайс от экспертов"]
+    PARTNER_URL = os.getenv("PARTNER_URL", "https://app.leadteh.ru/w/dTeKr")
+    PARTNER_BUTTON_TEXT_OPTIONS = ["🎁 Узнать спеццены", "🔥 Эксклюзивное предложение", "💡 Получить консультацию", "💎 Прайс от экспертов"]
     PARTNER_AD_TEXT_OPTIONS = [
         "Хотите превратить виртуальные BTC в реальные? Для этого нужно настоящее оборудование! Наши партнеры предлагают лучшие условия для старта.",
         "Виртуальный майнинг - это только начало. Готовы к реальной добыче? Ознакомьтесь с предложениями от проверенных поставщиков.",
@@ -125,7 +125,7 @@ class Config:
     POPULAR_TICKERS = ['BTC', 'ETH', 'LTC', 'DOGE', 'KAS']
     NEWS_RSS_FEEDS = [
         "https://forklog.com/feed",
-        "https://cointelegraph.com/rss", # Новый надежный источник
+        "https://cointelegraph.com/rss",
         "https://bits.media/rss/",
         "https://www.rbc.ru/crypto/feed"
     ]
@@ -289,6 +289,7 @@ class ApiHandler:
         except Exception as e:
             logger.warning(f"Ошибка при обработке данных ASIC с API minerstat: {e}"); return None
 
+    # --- ФИНАЛЬНАЯ ВЕРСИЯ ПАРСЕРА ASIC ---
     def _get_asics_from_scraping(self):
         response = self._make_request("https://www.asicminervalue.com", is_json=False)
         if not response: return None
@@ -323,11 +324,17 @@ class ApiHandler:
                     name = cols[1].find('a').get_text(strip=True) if cols[1].find('a') else 'N/A'
                     hashrate_text = cols[2].get_text(strip=True)
                     power_text = cols[3].get_text(strip=True)
-                    revenue_text = cols[4].find(text=True, recursive=False).strip().replace('$', '')
+                    
+                    full_revenue_text = cols[4].get_text(strip=True)
+                    revenue_match = re.search(r'\$([\d\.]+)', full_revenue_text)
+                    if not revenue_match:
+                        logger.warning(f"Парсинг: не найден доход в строке: {row.get_text(strip=True, separator='|')}")
+                        continue
+                    
+                    revenue_text = revenue_match.group(1)
                     power_val = float(re.search(r'([\d,]+)', power_text).group(1).replace(',', ''))
                     revenue_val = float(revenue_text)
 
-                    # Улучшенная проверка на SHA-256
                     if revenue_val > 0 and ('th/s' in hashrate_text.lower() or 'ph/s' in hashrate_text.lower()):
                         parsed_asics.append({'name': name, 'hashrate': hashrate_text, 'power_watts': power_val, 'daily_revenue': revenue_val})
                 except Exception as e:
