@@ -319,13 +319,15 @@ class ApiHandler:
                     power_text = cols[3].get_text(strip=True)
                     
                     full_revenue_text = cols[4].get_text(strip=True)
-                    revenue_match = re.search(r'\$([\d\.]+)', full_revenue_text)
+                    revenue_match = re.search(r'(-?)\$?([\d\.]+)', full_revenue_text)
                     
                     if not revenue_match:
                         logger.warning(f"Парсинг: не найден доход в строке: {row_text}")
                         continue
                         
-                    revenue_val = float(revenue_match.group(1))
+                    sign = -1 if revenue_match.group(1) == '-' else 1
+                    revenue_val = float(revenue_match.group(2)) * sign
+                    
                     power_val = float(re.search(r'([\d,]+)', power_text).group(1).replace(',', ''))
                     
                     if revenue_val > 0:
@@ -1282,4 +1284,4 @@ if __name__ == '__main__':
     else:
         logger.info("Режим: long-polling.")
         bot.remove_webhook()
-        bot.polling(none_stop=True)
+        bot.polling(none_stop=Tr
