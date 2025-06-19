@@ -60,7 +60,7 @@ class Config:
         logger.critical("Критическая ошибка: TG_BOT_TOKEN не установлен.")
         raise ValueError("Критическая ошибка: TG_BOT_TOKEN не установлен")
 
-    PARTNER_URL = os.getenv("PARTNER_URL", "https://app.leadteh.ru/w/dTeKr")
+    PARTNER_URL = os.getenv("PARTNER_URL", "https://cutt.ly/5rWGcgYL")
     PARTNER_BUTTON_TEXT_OPTIONS = ["🎁 Узнать спеццены", "🔥 Эксклюзивное предложение", "💡 Получить консультацию", "💎 Прайс от экспертов"]
     PARTNER_AD_TEXT_OPTIONS = [
         "Хотите превратить виртуальные BTC в реальные? Для этого нужно настоящее оборудование! Наши партнеры предлагают лучшие условия для старта.",
@@ -296,30 +296,23 @@ class ApiHandler:
         
         try:
             soup = BeautifulSoup(response.text, "lxml")
-            tables = soup.find_all("table")
-            target_table = None
-            
-            best_score = 0
-            for table in tables:
-                headers = [th.get_text(strip=True).lower() for th in table.select("thead th")]
-                score = 0
-                if 'miner' in headers: score += 1
-                if 'hashrate' in headers: score += 1
-                if 'profit' in headers: score += 1
-                if 'power' in headers: score += 1
-                if score > best_score:
-                    best_score = score
-                    target_table = table
-            
-            if not target_table or best_score < 3:
-                logger.error("Парсинг: не найдена таблица с нужными заголовками (Miner, Hashrate, Profit).")
-                return None
-
             parsed_asics = []
-            for row in target_table.select("tbody tr"):
+            
+            # Ищем все строки таблиц на странице, которые не являются заголовками
+            rows = soup.select("tbody > tr")
+            logger.info(f"Парсинг: Найдено {len(rows)} строк в телах таблиц.")
+
+            for row in rows:
                 cols = row.find_all("td")
                 if len(cols) < 5: continue
                 
+                row_text = row.get_text(strip=True, separator='|').lower()
+                
+                # Эвристика: настоящая строка с ASIC должна содержать th/s, w и $
+                if 'th/s' not in row_text and 'gh/s' not in row_text: continue
+                if 'w' not in row_text: continue
+                if '$' not in row_text: continue
+
                 try:
                     name = cols[1].find('a').get_text(strip=True) if cols[1].find('a') else 'N/A'
                     hashrate_text = cols[2].get_text(strip=True)
@@ -327,22 +320,28 @@ class ApiHandler:
                     
                     full_revenue_text = cols[4].get_text(strip=True)
                     revenue_match = re.search(r'\$([\d\.]+)', full_revenue_text)
-                    if not revenue_match:
-                        logger.warning(f"Парсинг: не найден доход в строке: {row.get_text(strip=True, separator='|')}")
-                        continue
                     
-                    revenue_text = revenue_match.group(1)
+                    if not revenue_match:
+                        logger.warning(f"Парсинг: не найден доход в строке: {row_text}")
+                        continue
+                        
+                    revenue_val = float(revenue_match.group(1))
                     power_val = float(re.search(r'([\d,]+)', power_text).group(1).replace(',', ''))
-                    revenue_val = float(revenue_text)
+                    
+                    if revenue_val > 0:
+                        parsed_asics.append({
+                            'name': name,
+                            'hashrate': hashrate_text,
+                            'power_watts': power_val,
+                            'daily_revenue': revenue_val
+                        })
 
-                    if revenue_val > 0 and ('th/s' in hashrate_text.lower() or 'ph/s' in hashrate_text.lower()):
-                        parsed_asics.append({'name': name, 'hashrate': hashrate_text, 'power_watts': power_val, 'daily_revenue': revenue_val})
                 except Exception as e:
-                    logger.warning(f"Парсинг: пропущена строка из-за ошибки: {e}.")
+                    logger.warning(f"Парсинг: ошибка при обработке строки: {e}. Содержимое: {row_text}")
                     continue
 
             if not parsed_asics:
-                logger.error("Парсинг: не удалось извлечь данные из строк таблицы.")
+                logger.error("Парсинг: не удалось извлечь данные ни из одной подходящей строки.")
                 return None
             
             logger.info(f"Парсинг: успешно извлечено {len(parsed_asics)} ASIC.")
