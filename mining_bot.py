@@ -1132,8 +1132,8 @@ def handle_asics_text(msg):
     asics = api.get_top_asics() 
     if not asics: return send_message_with_partner_button(msg.chat.id, "Не удалось получить данные об ASIC.") 
     rows = [f"{a['name']:<22.21}| {a['hashrate']:<18.17}| {a['power_watts']:<5.0f}| ${a['daily_revenue']:<10.2f}" for a in asics] 
-    response = f"<pre>Модель                       | H/s                 | P, W | Доход/день\n" \ 
-               f"----------------------|---------------------|------|-----------\n" + "\n".join(rows) + "</pre>" 
+    response = (f"<pre>Модель                       | H/s                 | P, W | Доход/день\n" 
+                f"----------------------|---------------------|------|-----------\n" + "\n".join(rows) + "</pre>") 
     response += f"\n\n{api.ask_gpt('Напиши короткий мотивирующий комментарий (1-2 предложения) для майнинг-чата по списку доходных ASIC.', 'gpt-4o-mini')}" 
     send_message_with_partner_button(msg.chat.id, response) 
 
