@@ -148,7 +148,7 @@ except Exception as e: openai_client = None; logger.critical(f"Не удалос
 user_quiz_states = {}
 
 # ========================================================================================
-# 3. КЛАССЫ ЛОГИКИ (API, ИГРА, АНТИСПАМ) - ВЕРСИЯ 7.2
+# 3. КЛАССЫ ЛОГИКИ (API, ИГРА, АНТИСПАМ) - ВЕРСИЯ 7.3
 # ========================================================================================
 class ApiHandler:
     def __init__(self):
@@ -173,20 +173,22 @@ class ApiHandler:
         else:
             data_to_return = default_value if default_value is not None else {}
         
+        if not os.path.exists(file_path):
+            return data_to_return
+            
         try:
-            if os.path.exists(file_path):
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    loaded_data = json.load(f)
-                    if is_cache:
-                        if "timestamp" in loaded_data and loaded_data["timestamp"]:
-                            cache_time = datetime.fromisoformat(loaded_data["timestamp"])
-                            if datetime.now() - cache_time < timedelta(hours=4): 
-                                logger.info(f"Свежий кэш ({file_path}) успешно загружен.")
-                                loaded_data["timestamp"] = cache_time
-                                return loaded_data
-                            else: logger.warning(f"Кэш ({file_path}) старше 4 часов, будет проигнорирован.")
-                        return data_to_return
-                    return loaded_data
+            with open(file_path, 'r', encoding='utf-8') as f:
+                loaded_data = json.load(f)
+                if is_cache:
+                    if "timestamp" in loaded_data and loaded_data["timestamp"]:
+                        cache_time = datetime.fromisoformat(loaded_data["timestamp"])
+                        if datetime.now() - cache_time < timedelta(hours=4): 
+                            logger.info(f"Свежий кэш ({file_path}) успешно загружен.")
+                            loaded_data["timestamp"] = cache_time
+                            return loaded_data
+                        else: logger.warning(f"Кэш ({file_path}) старше 4 часов, будет проигнорирован.")
+                    return data_to_return
+                return loaded_data
         except (json.JSONDecodeError, TypeError, ValueError): logger.warning(f"Файл {file_path} пуст/поврежден.")
         except Exception as e: logger.error(f"Не удалось загрузить файл {file_path}: {e}")
         return data_to_return
@@ -352,12 +354,10 @@ class ApiHandler:
         seen_titles = set(); unique_news = [item for item in all_news if item['title'].strip().lower() not in seen_titles and not seen_titles.add(item['title'].strip().lower())]
         if not unique_news: return "[🧐 Свежих новостей не найдено.]"
         
-        # ИСПРАВЛЕНИЕ: Разбиваем сложную f-string на безопасные части
         items = []
         for p in unique_news[:4]:
             try:
-                # Используем одинарные кавычки для внешней f-строки и двойные для внутренней строки
-                prompt = f'Сделай очень краткое саммари новости в одно предложение на русском языке: "{p["title"]}"'
+                prompt = f"Сделай очень краткое саммари новости в одно предложение на русском языке: '{p['title']}'"
                 summary = self.ask_gpt(prompt, "gpt-4o-mini")
                 clean_summary = summary.replace('[❌ Ошибка GPT.]', p['title'])
                 items.append(f"🔹 <a href=\"{p.get('link', '')}\">{clean_summary}</a>")
@@ -391,8 +391,7 @@ class ApiHandler:
 class GameLogic:
     def __init__(self, data_file):
         self.data_file = data_file
-        self.user_rigs = api._load_json_file(self.data_file)
-        atexit.register(api._save_json_file, self.data_file, self.user_rigs)
+        self.user_rigs = api._load_json_file(self.data_file, default_value={})
 
     def _convert_timestamps_to_dt(self, data):
         for key, value in data.items():
@@ -402,14 +401,14 @@ class GameLogic:
         return data
 
     def create_rig(self, user_id, user_name, asic_data):
-        if user_id in self.user_rigs: return "У вас уже есть ферма!"
+        if str(user_id) in self.user_rigs: return "У вас уже есть ферма!"
         price_data, _ = api.get_crypto_price("BTC")
         btc_price = price_data['price'] if price_data else 65000
-        self.user_rigs[user_id] = {'last_collected': None, 'balance': 0.0, 'level': 1, 'streak': 0, 'name': user_name, 'boost_active_until': None, 'asic_model': asic_data['name'], 'base_rate': asic_data['daily_revenue'] / btc_price, 'overclock_bonus': 0.0, 'penalty_multiplier': 1.0}
+        self.user_rigs[str(user_id)] = {'last_collected': None, 'balance': 0.0, 'level': 1, 'streak': 0, 'name': user_name, 'boost_active_until': None, 'asic_model': asic_data['name'], 'base_rate': asic_data['daily_revenue'] / btc_price, 'overclock_bonus': 0.0, 'penalty_multiplier': 1.0}
         return f"🎉 Поздравляем! Ваша ферма с <b>{asic_data['name']}</b> успешно создана!"
 
     def get_rig_info(self, user_id, user_name):
-        rig_data = self.user_rigs.get(user_id)
+        rig_data = self.user_rigs.get(str(user_id))
         if not rig_data:
             starter_asics = api.get_top_asics()
             if not starter_asics: return "К сожалению, сейчас не удается получить список оборудования. Попробуйте позже.", None
@@ -434,7 +433,7 @@ class GameLogic:
         return (f"🖥️ <b>Ферма «{telebot.util.escape(rig['name'])}»</b>\n<i>Оборудование: {rig.get('asic_model', 'Стандартное')}</i>\n\n<b>Уровень:</b> {rig['level']}\n<b>Базовая добыча:</b> <code>{current_rate:.8f} BTC/день</code> {overclock_text}\n<b>Баланс:</b> <code>{rig['balance']:.8f}</code> BTC\n<b>Дневная серия:</b> {rig['streak']} 🔥 (бонус <b>+{rig['streak'] * Config.STREAK_BONUS_MULTIPLIER:.0%}</b>)\n{boost_status}\n{upgrade_cost_text}"), None
 
     def collect_reward(self, user_id):
-        rig = self.user_rigs.get(user_id);
+        rig = self.user_rigs.get(str(user_id));
         if not rig: return "🤔 У вас нет фермы. Начните с <code>/my_rig</code>."
         now = datetime.now()
         last_collected_str = rig.get('last_collected')
@@ -463,7 +462,7 @@ class GameLogic:
         return f"✅ Собрано <b>{total_mined:.8f}</b> BTC{' (x2 Буст!)' if boost_multiplier > 1 else ''}!\n  (База: {base_mined:.8f} + Серия: {streak_bonus:.8f}){penalty_text}\n🔥 Ваша серия: <b>{rig['streak']} дней!</b>\n💰 Ваш новый баланс: <code>{rig['balance']:.8f}</code> BTC.{event_text}"
 
     def buy_item(self, user_id, item_key):
-        rig, item = self.user_rigs.get(user_id), Config.SHOP_ITEMS.get(item_key)
+        rig, item = self.user_rigs.get(str(user_id)), Config.SHOP_ITEMS.get(item_key)
         if not rig: return "🤔 У вас нет фермы.";
         if not item: return "❌ Такого товара нет."
         if rig['balance'] < item['cost']: return f"❌ <b>Недостаточно средств.</b> Нужно {item['cost']:.4f} BTC."
@@ -472,7 +471,7 @@ class GameLogic:
         if item_key == 'overclock': rig['overclock_bonus'] = rig.get('overclock_bonus', 0.0) + item['effect']; return f"⚙️ <b>Оверклокинг-чип установлен!</b> Ваша базовая добыча навсегда увеличена на {item['effect']:.0%}."
 
     def upgrade_rig(self, user_id):
-        rig = self.user_rigs.get(user_id);
+        rig = self.user_rigs.get(str(user_id));
         if not rig: return "🤔 У вас нет фермы."
         next_level, cost = rig['level'] + 1, Config.UPGRADE_COSTS.get(rig['level'] + 1)
         if not cost: return "🎉 Поздравляем, у вас максимальный уровень фермы!"
@@ -485,15 +484,13 @@ class GameLogic:
         return "🏆 <b>Топ-5 Виртуальных Майнеров:</b>\n" + "\n".join([f"<b>{i+1}.</b> {telebot.util.escape(rig.get('name','N/A'))} - <code>{rig.get('balance',0):.6f}</code> BTC (Ур. {rig.get('level',1)})" for i, rig in enumerate(sorted_rigs[:5])])
         
     def apply_quiz_reward(self, user_id):
-        if user_id in self.user_rigs: self.user_rigs[user_id]['balance'] += Config.QUIZ_REWARD; return f"\n\n🎁 За отличный результат вам начислено <b>{Config.QUIZ_REWARD:.4f} BTC!</b>"
+        if str(user_id) in self.user_rigs: self.user_rigs[str(user_id)]['balance'] += Config.QUIZ_REWARD; return f"\n\n🎁 За отличный результат вам начислено <b>{Config.QUIZ_REWARD:.4f} BTC!</b>"
         return f"\n\n🎁 Вы бы получили <b>{Config.QUIZ_REWARD:.4f} BTC</b>, если бы у вас была ферма! Начните с <code>/my_rig</code>."
 
 class SpamAnalyzer:
     def __init__(self, profiles_file, keywords_file):
-        self.profiles_file = api._load_json_file(profiles_file)
+        self.user_profiles = api._load_json_file(profiles_file, default_value={})
         self.dynamic_keywords = api._load_json_file(keywords_file, default_value=[])
-        atexit.register(api._save_json_file, profiles_file, self.profiles_file)
-        atexit.register(api._save_json_file, keywords_file, self.dynamic_keywords)
 
     def add_keywords_from_text(self, text):
         if not text: return
@@ -532,9 +529,20 @@ class SpamAnalyzer:
         profile = self.user_profiles.get(str(user_id))
         if not profile: return "🔹 Информация о пользователе не найдена."
         spam_factor = (profile.get('spam_count', 0) / profile.get('msg_count', 1) * 100)
-        first_msg_dt = datetime.fromisoformat(profile['first_msg']) if profile.get('first_msg') else 'N/A'
-        last_seen_dt = datetime.fromisoformat(profile['last_seen']) if profile.get('last_seen') else 'N/A'
-        return f"ℹ️ <b>Инфо о пользователе</b>\n\n👤 <b>ID:</b> <code>{profile['user_id']}</code>\n🔖 <b>Имя:</b> {telebot.util.escape(profile.get('name', 'N/A'))}\n🌐 <b>Юзернейм:</b> @{profile.get('username', 'N/A')}\n\n💬 <b>Сообщений:</b> {profile.get('msg_count', 0)}\n🚨 <b>Предупреждений:</b> {profile.get('spam_count', 0)}/{Config.WARN_LIMIT}\n📈 <b>Спам-фактор:</b> {spam_factor:.2f}%\n\n🗓️ <b>Первое сообщение:</b> {first_msg_dt:%d %b %Y}\n👀 <b>Последняя активность:</b> {last_seen_dt:%d %b %Y, %H:%M}"
+        first_msg_dt_str = profile.get('first_msg')
+        first_msg_dt = datetime.fromisoformat(first_msg_dt_str) if first_msg_dt_str else None
+        last_seen_dt_str = profile.get('last_seen')
+        last_seen_dt = datetime.fromisoformat(last_seen_dt_str) if last_seen_dt_str else None
+        
+        return (f"ℹ️ <b>Инфо о пользователе</b>\n\n"
+                f"👤 <b>ID:</b> <code>{profile.get('user_id')}</code>\n"
+                f"🔖 <b>Имя:</b> {telebot.util.escape(profile.get('name', 'N/A'))}\n"
+                f"🌐 <b>Юзернейм:</b> @{profile.get('username', 'N/A')}\n\n"
+                f"💬 <b>Сообщений:</b> {profile.get('msg_count', 0)}\n"
+                f"🚨 <b>Предупреждений:</b> {profile.get('spam_count', 0)}/{Config.WARN_LIMIT}\n"
+                f"📈 <b>Спам-фактор:</b> {spam_factor:.2f}%\n\n"
+                f"🗓️ <b>Первое сообщение:</b> {first_msg_dt.strftime('%d %b %Y') if first_msg_dt else 'N/A'}\n"
+                f"👀 <b>Последняя активность:</b> {last_seen_dt.strftime('%d %b %Y, %H:%M') if last_seen_dt else 'N/A'}")
         
     def get_chat_statistics(self, days=7):
         if not self.user_profiles: return "📊 <b>Статистика чата:</b>\n\nНет данных."
@@ -569,10 +577,149 @@ def send_message_with_partner_button(chat_id, text, reply_markup=None):
     except Exception as e:
         logger.error(f"Не удалось отправить сообщение в чат {chat_id}: {e}")
 
-# ... (все остальные функции и обработчики)
-# Полный код для всех функций и обработчиков, включая исправленные, доступен в предыдущих версиях.
-# Здесь они опущены для краткости, но должны быть в вашем финальном файле.
-# Ниже приведены все обработчики для целостности кода
+@bot.message_handler(commands=['start', 'help'])
+def handle_start_help(msg):
+    bot.send_message(msg.chat.id, "👋 Привет! Я ваш крипто-помощник.\n\nИспользуйте кнопки для навигации или введите команду.\n\n<b>Админ-команды:</b>\n<code>/userinfo</code>, <code>/spam</code>, <code>/ban</code>, <code>/unban</code>, <code>/unmute</code>, <code>/chatstats</code>", reply_markup=get_main_keyboard())
+
+@bot.message_handler(commands=['userinfo', 'ban', 'unban', 'unmute', 'chatstats', 'spam'])
+def handle_admin_commands(msg):
+    command = msg.text.split('@')[0].split(' ')[0].lower()
+    if not is_admin(msg.chat.id, msg.from_user.id):
+        return bot.reply_to(msg, "🚫 У вас нет прав для выполнения этой команды.")
+    def get_target_user(m):
+        if m.reply_to_message: return m.reply_to_message.from_user, None
+        parts = m.text.split()
+        if len(parts) > 1 and parts[1].isdigit():
+            try: return bot.get_chat_member(m.chat.id, int(parts[1])).user, None
+            except Exception as e: return None, f"Не удалось найти пользователя: {e}"
+        return None, "Пожалуйста, ответьте на сообщение пользователя или укажите его ID."
+    target_user, error = None, None
+    if command in ['/userinfo', '/ban', '/unban', 'unmute']:
+        target_user, error = get_target_user(msg)
+        if error: return bot.reply_to(msg, error)
+    try:
+        if command == '/userinfo': bot.send_message(msg.chat.id, spam_analyzer.get_user_info_text(target_user.id))
+        elif command == '/unban': bot.unban_chat_member(msg.chat.id, target_user.id); bot.reply_to(msg, f"Пользователь {telebot.util.escape(target_user.full_name)} разбанен.")
+        elif command == '/unmute': bot.restrict_chat_member(msg.chat.id, target_user.id, can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True, can_add_web_page_previews=True); bot.reply_to(msg, f"С пользователя {telebot.util.escape(target_user.full_name)} сняты ограничения.")
+        elif command == '/chatstats': bot.send_message(msg.chat.id, spam_analyzer.get_chat_statistics())
+        elif command in ['/ban', '/spam']:
+            if not msg.reply_to_message: return bot.reply_to(msg, "Используйте эту команду в ответ на сообщение.")
+            user_to_act = msg.reply_to_message.from_user
+            spam_analyzer.add_keywords_from_text(msg.reply_to_message.text)
+            if command == '/ban':
+                bot.ban_chat_member(msg.chat.id, user_to_act.id)
+                bot.delete_message(msg.chat.id, msg.reply_to_message.message_id)
+                bot.send_message(msg.chat.id, f"🚫 Пользователь {telebot.util.escape(user_to_act.full_name)} забанен. Подозрительные слова добавлены в фильтр.")
+            else: spam_analyzer.handle_spam_detection(msg.reply_to_message, initiated_by_admin=True)
+            bot.delete_message(msg.chat.id, msg.message_id)
+    except Exception as e: logger.error(f"Ошибка выполнения команды {command}: {e}"); bot.reply_to(msg, "Не удалось выполнить действие.")
+
+@bot.message_handler(func=lambda msg: msg.text == "💹 Курс")
+def handle_price_request(msg):
+    markup = types.InlineKeyboardMarkup(row_width=3).add(*[types.InlineKeyboardButton(t, callback_data=f"price_{t}") for t in Config.POPULAR_TICKERS])
+    markup.add(types.InlineKeyboardButton("➡️ Другая монета", callback_data="price_other"))
+    bot.send_message(msg.chat.id, "Курс какой криптовалюты вас интересует?", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('price_'))
+def handle_price_callback(call):
+    bot.answer_callback_query(call.id)
+    try: bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id)
+    except Exception: pass
+    action = call.data.split('_')[1]
+    if action == "other":
+        sent = bot.send_message(call.message.chat.id, "Введите тикер монеты (например: Aleo, XRP):", reply_markup=types.ForceReply(selective=True))
+        bot.register_next_step_handler(sent, process_price_step)
+    else:
+        bot.send_chat_action(call.message.chat.id, 'typing')
+        price_data, asic_suggestions = api.get_crypto_price(action)
+        if price_data:
+            text = f"💹 Курс {price_data['ticker'].upper()}/USD: <b>${price_data['price']:,.4f}</b>\n<i>(Данные от {price_data['source']})</i>"
+            if asic_suggestions: text += asic_suggestions
+        else: text = f"❌ Не удалось получить курс для {action.upper()}."
+        send_message_with_partner_button(call.message.chat.id, text)
+
+def process_price_step(msg):
+    if not msg.text or len(msg.text) > 20: return bot.send_message(msg.chat.id, "Некорректный ввод.", reply_markup=get_main_keyboard())
+    bot.send_chat_action(msg.chat.id, 'typing')
+    price_data, asic_suggestions = api.get_crypto_price(msg.text)
+    if price_data:
+        text = f"💹 Курс {price_data['ticker'].upper()}/USD: <b>${price_data['price']:,.4f}</b>\n<i>(Данные от {price_data['source']})</i>"
+        if asic_suggestions: text += asic_suggestions
+    else: text = f"❌ Не удалось получить курс для {msg.text.upper()}."
+    send_message_with_partner_button(msg.chat.id, text)
+    bot.send_message(msg.chat.id, "Выберите действие:", reply_markup=get_main_keyboard())
+
+@bot.message_handler(func=lambda msg: msg.text == "⚙️ Топ ASIC")
+def handle_asics_text(msg):
+    bot.send_message(msg.chat.id, "⏳ Загружаю актуальный список со всех источников...")
+    asics = api.get_top_asics(force_update=True)
+    if not asics: return send_message_with_partner_button(msg.chat.id, "Не удалось получить данные об ASIC.")
+    asics_to_show = asics[:12]
+    rows = [f"{a.get('name', 'N/A'):<22.21}| {a.get('hashrate', 'N/A'):<18.17}| {a.get('power_watts', 0):<5.0f}| ${a.get('daily_revenue', 0):<10.2f}" for a in asics_to_show]
+    response = (f"<pre>Модель                  | H/s               | P, W | Доход/день\n"
+                f"------------------------|-------------------|------|-----------\n" + "\n".join(rows) + "</pre>")
+    send_message_with_partner_button(msg.chat.id, response)
+
+@bot.message_handler(func=lambda msg: msg.text == "⛏️ Калькулятор")
+def handle_calculator_request(msg):
+    sent = bot.send_message(msg.chat.id, "💡 Введите стоимость электроэнергии в <b>рублях</b> за кВт/ч:", reply_markup=types.ForceReply(selective=True))
+    bot.register_next_step_handler(sent, process_calculator_step)
+
+def process_calculator_step(msg):
+    try: cost_rub = float(msg.text.replace(',', '.'))
+    except (ValueError, TypeError):
+        bot.send_message(msg.chat.id, "❌ Неверный формат. Введите число (например: 4.5).", reply_markup=get_main_keyboard()); return
+    rate, is_fallback = api.get_usd_rub_rate()
+    asics_data = api.get_top_asics()
+    if not asics_data:
+        bot.send_message(msg.chat.id, "❌ Не удалось получить данные о доходности ASIC.", reply_markup=get_main_keyboard()); return
+    cost_usd = cost_rub / rate
+    result = [f"💰 <b>Расчет профита (розетка {cost_rub:.2f} ₽/кВтч)</b>"]
+    if is_fallback: result.append(f"<i>(Внимание! Используется резервный курс: 1$≈{rate:.2f}₽)</i>")
+    result.append("")
+    for asic in asics_data[:12]:
+        daily_cost = (asic.get('power_watts', 0) / 1000) * 24 * cost_usd
+        profit = asic.get('daily_revenue', 0) - daily_cost
+        result.append(f"<b>{telebot.util.escape(asic['name'])}</b>\n  Профит: <b>${profit:.2f}/день</b>")
+    send_message_with_partner_button(msg.chat.id, "\n\n".join(result))
+    bot.send_message(msg.chat.id, "Выберите действие:", reply_markup=get_main_keyboard())
+
+@bot.message_handler(func=lambda msg: msg.text in ["📰 Новости", "😱 Индекс Страха", "⏳ Халвинг", "📡 Статус BTC", "🎓 Слово дня"])
+def handle_info_buttons(msg):
+    bot.send_chat_action(msg.chat.id, 'typing')
+    text = ""
+    if msg.text == "📰 Новости": text = api.get_crypto_news()
+    elif msg.text == "😱 Индекс Страха": 
+        image, text = api.get_fear_and_greed_index()
+        if image: return send_photo_with_partner_button(msg.chat.id, image, text)
+    elif msg.text == "⏳ Халвинг": text = api.get_halving_info()
+    elif msg.text == "📡 Статус BTC": text = api.get_btc_network_status()
+    elif msg.text == "🎓 Слово дня":
+        term = random.choice(Config.CRYPTO_TERMS)
+        explanation = api.ask_gpt(f"Объясни термин '{term}' простыми словами для новичка (2-3 предложения).", "gpt-4o-mini")
+        text = f"🎓 <b>Слово дня: {term}</b>\n\n{explanation}"
+    if text: send_message_with_partner_button(msg.chat.id, text)
+    else: bot.send_message(msg.chat.id, "Не удалось получить данные. Попробуйте позже.")
+
+# ... (Остальные обработчики без изменений) ...
+
+@bot.message_handler(content_types=['text', 'caption'], func=lambda msg: not msg.text.startswith('/'))
+def handle_non_command_text(msg):
+    spam_analyzer.process_message(msg)
+    is_reply_to_bot = msg.reply_to_message and msg.reply_to_message.from_user.id == bot.get_me().id
+    is_group_mention = msg.chat.type in ('group', 'supergroup') and f"@{bot.get_me().username}" in msg.text
+    is_private_chat = msg.chat.type == 'private'
+    if not (is_reply_to_bot or is_group_mention or is_private_chat): return
+
+    bot.send_chat_action(msg.chat.id, 'typing')
+    price_data, asic_suggestions = api.get_crypto_price(msg.text)
+    if price_data:
+        text = f"💹 Курс {price_data['ticker'].upper()}/USD: <b>${price_data['price']:,.4f}</b>\n<i>(Данные от {price_data['source']})</i>"
+        if asic_suggestions: text += asic_suggestions
+        send_message_with_partner_button(msg.chat.id, text)
+    else:
+        response = api.ask_gpt(msg.text)
+        bot.reply_to(msg, response)
 
 # ========================================================================================
 # 7. ЗАПУСК БОТА И ПЛАНИРОВЩИКА
@@ -590,6 +737,8 @@ def run_scheduler():
     schedule.every(4).hours.do(auto_send_news)
     schedule.every(1).hours.do(lambda: api.get_top_asics(force_update=True))
     schedule.every(5).minutes.do(lambda: api._save_json_file(Config.GAME_DATA_FILE, game.user_rigs))
+    schedule.every(5).minutes.do(lambda: api._save_json_file(Config.PROFILES_DATA_FILE, spam_analyzer.user_profiles))
+    schedule.every(5).minutes.do(lambda: api._save_json_file(Config.DYNAMIC_KEYWORDS_FILE, spam_analyzer.dynamic_keywords))
     while True:
         try:
             schedule.run_pending()
