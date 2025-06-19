@@ -176,6 +176,10 @@ class ApiHandler:
                     cache = json.load(f)
                     if "timestamp" in cache and cache["timestamp"]:
                         cache["timestamp"] = datetime.fromisoformat(cache["timestamp"])
+                        # Если кэш слишком старый, считаем его невалидным
+                        if datetime.now() - cache["timestamp"] > timedelta(hours=24):
+                            logger.warning("Кэш ASIC старше 24 часов, будет проигнорирован.")
+                            return {"data": [], "timestamp": None}
                     else:
                         cache["timestamp"] = None
                     logger.info("Локальный кэш ASIC успешно загружен.")
@@ -281,6 +285,7 @@ class ApiHandler:
         except Exception as e:
             logger.warning(f"Ошибка при обработке данных ASIC с API minerstat: {e}"); return None
 
+    # --- УЛУЧШЕННЫЙ ПАРСЕР ASIC ---
     def _get_asics_from_scraping(self):
         response = self._make_request("https://www.asicminervalue.com", is_json=False)
         if not response: return None
@@ -290,14 +295,21 @@ class ApiHandler:
             tables = soup.find_all("table")
             target_table = None
             
+            # Ищем наиболее подходящую таблицу по содержимому заголовков
+            best_score = 0
             for table in tables:
                 headers = [th.get_text(strip=True).lower() for th in table.select("thead th")]
-                if 'miner' in headers and 'profit' in headers and 'hashrate' in headers:
+                score = 0
+                if 'miner' in headers: score += 1
+                if 'hashrate' in headers: score += 1
+                if 'profit' in headers: score += 1
+                if 'power' in headers: score += 1
+                if score > best_score:
+                    best_score = score
                     target_table = table
-                    break
             
-            if not target_table:
-                logger.error("Парсинг: не найдена таблица с нужными заголовками (Miner, Hashrate, Profit).")
+            if not target_table or best_score < 3:
+                logger.error("Парсинг: не найдена таблица с достаточным количеством релевантных заголовков.")
                 return None
 
             parsed_asics = []
@@ -313,7 +325,7 @@ class ApiHandler:
                     power_val = float(re.search(r'([\d,]+)', power_text).group(1).replace(',', ''))
                     revenue_val = float(revenue_text)
 
-                    if revenue_val > 0:
+                    if revenue_val > 0 and 'sha-256' in hashrate_text.lower():
                         parsed_asics.append({'name': name, 'hashrate': hashrate_text, 'power_watts': power_val, 'daily_revenue': revenue_val})
                 except Exception as e:
                     logger.warning(f"Парсинг: пропущена строка из-за ошибки: {e}.")
