@@ -9,8 +9,6 @@ openai==1.28.0
 fuzzywuzzy==0.18.0
 python-levenshtein==0.25.1
 bleach==6.1.0
-gspread==6.0.2
-google-oauth2-service-account==1.4.0
 matplotlib==3.8.4
 lxml==5.2.2
 requests==2.32.3
